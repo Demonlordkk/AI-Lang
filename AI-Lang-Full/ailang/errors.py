@@ -1,0 +1,89 @@
+"""Structured diagnostics for AI-Lang.
+
+Every error carries a source position so the toolchain can render a caret
+diagnostic instead of a bare Python traceback.
+"""
+
+from __future__ import annotations
+
+
+class AILangError(Exception):
+    """Base class for every AI-Lang error surfaced to a user."""
+
+    stage = "error"
+
+    def __init__(self, message: str, line: int = 0, col: int = 0):
+        super().__init__(message)
+        self.message = message
+        self.line = line
+        self.col = col
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        if self.line:
+            return f"{self.message} (line {self.line}, column {self.col})"
+        return self.message
+
+    def render(self, source: str | None = None, filename: str = "<source>") -> str:
+        """Return a human readable diagnostic, with a source excerpt if possible."""
+        where = f"{filename}:{self.line}:{self.col}" if self.line else filename
+        out = [f"{where}: {self.stage}: {self.message}"]
+        if source and self.line:
+            lines = source.splitlines()
+            if 0 < self.line <= len(lines):
+                text = lines[self.line - 1]
+                out.append(f"  {self.line:>4} | {text}")
+                caret = " " * max(self.col - 1, 0) + "^"
+                out.append(f"       | {caret}")
+        return "\n".join(out)
+
+
+class LexError(AILangError):
+    stage = "lex error"
+
+
+class ParseError(AILangError):
+    stage = "parse error"
+
+
+class CheckError(AILangError):
+    stage = "type error"
+
+    def __init__(self, message, line=0, col=0, diagnostics=None):
+        super().__init__(message, line, col)
+        self.diagnostics = diagnostics or []
+
+
+class CompileError(AILangError):
+    stage = "compile error"
+
+
+class VMError(AILangError):
+    stage = "runtime error"
+
+
+class ImportError_(AILangError):
+    stage = "import error"
+
+
+class AILangRaise(AILangError):
+    """A value raised by user code via `raise`. Catchable with attempt/rescue."""
+
+    stage = "raised"
+
+    def __init__(self, value, line: int = 0, col: int = 0):
+        from .values import display
+
+        super().__init__(display(value), line, col)
+        self.value = value
+
+
+__all__ = [
+    "AILangError",
+    "LexError",
+    "ParseError",
+    "CheckError",
+    "CompileError",
+    "VMError",
+    "ImportError_",
+    "AILangRaise",
+]

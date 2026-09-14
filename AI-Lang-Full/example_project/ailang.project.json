@@ -1,8 +1,0 @@
-{
-  "name": "example_app",
-  "version": "0.1.0",
-  "entry": "main.al",
-  "dependencies": {
-    "core": "0.1.0"
-  }
-}

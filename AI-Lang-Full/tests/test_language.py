@@ -1,0 +1,774 @@
+"""Comprehensive AI-Lang conformance suite.
+
+Run with:  python3 -m pytest tests/ -q      (or)   python3 tests/test_language.py
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from ailang.errors import AILangError, CheckError, ParseError, VMError  # noqa: E402
+from ailang.toolchain import run_source  # noqa: E402
+
+
+def out(source: str, check=True) -> str:
+    """Run source, return captured stdout."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        run_source(source, "<test>", [ROOT], check=check)
+    return buf.getvalue().strip()
+
+
+def fails(source: str, fragment: str = "", check=True):
+    try:
+        out(source, check=check)
+    except AILangError as e:
+        if fragment:
+            assert fragment.lower() in str(e).lower(), f"expected {fragment!r} in {e!r}"
+        return str(e)
+    raise AssertionError(f"expected failure for:\n{source}")
+
+
+# ---------------------------------------------------------------- regressions
+def test_zero_arg_call_does_not_corrupt_stack():
+    # stack[-0:] used to wipe the whole operand stack
+    assert out("fn f() -> Int:\n give 7.\ndone.\nemit f().") == "7"
+
+
+def test_zero_arg_call_preserves_pending_values():
+    src = """
+fn one() -> Int:
+    give 1.
+done.
+let a := 10.
+emit a + one().
+emit a.
+"""
+    assert out(src) == "11\n10"
+
+
+def test_empty_list_does_not_wipe_stack():
+    assert out("let a := 1.\nemit [].\nemit a.") == "[]\n1"
+
+
+def test_empty_map_does_not_wipe_stack():
+    assert out("let a := 5.\nemit {}.\nemit a.") == "{}\n5"
+
+
+def test_local_shadows_global():
+    src = """
+let x := 1.
+fn f() -> Int:
+    let x := 5.
+    give x.
+done.
+emit f().
+emit x.
+"""
+    assert out(src) == "5\n1"
+
+
+def test_nested_function_resolves():
+    src = """
+fn outer() -> Int:
+    fn inner() -> Int:
+        give 42.
+    done.
+    give inner().
+done.
+emit outer().
+"""
+    assert out(src) == "42"
+
+
+def test_closure_captures_parameter():
+    src = r"""
+fn make_adder(n: Int) -> Function:
+    give \x -> x + n.
+done.
+let add5 := make_adder(5).
+let add9 := make_adder(9).
+emit add5(10).
+emit add9(10).
+"""
+    assert out(src) == "15\n19"
+
+
+def test_and_short_circuits():
+    src = """
+let x := 0.
+when x != 0 and 10 / x > 1:
+    emit "unreachable".
+else:
+    emit "safe".
+done.
+"""
+    assert out(src) == "safe"
+
+
+def test_or_short_circuits():
+    src = """
+let xs := [].
+when len(xs) == 0 or xs[0] > 5:
+    emit "safe".
+done.
+"""
+    assert out(src) == "safe"
+
+
+def test_immutability_enforced():
+    fails("let a := 1.\na <- 2.", "let binding")
+
+
+def test_var_is_mutable():
+    assert out("var a := 1.\na <- 2.\nemit a.") == "2"
+
+
+# ------------------------------------------------------------------- literals
+def test_number_forms():
+    assert out("emit 1_000_000.") == "1000000"
+    assert out("emit 1.5.") == "1.5"
+    assert out("emit 2e3.") == "2000.0"
+
+
+def test_int_followed_by_terminator():
+    assert out("emit 5.") == "5"
+    assert out("let x := 42.\nemit x.") == "42"
+
+
+def test_text_escapes():
+    assert out(r'emit "a\tb".') == "a\tb"
+    assert out(r'emit "q\"q".') == 'q"q'
+    assert out(r'emit "\u0041".') == "A"
+
+
+def test_nothing_and_truthiness():
+    assert out("emit nothing.") == "nothing"
+    assert out('when 0: emit "zero is truthy". done.') == "zero is truthy"
+    assert out('when not nothing: emit "nothing is falsy". done.') == "nothing is falsy"
+
+
+# ---------------------------------------------------------------- control flow
+def test_elif_chain():
+    src = """
+fn grade(n: Int) -> Text:
+    when n >= 90:
+        give "A".
+    elif n >= 80:
+        give "B".
+    elif n >= 70:
+        give "C".
+    else:
+        give "F".
+    done.
+done.
+emit grade(95).
+emit grade(85).
+emit grade(75).
+emit grade(10).
+"""
+    assert out(src) == "A\nB\nC\nF"
+
+
+def test_while_with_stop_and_next():
+    src = """
+var i := 0.
+while true:
+    i <- i + 1.
+    when i == 3:
+        next.
+    done.
+    when i > 5:
+        stop.
+    done.
+    emit i.
+done.
+"""
+    assert out(src) == "1\n2\n4\n5"
+
+
+def test_repeat_with_index():
+    src = """
+repeat ch at i in ["a", "b", "c"]:
+    emit to Text(i) + ":" + ch.
+done.
+"""
+    assert out(src) == "0:a\n1:b\n2:c"
+
+
+def test_repeat_over_text_and_map():
+    assert out('repeat c in "hi":\n emit c.\ndone.') == "h\ni"
+    assert out('repeat k in {"a": 1}:\n emit k.\ndone.') == "a"
+
+
+def test_nested_loops_with_stop():
+    src = """
+repeat i in [1, 2, 3]:
+    repeat j in [1, 2, 3]:
+        when j == 2:
+            stop.
+        done.
+        emit to Text(i) + "-" + to Text(j).
+    done.
+done.
+"""
+    assert out(src) == "1-1\n2-1\n3-1"
+
+
+# ------------------------------------------------------------------ functions
+def test_recursion():
+    src = """
+fn fact(n: Int) -> Int:
+    when n <= 1:
+        give 1.
+    done.
+    give n * fact(n - 1).
+done.
+emit fact(10).
+"""
+    assert out(src) == "3628800"
+
+
+def test_mutual_recursion_via_hoisting():
+    src = """
+fn is_even(n: Int) -> Bool:
+    when n == 0:
+        give true.
+    done.
+    give is_odd(n - 1).
+done.
+fn is_odd(n: Int) -> Bool:
+    when n == 0:
+        give false.
+    done.
+    give is_even(n - 1).
+done.
+emit is_even(10).
+emit is_odd(7).
+"""
+    assert out(src) == "true\ntrue"
+
+
+def test_named_arguments():
+    src = """
+fn greet(name: Text, greeting: Text) -> Text:
+    give greeting + ", " + name.
+done.
+emit greet(name: "Ada", greeting: "Hello").
+emit greet("Bob", "Hi").
+"""
+    assert out(src) == "Hello, Ada\nHi, Bob"
+
+
+def test_lambda_forms():
+    assert out("let f := \\x -> x * 2.\nemit f(21).") == "42"
+    src = """
+let g := fn(a: Int, b: Int) -> Int:
+    give a + b.
+done.
+emit g(2, 3).
+"""
+    assert out(src) == "5"
+
+
+def test_higher_order_pipeline():
+    src = r"""
+emit [1, 2, 3, 4, 5, 6]
+    |> filter(\x -> x % 2 == 0)
+    |> map(\x -> x * x)
+    |> sum().
+"""
+    assert out(src) == "56"
+
+
+def test_arity_error_is_static():
+    fails("fn f(a: Int) -> Int:\n give a.\ndone.\nemit f(1, 2).", "expects 1")
+
+
+def test_deep_recursion_reports_cleanly():
+    src = """
+fn down(n: Int) -> Int:
+    give down(n + 1).
+done.
+emit down(0).
+"""
+    fails(src, "recursion limit")
+
+
+# -------------------------------------------------------------------- records
+def test_record_construct_and_read():
+    src = """
+record Point:
+    x: Real.
+    y: Real.
+done.
+let p := Point(3.0, 4.0).
+emit p.x.
+emit sqrt(p.x * p.x + p.y * p.y).
+"""
+    assert out(src) == "3.0\n5.0"
+
+
+def test_record_named_fields_and_mutation():
+    src = """
+record User:
+    name: Text.
+    age: Int.
+done.
+var u := User(name: "Ada", age: 36).
+u.age <- 37.
+emit u.age.
+emit u.
+"""
+    assert out(src) == "37\nUser(name: Ada, age: 37)"
+
+
+def test_record_missing_field_errors():
+    fails("record P:\n x: Int.\n y: Int.\ndone.\nlet p := P(1).", "expects 2")
+
+
+def test_unknown_field_errors():
+    fails("record P:\n x: Int.\ndone.\nlet p := P(1).\nemit p.z.", "no field")
+
+
+# -------------------------------------------------------------- collections
+def test_list_operations():
+    assert out("emit sort([3, 1, 2]).") == "[1, 2, 3]"
+    assert out("emit reverse([1, 2, 3]).") == "[3, 2, 1]"
+    assert out("emit unique([1, 1, 2, 2, 3]).") == "[1, 2, 3]"
+    assert out("emit concat([1], [2]).") == "[1, 2]"
+    assert out("emit flatten([[1, 2], [3]]).") == "[1, 2, 3]"
+    assert out("emit slice([1,2,3,4], 1, 3).") == "[2, 3]"
+
+
+def test_map_operations():
+    src = """
+let m := {"a": 1, "b": 2}.
+emit keys(m).
+emit values(m).
+emit has(m, "a").
+emit get(m, "z", 0).
+emit merge(m, {"c": 3}).
+"""
+    assert out(src) == '["a", "b"]\n[1, 2]\ntrue\n0\n{"a": 1, "b": 2, "c": 3}'
+
+
+def test_reduce_and_sort_by():
+    src = r"""
+emit reduce([1, 2, 3, 4], \a, b -> a + b, 0).
+emit sort_by(["ccc", "a", "bb"], \s -> len(s)).
+"""
+    assert out(src) == '10\n["a", "bb", "ccc"]'
+
+
+def test_index_out_of_range_message():
+    fails("let xs := [1, 2].\nemit xs[9].", "out of range")
+
+
+def test_negative_index():
+    assert out("emit [1, 2, 3][-1].") == "3"
+
+
+def test_text_helpers():
+    src = """
+emit upper("abc").
+emit split("a,b,c", ",").
+emit join(["a", "b"], "-").
+emit replace("aXa", "X", "-").
+emit format("{} is {}", ["x", 1]).
+"""
+    assert out(src) == 'ABC\n["a", "b", "c"]\na-b\na-a\nx is 1'
+
+
+# ------------------------------------------------------------ error handling
+def test_attempt_rescue_catches_runtime_error():
+    src = """
+attempt:
+    let x := 1 / 0.
+    emit x.
+rescue e:
+    emit "caught " + e.message.
+done.
+"""
+    assert out(src) == "caught division by zero"
+
+
+def test_raise_and_rescue_value():
+    src = """
+attempt:
+    raise "custom failure".
+rescue e:
+    emit e.message.
+done.
+"""
+    assert out(src) == "custom failure"
+
+
+def test_rescue_restores_stack():
+    src = """
+let base := 100.
+attempt:
+    raise "x".
+rescue e:
+    emit "handled".
+done.
+emit base.
+"""
+    assert out(src) == "handled\n100"
+
+
+def test_attempt_inside_function():
+    src = """
+fn safe_div(a: Int, b: Int) -> Text:
+    attempt:
+        give to Text(a / b).
+    rescue e:
+        give "undefined".
+    done.
+done.
+emit safe_div(6, 3).
+emit safe_div(1, 0).
+"""
+    assert out(src) == "2.0\nundefined"
+
+
+def test_assert_builtin():
+    assert out('assert(1 == 1, "ok").\nemit "passed".') == "passed"
+    fails('assert(false, "boom").', "boom")
+
+
+# ------------------------------------------------------------- static checking
+def test_undefined_name_is_static():
+    fails("emit missing_thing.", "undefined name")
+
+
+def test_type_mismatch_is_static():
+    fails('let n: Int := "text".', "cannot bind")
+
+
+def test_text_plus_int_rejected():
+    fails('emit "a" + 1.', "convert")
+
+
+def test_give_outside_function_rejected():
+    fails("give 1.", "only valid inside a function")
+
+
+def test_stop_outside_loop_rejected():
+    fails("stop.", "only valid inside a loop")
+
+
+def test_missing_return_rejected():
+    fails("fn f(n: Int) -> Int:\n emit n.\ndone.", "without 'give'")
+
+
+def test_duplicate_binding_rejected():
+    fails("let a := 1.\nlet a := 2.", "already defined")
+
+
+def test_no_check_mode_still_runs():
+    assert out('emit "a" + to Text(1).', check=False) == "a1"
+
+
+# --------------------------------------------------------------- diagnostics
+def test_parse_error_has_position():
+    try:
+        out("let x := .")
+    except ParseError as e:
+        assert e.line == 1 and e.col > 0
+        assert "expression" in str(e)
+    else:
+        raise AssertionError("expected ParseError")
+
+
+def test_error_render_includes_caret():
+    try:
+        out("let a := 1.\nemit unknown_name.")
+    except AILangError as e:
+        text = e.render("let a := 1.\nemit unknown_name.", "demo.al")
+        assert "demo.al:2" in text
+        assert "^" in text
+    else:
+        raise AssertionError("expected an error")
+
+
+# -------------------------------------------------------------------- numbers
+def test_division_always_real():
+    assert out("emit 6 / 3.") == "2.0"
+
+
+def test_integer_arithmetic_stays_int():
+    assert out("emit 2 + 3 * 4.") == "14"
+
+
+def test_modulo_by_zero():
+    fails("emit 5 % 0.", "modulo by zero")
+
+
+def test_precedence_and_parens():
+    assert out("emit (2 + 3) * 4.") == "20"
+    assert out("emit 10 - 2 - 3.") == "5"
+
+
+def test_comparison_chain_via_and():
+    assert out("let x := 5.\nemit x > 1 and x < 10.") == "true"
+
+
+def test_equality_is_type_strict():
+    assert out('emit 1 == "1".') == "false"
+    assert out("emit 1 == 1.0.") == "true"
+    assert out("emit true == 1.") == "false"
+
+
+# ------------------------------------------------------------------ coalescing
+def test_coalesce_operator():
+    assert out('emit get({"a": 1}, "z", nothing) ?? 99.') == "99"
+    assert out('emit get({"a": 1}, "a", nothing) ?? 99.') == "1"
+
+
+# --------------------------------------------------------------------- output
+def test_display_formats():
+    assert out("emit true.") == "true"
+    assert out("emit 1.0.") == "1.0"
+    assert out('emit ["a", 1, true].') == '["a", 1, true]'
+    assert out("emit nothing.") == "nothing"
+
+# ------------------------------------------------------------- loop scoping
+def test_let_inside_repeat_body():
+    assert out("repeat i in [1,2,3]:\n let sq := i * i.\n emit sq.\ndone.") == "1\n4\n9"
+
+
+def test_let_inside_while_body():
+    src = """
+var i := 0.
+while i < 3:
+    let d := i * 10.
+    emit d.
+    i <- i + 1.
+done.
+"""
+    assert out(src) == "0\n10\n20"
+
+
+def test_next_unwinds_iteration_scope():
+    src = """
+repeat i in [1, 2, 3, 4]:
+    when i % 2 == 0:
+        next.
+    done.
+    let v := i * 100.
+    emit v.
+done.
+"""
+    assert out(src) == "100\n300"
+
+
+def test_stop_unwinds_iteration_scope():
+    src = """
+repeat i in [1, 2, 3]:
+    let v := i.
+    when i == 2:
+        stop.
+    done.
+    emit v.
+done.
+emit "after".
+"""
+    assert out(src) == "1\nafter"
+
+
+def test_nested_loop_scopes():
+    src = """
+repeat i in [1, 2]:
+    let outer := i.
+    repeat j in [10, 20]:
+        let inner := outer + j.
+        emit inner.
+    done.
+done.
+"""
+    assert out(src) == "11\n21\n12\n22"
+
+
+def test_builtin_can_be_shadowed():
+    assert out("var count := 0.\ncount <- count + 5.\nemit count.") == "5"
+
+
+def test_optional_builtin_arguments():
+    assert out("emit range_from(1, 5, 2).") == "[1, 3]"
+    assert out("emit range_from(1, 4).") == "[1, 2, 3]"
+    assert out('emit join(["a","b"]).') == "ab"
+
+
+def test_closure_counter_keeps_state():
+    src = """
+fn make_counter() -> Function:
+    var total := 0.
+    give fn() -> Int:
+        total <- total + 1.
+        give total.
+    done.
+done.
+let tick := make_counter().
+emit tick().
+emit tick().
+let other := make_counter().
+emit other().
+"""
+    assert out(src) == "1\n2\n1"
+
+
+def test_module_import(tmp_path=None):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "lib").mkdir()
+        (base / "lib" / "util.al").write_text(
+            "fn triple(n: Int) -> Int:\n give n * 3.\ndone.\n", encoding="utf-8"
+        )
+        main = "use lib/util as util.\nemit util.triple(14).\n"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            run_source(main, str(base / "main.al"), [base])
+        assert buf.getvalue().strip() == "42"
+
+
+def test_circular_import_detected():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "a.al").write_text("use b as b.\nlet x := 1.\n", encoding="utf-8")
+        (base / "b.al").write_text("use a as a.\nlet y := 2.\n", encoding="utf-8")
+        try:
+            run_source("use a as a.\nemit 1.", str(base / "m.al"), [base])
+        except AILangError as e:
+            assert "circular" in str(e).lower()
+        else:
+            raise AssertionError("expected circular import error")
+
+
+# ------------------------------------------------------------------ bytecode
+def test_bytecode_roundtrip_is_deterministic():
+    import tempfile
+    from ailang.bytecode import artifact, load, write
+    from ailang.toolchain import compile_source
+
+    src = 'fn f(a: Int) -> Int:\n give a * 2.\ndone.\nemit f(21).'
+    p1 = compile_source(src)
+    p2 = compile_source(src)
+    assert artifact(p1, src)["artifact_sha256"] == artifact(p2, src)["artifact_sha256"]
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "out.albc.json"
+        write(p1, path, src)
+        restored = load(path)
+        assert restored.main.code == p1.main.code
+        assert set(restored.functions) == set(p1.functions)
+
+
+def test_built_artifact_executes():
+    import tempfile
+    from ailang.bytecode import load, write
+    from ailang.stdlib import build_globals
+    from ailang.toolchain import compile_source
+    from ailang.vm import VM
+
+    src = 'fn f(a: Int) -> Int:\n give a * 2.\ndone.\nemit f(21).'
+    program = compile_source(src)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.albc.json"
+        write(program, path, src)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            VM(build_globals()).run(load(path))
+        assert buf.getvalue().strip() == "42"
+
+
+# -------------------------------------------------------------- formatter
+def test_formatter_is_idempotent():
+    from ailang.format import format_source
+
+    messy = "fn  f( a:Int )->Int:\ngive a+1.\ndone.\nemit f(1).\n"
+    once = format_source(messy)
+    assert format_source(once) == once
+
+
+def test_formatter_indents_blocks():
+    from ailang.format import format_source
+
+    src = "fn f() -> Int:\ngive 1.\ndone.\n"
+    assert format_source(src) == "fn f() -> Int:\n    give 1.\ndone.\n"
+
+
+# ------------------------------------------------- keyword field regressions
+def test_done_is_a_valid_field_name():
+    src = """
+record Task:
+    title: Text.
+    done: Bool.
+done.
+let t := Task(title: "x", done: true).
+emit t.done.
+"""
+    assert out(src) == "true"
+
+
+def test_keyword_field_on_map():
+    assert out('let m := {"done": true}.\nemit m.done.') == "true"
+
+
+def test_module_closure_resolves(tmp=None):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "m.al").write_text(
+            "fn doubled(xs: List) -> List:\n"
+            "    give map(xs, \\x -> x * 2).\n"
+            "done.\n",
+            encoding="utf-8",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            run_source("use m as m.\nemit m.doubled([1, 2, 3]).", str(base / "main.al"), [base])
+        assert buf.getvalue().strip() == "[2, 4, 6]"
+
+
+def test_broken_module_reports_error():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "bad.al").write_text("fn oops(\n", encoding="utf-8")
+        try:
+            run_source("use bad as bad.\nemit 1.", str(base / "main.al"), [base])
+        except AILangError as e:
+            assert "bad" in str(e)
+        else:
+            raise AssertionError("a broken module must not be silently ignored")
+
+
+def _run_all():
+    mod = sys.modules[__name__]
+    tests = sorted(n for n in dir(mod) if n.startswith("test_"))
+    passed = failed = 0
+    failures = []
+    for name in tests:
+        try:
+            getattr(mod, name)()
+            passed += 1
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            failures.append((name, e))
+    for name, e in failures:
+        print(f"FAIL {name}: {e}")
+    print(f"\n{passed} passed, {failed} failed, {len(tests)} total")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_all())

@@ -1,7 +1,8 @@
 {
-  "name": "ai-lang-core",
-  "version": "1.0.0",
-  "entry": "examples/basic.al",
+  "name": "ai-lang",
+  "version": "2.0.0",
   "language": "AI-Lang",
-  "bytecode": "AILBC-2"
+  "entry": "examples/basic.al",
+  "source_dirs": ["examples"],
+  "test_dirs": ["tests"]
 }
