@@ -912,3 +912,63 @@ def _run_all():
 
 if __name__ == "__main__":
     raise SystemExit(_run_all())
+
+
+# --------------------------------------------------- record names as types
+
+
+def test_record_name_works_as_a_parameter_type():
+    assert out("""record Point:
+    x: Int.
+    y: Int.
+done.
+fn shift(p: Point, by: Int) -> Point:
+    give Point(p.x + by, p.y + by).
+done.
+emit shift(Point(1, 2), 10).x.
+""") == "11"
+
+
+def test_record_name_works_as_a_return_type():
+    assert out("""record Box:
+    v: Int.
+done.
+fn wrap(n: Int) -> Box:
+    give Box(n).
+done.
+emit wrap(7).v.
+""") == "7"
+
+
+def test_record_field_may_be_another_record():
+    assert out("""record Inner:
+    n: Int.
+done.
+record Outer:
+    inner: Inner.
+done.
+let o := Outer(Inner(5)).
+emit o.inner.n.
+""") == "5"
+
+
+def test_unknown_type_name_is_rejected():
+    fails("fn f(p: Nonexistent) -> Int:\n    give 1.\ndone.\nemit f(1).\n",
+          "unknown type 'Nonexistent'")
+
+
+def test_misspelled_record_type_is_suggested():
+    fails("""record Point:
+    x: Int.
+done.
+fn f(p: Poimt) -> Int:
+    give p.x.
+done.
+emit f(Point(1)).
+""", "Point")
+
+
+def test_builtin_type_names_still_work():
+    assert out('fn f(xs: List, n: Int, s: Text) -> Bool:\n'
+               '    give len(xs) > n and len(s) > 0.\n'
+               'done.\nemit f([1, 2], 1, "a").\n') == "true"

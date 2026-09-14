@@ -58,6 +58,18 @@ class Parser:
         self.i += 1
         return t
 
+    def type_name(self, what):
+        """Accept a builtin type or a user-declared record name.
+
+        A record is a type like any other, so `fn f(p: Point)` has to work;
+        the checker validates that the name really is a record.
+        """
+        t = self.cur()
+        if t.kind == "IDENT" and t.value and t.value[0].isupper():
+            self.i += 1
+            return t.value
+        return self.take("TYPE", what).value
+
     def dot(self):
         self.take("DOT", "end of statement")
 
@@ -133,7 +145,7 @@ class Parser:
             name = self.take("IDENT", "binding name").value
             declared = None
             if self.match("COLON"):
-                declared = self.take("TYPE", "type annotation").value
+                declared = self.type_name("type annotation")
             self.take("DEFINE", "binding (use ':=')")
             expr = self.expr()
             self.dot()
@@ -212,7 +224,7 @@ class Parser:
             params = self.param_list()
             ret = None
             if self.match("ARROW"):
-                ret = self.take("TYPE", "return type").value
+                ret = self.type_name("return type")
             self.take("COLON", "function body")
             body = self.block()
             return A.Fn(name, params, ret, body, t.line, t.col)
@@ -276,7 +288,7 @@ class Parser:
                 self.i += 1
                 ftype = None
                 if self.match("COLON"):
-                    ftype = self.take("TYPE", "field type").value
+                    ftype = self.type_name("field type")
                 self.dot()
                 fields.append((fname, ftype))
             self.take("DONE")
@@ -429,7 +441,7 @@ class Parser:
                 pname = self.take("IDENT", "parameter name").value
                 ptype = None
                 if self.match("COLON"):
-                    ptype = self.take("TYPE", "parameter type").value
+                    ptype = self.type_name("parameter type")
                 params.append((pname, ptype))
                 if not self.match("COMMA"):
                     break
@@ -653,7 +665,7 @@ class Parser:
             params = self.param_list()
             ret = None
             if self.match("ARROW"):
-                ret = self.take("TYPE", "return type").value
+                ret = self.type_name("return type")
             self.take("COLON", "lambda body")
             body = self.block(consume_dot=False)
             return A.FnExpr(params, ret, body, "<lambda>", t.line, t.col)
@@ -667,7 +679,7 @@ class Parser:
                     pname = self.take("IDENT", "lambda parameter").value
                     ptype = None
                     if self.match("COLON"):
-                        ptype = self.take("TYPE").value
+                        ptype = self.type_name("parameter type")
                     params.append((pname, ptype))
                     if not self.match("COMMA"):
                         break

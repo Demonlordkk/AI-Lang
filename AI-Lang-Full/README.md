@@ -312,6 +312,28 @@ when user not in banned and "admin" in user.roles:
 done.
 ```
 
+### Records as types
+
+A record name is a type name, usable anywhere a builtin type is:
+
+```text
+record Point:
+    x: Int.
+    y: Int.
+done.
+
+fn shift(p: Point, by: Int) -> Point:
+    give Point(p.x + by, p.y + by).
+done.
+```
+
+A type that was never declared is rejected before the program runs, with the
+same near-miss suggestions as any other name:
+
+```
+error: unknown type 'Poimt'; did you mean 'Point'?
+```
+
 ### Contracts
 
 A function can state what it requires and what it guarantees. The conditions

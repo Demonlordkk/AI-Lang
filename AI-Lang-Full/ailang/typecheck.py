@@ -401,6 +401,7 @@ class TypeChecker:
 
     def check(self, program: A.Program):
         self.hoist(program.statements, self.global_scope)
+        self._check_type_names(program.statements)
         for s in program.statements:
             self.stmt(s)
         if self.diagnostics:
@@ -414,6 +415,51 @@ class TypeChecker:
                 self.diagnostics,
             )
         return True
+
+    def _check_type_names(self, statements):
+        """Reject annotations naming a type that was never declared.
+
+        Records are hoisted first, so by now every legitimate record name is
+        known; anything else capitalised is a typo or a missing declaration.
+        """
+        from .lexer import TYPE_NAMES
+
+        def ok(name):
+            return not name or name in TYPE_NAMES or name in self.records
+
+        def visit(stmts):
+            for s in stmts:
+                if isinstance(s, (A.Fn, A.FnExpr)):
+                    for pname, ptype in s.params:
+                        if not ok(ptype):
+                            self._unknown_type(ptype, s)
+                    if not ok(s.return_type):
+                        self._unknown_type(s.return_type, s)
+                    visit(s.body)
+                elif isinstance(s, A.Record):
+                    for _f, ftype in s.fields:
+                        if not ok(ftype):
+                            self._unknown_type(ftype, s)
+                elif isinstance(s, A.Let) and not ok(getattr(s, "declared_type", None)):
+                    self._unknown_type(s.declared_type, s)
+                else:
+                    for attr in ("body", "else_body", "rescue_body"):
+                        inner = getattr(s, attr, None)
+                        if isinstance(inner, list):
+                            visit(inner)
+                    for b in getattr(s, "branches", []) or []:
+                        visit(getattr(b, "body", []))
+
+        visit(statements)
+
+    def _unknown_type(self, name, node):
+        hint = _closest(name, sorted(set(self.records) | set(__import__(
+            "ailang.lexer", fromlist=["TYPE_NAMES"]).TYPE_NAMES))) if name else []
+        extra = ""
+        if hint:
+            extra = f"; did you mean '{hint[0]}'?" if len(hint) == 1 else \
+                "; did you mean one of " + ", ".join(f"'{h}'" for h in hint) + "?"
+        self.error(f"unknown type '{name}'{extra}", node)
 
     def hoist(self, statements, scope):
         """Pre-declare functions and records so order of definition is free."""
