@@ -570,6 +570,96 @@ let results := parallel_map(urls, \u -> http_get(u).status).
 let output := retry(\ -> run("deploy.sh"), 3, 1.0).
 ```
 
+## Services
+
+An AI-Lang program can be a web service. The handler is an ordinary function
+from a request Map to a response Map, so routing and middleware are written
+in the language rather than configured:
+
+```text
+fn router(req: Map) -> Map:
+    when req.path == "/health":
+        give {"status": 200, "body": "ok"}.
+    elif req.path == "/notes" and req.method == "POST":
+        give create_note(req).
+    done.
+    give {"status": 404, "json": {"error": "no route for " + req.path}}.
+done.
+
+serve(8080, router).
+```
+
+A request carries `method`, `path`, `query`, `headers`, `body` and `client`.
+A response may set `status`, `headers`, and either `body` or `json`. Requests
+are served on a thread pool, and a fault inside a handler becomes a 500
+rather than taking the process down. Pass `background: true` to keep running
+and stop later with `serve_stop`.
+
+Raw TCP is available for protocols that are not HTTP: `tcp_listen`,
+`tcp_accept`, `tcp_connect`, `tcp_send`, `tcp_receive`, `tcp_close`.
+
+## Storage
+
+Durable storage with transactions, backed by SQLite:
+
+```text
+let db := db_open("app.db").
+db_exec(db, "create table if not exists users(id integer, name text)").
+db_exec(db, "insert into users values(?, ?)", [1, "ann"]).
+emit db_query(db, "select * from users where id = ?", [1]).
+```
+
+Rows come back as Maps keyed by column name, so a result flows straight into
+`map`, `filter` and `group_by`. Parameters are always bound, never
+interpolated, so a value containing a quote cannot alter the statement.
+`db_transaction` commits on success and rolls back on any error, and nesting
+behaves correctly -- an inner block joins the outer transaction.
+
+For documents rather than tables there is a key/value store:
+
+```text
+let s := store_open("state.db").
+store_put(s, "config", {"theme": "dark", "retries": 3}).
+emit store_get(s, "config").theme.
+```
+
+## Graphics
+
+Draw and write real PNG files, with no dependency:
+
+```text
+let c := canvas(480, 320).
+canvas_fill(c, "#101820").
+circle(c, 140, 160, 70, "#ffcc00").
+text(c, 60, 60, "AI-LANG", "#ffffff", 3).
+canvas_save(c, "out.png").
+```
+
+`pixel`, `line`, `rect`, `circle` and `text` all clip at the edges rather
+than raising, so a generated drawing never fails on a rounding error. For the
+common case there is a one-call chart:
+
+```text
+plot("wave.png", map(range(200), \i -> sin(real(i) / 12.0))).
+```
+
+## Foreign functions
+
+Anything the standard library does not cover can be reached in a C library,
+so a missing capability is a binding away rather than a wall:
+
+```text
+let m := ffi_open("m").
+let cosine := ffi_fn(m, "cos", ["real"], "real").
+emit ffi_call(cosine, [0.0]).
+```
+
+Foreign types are named with AI-Lang words -- `int`, `real`, `text`, `bool`,
+`ptr`, `byte`, `void` -- so a binding reads the same everywhere. Bindings are
+validated when declared: an unknown symbol or type fails at `ffi_fn`, not at
+the first call. Argument counts and types are checked before crossing the
+boundary, and a pointer cannot be fabricated from an integer.
+
 ## Packages
 
 A package is a directory with `ailang.package.json` and `.al` sources.

@@ -1009,6 +1009,90 @@ def _timed(fn):
 
 
 
+# --------------------------------------------------------------- mathematics
+def _asin(x):
+    v = float(x)
+    if not -1.0 <= v <= 1.0:
+        raise VMError(f"asin: argument must be between -1 and 1, got {v}")
+    return math.asin(v)
+
+
+def _acos(x):
+    v = float(x)
+    if not -1.0 <= v <= 1.0:
+        raise VMError(f"acos: argument must be between -1 and 1, got {v}")
+    return math.acos(v)
+
+
+def _log10(x):
+    v = float(x)
+    if v <= 0:
+        raise VMError(f"log10: argument must be positive, got {v}")
+    return math.log10(v)
+
+
+def _log2(x):
+    v = float(x)
+    if v <= 0:
+        raise VMError(f"log2: argument must be positive, got {v}")
+    return math.log2(v)
+
+
+def _sign(x):
+    v = float(x)
+    return 0 if v == 0 else (1 if v > 0 else -1)
+
+
+def _clamp(value, low, high):
+    if low > high:
+        raise VMError(f"clamp: low ({low}) is above high ({high})")
+    return max(low, min(high, value))
+
+
+def _lcm(a, b):
+    ia, ib = int(a), int(b)
+    if ia == 0 or ib == 0:
+        return 0
+    return abs(ia * ib) // math.gcd(ia, ib)
+
+
+def _factorial(n):
+    i = int(n)
+    if i < 0:
+        raise VMError(f"factorial: argument must not be negative, got {i}")
+    if i > 2000:
+        raise VMError("factorial: argument too large (over 2000)")
+    return math.factorial(i)
+
+
+# ------------------------------------------------------------------ graphics
+def _gfx():
+    from . import graphics
+
+    return graphics
+
+
+# ------------------------------------------------------------------- storage
+def _db():
+    from . import db
+
+    return db
+
+
+# ------------------------------------------------------------------- network
+def _net():
+    from . import net
+
+    return net
+
+
+# ----------------------------------------------------------------------- ffi
+def _ffi():
+    from . import ffi
+
+    return ffi
+
+
 # ------------------------------------------------------------------ autodiff
 def _ad():
     from . import autodiff
@@ -1514,6 +1598,70 @@ def build_globals(argv=None):
         "read_csv": _read_csv,
         "write_csv": _write_csv,
         "run": _run_command,
+        # mathematics
+        "pi": lambda: math.pi,
+        "e": lambda: math.e,
+        "sin": lambda x: math.sin(float(x)),
+        "cos": lambda x: math.cos(float(x)),
+        "tan": lambda x: math.tan(float(x)),
+        "asin": _asin,
+        "acos": _acos,
+        "atan": lambda x: math.atan(float(x)),
+        "atan2": lambda y, x: math.atan2(float(y), float(x)),
+        "sinh": lambda x: math.sinh(float(x)),
+        "cosh": lambda x: math.cosh(float(x)),
+        "log10": _log10,
+        "log2": _log2,
+        "hypot": lambda a, b: math.hypot(float(a), float(b)),
+        "degrees": lambda x: math.degrees(float(x)),
+        "radians": lambda x: math.radians(float(x)),
+        "sign": _sign,
+        "clamp": _clamp,
+        "gcd": lambda a, b: math.gcd(int(a), int(b)),
+        "lcm": _lcm,
+        "trunc": lambda x: math.trunc(float(x)),
+        "is_finite": lambda x: math.isfinite(float(x)),
+        "factorial": _factorial,
+        # graphics
+        "canvas": _gfx().canvas,
+        "canvas_size": _gfx().canvas_size,
+        "canvas_fill": _gfx().canvas_fill,
+        "canvas_save": _gfx().canvas_save,
+        "pixel": _gfx().pixel,
+        "rect": _gfx().rect,
+        "line": _gfx().line,
+        "circle": _gfx().circle,
+        "text": _gfx().text,
+        "plot": _gfx().plot,
+        # storage
+        "db_open": _db().db_open,
+        "db_exec": _db().db_exec,
+        "db_query": _db().db_query,
+        "db_one": _db().db_one,
+        "db_many": _db().db_many,
+        "db_transaction": _db().db_transaction,
+        "db_tables": _db().db_tables,
+        "db_close": _db().db_close,
+        "store_open": _db().store_open,
+        "store_put": _db().store_put,
+        "store_get": _db().store_get,
+        "store_delete": _db().store_delete,
+        "store_keys": _db().store_keys,
+        # networking
+        "serve": _net().serve,
+        "serve_stop": _net().serve_stop,
+        "tcp_listen": _net().tcp_listen,
+        "tcp_accept": _net().tcp_accept,
+        "tcp_connect": _net().tcp_connect,
+        "tcp_send": _net().tcp_send,
+        "tcp_receive": _net().tcp_receive,
+        "tcp_close": _net().tcp_close,
+        # foreign function interface
+        "ffi_open": _ffi().ffi_open,
+        "ffi_fn": _ffi().ffi_fn,
+        "ffi_call": _ffi().ffi_call,
+        "ffi_symbol": _ffi().ffi_symbol,
+        "ffi_info": _ffi().ffi_info,
         "timestamp": _timestamp,
         "parallel_map": _parallel_map,
         "retry": _retry,

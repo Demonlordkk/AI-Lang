@@ -9,3 +9,10 @@ venv/
 .pytest_cache/
 *.pyz
 build/
+
+# artifacts produced by running the showcase examples
+examples/showcase/*.db
+examples/showcase/*.db-wal
+examples/showcase/*.db-shm
+examples/showcase/*.png
+examples/showcase/*.csv

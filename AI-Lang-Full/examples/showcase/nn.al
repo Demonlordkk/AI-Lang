@@ -1,10 +1,10 @@
 # Train a small network on XOR using the autodiff library.
-let xs := tensor([[0.0,0.0],[0.0,1.0],[1.0,0.0],[1.0,1.0]]).
-let ys := tensor([[0.0],[1.0],[1.0],[0.0]]).
+let xs := tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]).
+let ys := tensor([[0.0], [1.0], [1.0], [0.0]]).
 
-let w1 := param(randn(2, 8)).
+let w1 := param(randn(2, 8, 1.0, 42)).
 let b1 := param(zeros(1, 8)).
-let w2 := param(randn(8, 1)).
+let w2 := param(randn(8, 1, 1.0, 43)).
 let b2 := param(zeros(1, 1)).
 let ps := [w1, b1, w2, b2].
 
