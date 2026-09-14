@@ -121,6 +121,8 @@ BUILTIN_SIGS = {
     "now": ([], REAL),
     "read_file": ([("path", TEXT)], TEXT),
     "write_file": ([("path", TEXT), ("content", TEXT)], VOID),
+    "append_file": ([("path", TEXT), ("content", TEXT)], VOID),
+    "pad_left": ([("text", TEXT), ("width", INT)], TEXT),
     "env": ([("name", TEXT)], ANY),
     "args": ([], LIST),
     "input": ([("prompt", ANY)], TEXT, 1),

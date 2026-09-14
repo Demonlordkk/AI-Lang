@@ -752,6 +752,79 @@ def test_broken_module_reports_error():
             raise AssertionError("a broken module must not be silently ignored")
 
 
+# --------------------------------------------- stdlib / checker consistency
+def test_every_runtime_builtin_is_known_to_the_checker():
+    """A function callable at runtime must not be rejected statically."""
+    from ailang.stdlib import build_globals
+    from ailang.typecheck import BUILTIN_SIGS
+
+    runtime = set(build_globals())
+    declared = set(BUILTIN_SIGS)
+    missing = sorted(runtime - declared)
+    assert not missing, f"callable but rejected by the checker: {missing}"
+
+
+def test_every_declared_builtin_exists_at_runtime():
+    from ailang.stdlib import build_globals
+    from ailang.typecheck import BUILTIN_SIGS
+
+    runtime = set(build_globals())
+    declared = set(BUILTIN_SIGS)
+    phantom = sorted(declared - runtime)
+    assert not phantom, f"declared by the checker but missing at runtime: {phantom}"
+
+
+def test_builtin_signature_arity_matches_implementation():
+    """Catch signatures that promise more/fewer params than the function takes."""
+    import inspect
+
+    from ailang.stdlib import build_globals
+    from ailang.typecheck import BUILTIN_SIGS
+
+    g = build_globals()
+    problems = []
+    for name, spec in BUILTIN_SIGS.items():
+        fn = g.get(name)
+        if fn is None or not callable(fn):
+            continue
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            continue
+        if any(p.kind == p.VAR_POSITIONAL for p in sig.parameters.values()):
+            continue
+        declared = len(spec[0])
+        optional = spec[2] if len(spec) > 2 else 0
+        required = declared - optional
+        real_total = len(sig.parameters)
+        real_required = sum(1 for p in sig.parameters.values() if p.default is p.empty)
+        if required < real_required or declared > real_total:
+            problems.append(
+                f"{name}: checker accepts {required}-{declared}, "
+                f"implementation takes {real_required}-{real_total}"
+            )
+    assert not problems, "signature mismatches:\n  " + "\n  ".join(problems)
+
+
+def test_append_file_is_callable():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "log.txt"
+        src = f'''
+write_file("{path}", "a").
+append_file("{path}", "b").
+emit read_file("{path}").
+'''
+        assert out(src) == "ab"
+
+
+def test_pad_left_is_callable():
+    # `out()` strips surrounding whitespace, so anchor both sides
+    assert out('emit "|" + pad_left("7", 3) + "|".') == "|  7|"
+    assert out('emit "|" + pad("7", 3) + "|".') == "|7  |"
+
+
 def _run_all():
     mod = sys.modules[__name__]
     tests = sorted(n for n in dir(mod) if n.startswith("test_"))
