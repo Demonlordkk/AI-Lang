@@ -825,6 +825,73 @@ def test_pad_left_is_callable():
     assert out('emit "|" + pad("7", 3) + "|".') == "|7  |"
 
 
+# ------------------------------------------------ v0.1 specification syntax
+def test_original_spec_syntax_still_runs():
+    """Every construct in docs/05_syntax.md must keep working."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "math.al").write_text(
+            "fn square(n: Int) -> Int:\n    give n * n.\ndone.\n", encoding="utf-8"
+        )
+        src = """
+use math.
+
+let score := 42.
+var counter := 42.
+counter <- 43.
+emit "hello".
+
+when score > 40:
+    emit "high".
+else:
+    emit "low".
+done.
+
+fn add(a: Int, b: Int) -> Int:
+    give a + b.
+done.
+
+let values := [1, 2, 3].
+repeat item in values:
+    emit item.
+done.
+
+record Point:
+    x: Real.
+    y: Real.
+done.
+
+let real_count := 7.9.
+let count := to Int(real_count).
+emit count.
+emit add(1, 2).
+emit math.square(5).
+"""
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            run_source(src, str(base / "main.al"), [base])
+        assert buf.getvalue().split() == [
+            "hello", "high", "1", "2", "3", "7", "3", "25"
+        ]
+
+
+def test_bare_use_binds_module_name():
+    """`use math.` (no alias) must bind `math`, per the v0.1 spec."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        (base / "helper.al").write_text(
+            "fn twice(n: Int) -> Int:\n    give n * 2.\ndone.\n", encoding="utf-8"
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            run_source("use helper.\nemit helper.twice(21).", str(base / "m.al"), [base])
+        assert buf.getvalue().strip() == "42"
+
+
 def _run_all():
     mod = sys.modules[__name__]
     tests = sorted(n for n in dir(mod) if n.startswith("test_"))
