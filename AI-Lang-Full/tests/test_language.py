@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from ailang.errors import AILangError, CheckError, ParseError, VMError  # noqa: E402
-from ailang.toolchain import run_source  # noqa: E402
+from ailang.toolchain import run_file, run_source  # noqa: E402
 
 
 def out(source: str, check=True) -> str:
@@ -285,6 +285,94 @@ emit [1, 2, 3, 4, 5, 6]
     |> sum().
 """
     assert out(src) == "56"
+
+
+def test_pipeline_is_lowest_precedence():
+    """`a |> f(b)` binds as `f(a, b)` — the pipe is looser than every other
+    operator, and chained pipes apply left to right."""
+    assert out("emit 1 - 6 |> abs().") == "5"
+    assert out("emit 2 * 3 |> abs().") == "6"
+    src = """
+fn add3(x: Int, n: Int) -> Int:
+    give x + n.
+done.
+fn double(x: Int) -> Int:
+    give x * 2.
+done.
+emit 10 |> add3(4) |> double().
+"""
+    assert out(src) == "28"
+    assert out('emit "ab" + "cd" |> upper().') == "ABCD"
+
+
+def test_named_args_to_builtins():
+    """Named arguments must work for builtins with the documented names, and
+    the checker's parameter names must never drift from the implementations
+    (which used to leak raw Python TypeErrors, e.g. `5 |> max(a: 3)`)."""
+    assert out("emit round(value: 2.567, digits: 2).") == "2.57"
+    assert out('emit upper(text: "hi").') == "HI"
+    assert out("emit pow(base: 2, exp: 10).") == "1024.0"
+    assert out('emit repeat_text(text: "ab", times: 3).') == "ababab"
+    # variadic builtins: named args rejected at check time, cleanly
+    fails("emit max(a: 1, b: 2).", "positional arguments only")
+    fails("emit 5 |> max(a: 3).", "positional arguments only")
+    # unknown names rejected at check time
+    fails("emit round(bogus: 1).", "no parameter named 'bogus'")
+    # ...and at runtime when the checker is skipped — never a raw Python error
+    try:
+        out("emit 5 |> max(a: 3).", check=False)
+        assert False, "expected clean runtime error"
+    except AILangError as e:
+        assert "raw" not in str(e) and "unexpected keyword" not in str(e)
+        assert "max" in str(e)
+
+
+def test_run_file_restores_script_dir(tmp_path):
+    """`run_file` must not leak its script directory into the next program
+    in the same process (a cumulative-state bug that made relative paths in
+    later in-process runs resolve against an earlier example's folder)."""
+    from ailang.stdlib import script_dir
+
+    d = tmp_path / "prog"
+    d.mkdir()
+    (d / "data.txt").write_text("hello")
+    (d / "main.al").write_text('emit read_file("data.txt").')
+    prev = script_dir()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        run_file(str(d / "main.al"))
+    assert script_dir() == prev
+    assert buf.getvalue().strip() == "hello"
+
+
+def test_builtin_signatures_align_with_implementations():
+    """Structural guard: every parameter name the checker advertises for a
+    builtin must exist on the real Python implementation (or the implementation
+    must be variadic, in which case the checker must reject named args).
+    This is what keeps `x |> f(a: 1)` from ever reaching a raw Python call."""
+    import inspect
+
+    from ailang import stdlib
+    from ailang.typecheck import TypeChecker
+
+    g = stdlib.build_globals([])
+    tc = TypeChecker()
+    for name, sig in tc.functions.items():
+        fn = g.get(name)
+        if fn is None:
+            continue
+        try:
+            psig = list(inspect.signature(fn).parameters.values())
+        except (TypeError, ValueError):
+            continue
+        if any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in psig):
+            assert sig.variadic, f"{name}: impl is variadic, checker is not"
+            continue
+        real = {p.name for p in psig}
+        for pname, _ in sig.params:
+            assert pname in real, (
+                f"{name}: checker accepts named '{pname}' but impl has {sorted(real)}"
+            )
 
 
 def test_arity_error_is_static():

@@ -227,10 +227,52 @@ def _strides(shape):
 
 
 def _index_map(out_shape, in_shape):
-    """Map each output flat index to the source flat index under broadcasting."""
+    """Map each output flat index to the source flat index under broadcasting.
+
+    Returns None for the identity case, else a list `mapping` with
+    `mapping[flat]` = source flat index. The common broadcast patterns
+    (scalar, trailing-suffix bias, per-dim 1s) use single-division
+    fast paths instead of the general stride walk.
+    """
     if out_shape == in_shape:
         return None  # identity, no mapping needed
     n = _prod(out_shape)
+    if not in_shape:  # scalar broadcast: every output reads flat 0
+        return [0] * n
+    d = len(in_shape)
+    if in_shape == out_shape[-d:]:
+        # trailing-suffix broadcast, e.g. bias (m,) over (n, m)
+        tail = _prod(in_shape)
+        if tail == 1:
+            return [0] * n
+        return [flat % tail for flat in range(n)]
+    if d == len(out_shape) and all(
+        in_shape[i] in (1, out_shape[i]) for i in range(d)
+    ):
+        # in lines up with out dim-by-dim (each dim either equal or 1)
+        out_strides = _strides(out_shape)
+        in_strides = _strides(in_shape)
+        keep = [
+            (out_strides[i], in_strides[i], out_shape[i])
+            for i in range(d)
+            if in_shape[i] != 1
+        ]
+        if not keep:
+            return [0] * n
+        if len(keep) == 1:
+            # one non-unit dim: flat -> (flat // so) % size, rescaled by si
+            so, si, size = keep[0]
+            return [((flat // so) % size) * si for flat in range(n)]
+        mapping = [0] * n
+        for flat in range(n):
+            rem = flat
+            src = 0
+            for so, si, size in keep:
+                src += (rem // so) % size * si
+                rem %= so
+            mapping[flat] = src
+        return mapping
+    # general case: full stride walk
     out_strides = _strides(out_shape)
     in_strides = _strides(in_shape)
     pad = len(out_shape) - len(in_shape)
@@ -323,23 +365,32 @@ def _binary_op(a: Tensor, b: Tensor, fwd, back_a, back_b, name, np_fwd=None, np_
 
     ma = _index_map(shape, a.shape)
     mb = _index_map(shape, b.shape)
-    out = [0.0] * n
-    for i in range(n):
-        out[i] = fwd(ad[ma[i] if ma else i], bd[mb[i] if mb else i])
+    if ma is None and mb is None:
+        out = [fwd(x, y) for x, y in zip(ad, bd)]
 
-    def backward(g):
-        if a.requires_grad:
-            ga = [0.0] * a.size
-            for i in range(n):
-                si = ma[i] if ma else i
-                ga[si] += back_a(ad[si], bd[mb[i] if mb else i], out[i]) * g[i]
-            a._accum(ga)
-        if b.requires_grad:
-            gb = [0.0] * b.size
-            for i in range(n):
-                si = mb[i] if mb else i
-                gb[si] += back_b(ad[ma[i] if ma else i], bd[si], out[i]) * g[i]
-            b._accum(gb)
+        def backward(g):
+            if a.requires_grad:
+                a._accum([back_a(x, y, o) * gi for x, y, o, gi in zip(ad, bd, out, g)])
+            if b.requires_grad:
+                b._accum([back_b(x, y, o) * gi for x, y, o, gi in zip(ad, bd, out, g)])
+    else:
+        out = [0.0] * n
+        for i in range(n):
+            out[i] = fwd(ad[ma[i] if ma else i], bd[mb[i] if mb else i])
+
+        def backward(g):
+            if a.requires_grad:
+                ga = [0.0] * a.size
+                for i in range(n):
+                    si = ma[i] if ma else i
+                    ga[si] += back_a(ad[si], bd[mb[i] if mb else i], out[i]) * g[i]
+                a._accum(ga)
+            if b.requires_grad:
+                gb = [0.0] * b.size
+                for i in range(n):
+                    si = mb[i] if mb else i
+                    gb[si] += back_b(ad[ma[i] if ma else i], bd[si], out[i]) * g[i]
+                b._accum(gb)
 
     return a._child(out, shape, (a, b), backward, name)
 
@@ -644,6 +695,7 @@ def matmul(a, b):
 
         return a._child(out, (n, m), (a, b), backward, "matmul")
 
+    brows = [bd[p * m:(p + 1) * m] for p in range(k)]
     out = [0.0] * (n * m)
     for i in range(n):
         ai = i * k
@@ -652,29 +704,34 @@ def matmul(a, b):
             av = ad[ai + p]
             if av == 0.0:
                 continue
-            bp = p * m
+            brow = brows[p]
             for j in range(m):
-                out[oi + j] += av * bd[bp + j]
+                out[oi + j] += av * brow[j]
 
     def backward(g):
         if a.requires_grad:
+            # ga = g @ B^T, as row dots against B's rows
             ga = [0.0] * (n * k)
             for i in range(n):
+                grow = g[i * m:(i + 1) * m]
+                base = i * k
                 for p in range(k):
                     s = 0.0
-                    bp = p * m
-                    gi = i * m
-                    for j in range(m):
-                        s += g[gi + j] * bd[bp + j]
-                    ga[i * k + p] = s
+                    for x, y in zip(grow, brows[p]):
+                        s += x * y
+                    ga[base + p] = s
             a._accum(ga)
         if b.requires_grad:
+            # gb = A^T @ g, as column dots
+            acols = [[ad[i * k + p] for i in range(n)] for p in range(k)]
+            gcols = [[g[i * m + j] for i in range(n)] for j in range(m)]
             gb = [0.0] * (k * m)
             for p in range(k):
+                ap = acols[p]
                 for j in range(m):
                     s = 0.0
-                    for i in range(n):
-                        s += ad[i * k + p] * g[i * m + j]
+                    for x, y in zip(ap, gcols[j]):
+                        s += x * y
                     gb[p * m + j] = s
             b._accum(gb)
 

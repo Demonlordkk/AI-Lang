@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .errors import AILangError, AILangRaise, VMError
+import inspect
 from .opcodes import NAMES, OPS
 from .values import Module, RecordType, RecordValue, display, is_truthy, type_name
 
@@ -906,14 +907,41 @@ class VM:
         if isinstance(callee, Closure):
             return self.invoke(callee, args, kwargs)
         if isinstance(callee, RecordType):
-            return callee(*args, **kwargs)
-        if callable(callee):
+            name = getattr(callee, "name", "record")
             try:
                 return callee(*args, **kwargs)
             except TypeError as e:
-                name = getattr(callee, "ailang_name", getattr(callee, "__name__", "function"))
+                raise VMError(f"{name}: {e}") from e
+        if callable(callee):
+            name = getattr(callee, "ailang_name", getattr(callee, "__name__", "function"))
+            if kwargs:
+                _check_python_named_args(callee, kwargs, name)
+            try:
+                return callee(*args, **kwargs)
+            except TypeError as e:
                 raise VMError(f"{name}: {e}") from e
         raise VMError(f"value of type {type_name(callee)} is not callable")
+
+
+def _check_python_named_args(fn, kwargs, name):
+    """Named arguments to a Python builtin must exist on its real signature;
+    otherwise the call would leak a raw Python TypeError into the user.
+    (The checker already enforces this; this guards `check=False` runs.)"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        raise VMError(f"{name}: does not accept named arguments")
+    named = [
+        p.name for p in sig.parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    for key in kwargs:
+        if key not in named:
+            if not named:
+                raise VMError(f"{name}: takes positional arguments only")
+            raise VMError(
+                f"{name}: unknown parameter '{key}' (expected {', '.join(named)})"
+            )
 
 
 _SENTINEL = object()

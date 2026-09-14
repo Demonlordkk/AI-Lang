@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from .errors import AILangError
+from .errors import AILangError, ProcessExit
 from .version import LANGUAGE, VERSION
 
 BANNER = f"{LANGUAGE} {VERSION}"
@@ -19,6 +19,19 @@ def _fail(exc: AILangError, source=None, filename="<source>"):
     return 1
 
 
+def _read_source(path: Path) -> str:
+    """Read a program file. A non-UTF-8 or unreadable file is a clean
+    AI-Lang error, never a Python traceback."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise AILangError(
+            f"is not a valid UTF-8 text file: {e.reason} (byte {e.start})"
+        ) from None
+    except OSError as e:
+        raise AILangError(f"could not be read: {e.strerror or e}") from None
+
+
 def cmd_run(args):
     from .toolchain import run_file
 
@@ -26,10 +39,13 @@ def cmd_run(args):
     if not path.is_file():
         print(f"ailang: no such file: {path}", file=sys.stderr)
         return 1
-    source = path.read_text(encoding="utf-8")
+    source = None
     try:
+        source = _read_source(path)
         run_file(path, argv=args.args, check=not args.no_check)
         return 0
+    except ProcessExit as e:
+        return e.code
     except AILangError as e:
         return _fail(e, source, str(path))
     except RecursionError:
@@ -41,8 +57,9 @@ def cmd_check(args):
     from .toolchain import compile_source
 
     path = Path(args.file)
-    source = path.read_text(encoding="utf-8")
+    source = None
     try:
+        source = _read_source(path)
         compile_source(source, str(path), [path.parent.resolve(), Path.cwd()])
     except AILangError as e:
         return _fail(e, source, str(path))
@@ -55,8 +72,9 @@ def cmd_build(args):
     from .toolchain import compile_source
 
     path = Path(args.file)
-    source = path.read_text(encoding="utf-8")
+    source = None
     try:
+        source = _read_source(path)
         program = compile_source(source, str(path), [path.parent.resolve(), Path.cwd()])
     except AILangError as e:
         return _fail(e, source, str(path))
@@ -159,7 +177,10 @@ def cmd_fmt(args):
     from .format import format_source
 
     path = Path(args.file)
-    source = path.read_text(encoding="utf-8")
+    try:
+        source = _read_source(path)
+    except AILangError as e:
+        return _fail(e, None, str(path))
     formatted = format_source(source)
     if args.check:
         if formatted != source:
@@ -179,7 +200,10 @@ def cmd_lint(args):
     from .format import lint
 
     path = Path(args.file)
-    source = path.read_text(encoding="utf-8")
+    try:
+        source = _read_source(path)
+    except AILangError as e:
+        return _fail(e, None, str(path))
     issues = lint(source)
     for line, message in issues:
         print(f"{path}:{line}: {message}")
@@ -198,8 +222,9 @@ def cmd_test(args):
     from .modules import ModuleLoader
 
     path = Path(args.file)
-    source = path.read_text(encoding="utf-8")
+    source = None
     try:
+        source = _read_source(path)
         program = compile_source(source, str(path), [path.parent.resolve(), Path.cwd()])
     except AILangError as e:
         return _fail(e, source, str(path))

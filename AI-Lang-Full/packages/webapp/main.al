@@ -246,3 +246,55 @@ fn start(app: App, port: Int, host: Text, background: Bool) -> Any:
     done.
     give serve(port, router, host, background).
 done.
+
+# --------------------------------------------------------------- professional
+# Standard middleware factories for production-style apps: request logging,
+# a JSON error handler that turns exceptions into 500s, and a simple
+# in-memory rate limiter.
+
+# Request logging: prints "METHOD /path -> STATUS" for every dispatched
+# request. Works under w.dispatch() too, so tests can see the log.
+fn make_logger() -> Function:
+    give fn(req: Map, cont: Function) -> Map:
+        let res := cont(req).
+        emit req.method + " " + req.path + " -> " + to Text(res.status).
+        give res.
+    done.
+done.
+
+# Error handler: any exception raised by a route becomes a clean JSON 500
+# (and a one-line log when log is true) instead of a failed request.
+fn make_error_handler(log: Bool) -> Function:
+    give fn(req: Map, cont: Function) -> Map:
+        attempt:
+            give cont(req).
+        rescue e:
+            when log:
+                emit "error on " + req.method + " " + req.path + ": " + e.message.
+            done.
+            give {"status": 500, "headers": {"content-type": "application/json"}, "body": json_encode({"error": e.message})}.
+        done.
+    done.
+done.
+
+# In-memory rate limit: at most `limit` requests per `window_s` seconds,
+# tracked per "METHOD /path". Over-limit requests get a clean 429 JSON.
+fn make_throttle(limit: Int, window_s: Real) -> Function:
+    var hits := {}.
+    give fn(req: Map, cont: Function) -> Map:
+        let t := now().
+        let key := req.method + " " + req.path.
+        var start := get(hits, key, 0.0).
+        var count := get(hits, key + "#n", 0).
+        when t - start >= window_s:
+            start <- t.
+            count <- 0.
+        done.
+        when count >= limit:
+            give {"status": 429, "headers": {"content-type": "application/json"}, "body": json_encode({"error": "rate limit exceeded"})}.
+        done.
+        hits <- set(hits, key, start).
+        hits <- set(hits, key + "#n", count + 1).
+        give cont(req).
+    done.
+done.

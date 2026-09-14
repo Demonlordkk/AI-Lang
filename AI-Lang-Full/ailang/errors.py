@@ -76,6 +76,16 @@ class ImportError_(AILangError):
     stage = "import error"
 
 
+class ProcessExit(BaseException):
+    """Raised by the `exit` builtin to terminate the host process with a
+    status code. Deliberately not an AILangError: attempt/rescue must not
+    be able to catch a process termination."""
+
+    def __init__(self, code: int = 0):
+        super().__init__(f"exit({code})")
+        self.code = int(code)
+
+
 class AILangRaise(AILangError):
     """A value raised by user code via `raise`. Catchable with attempt/rescue."""
 

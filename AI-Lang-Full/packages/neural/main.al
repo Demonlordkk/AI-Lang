@@ -100,3 +100,32 @@ fn accuracy(probs: Any, expected: List) -> Real:
     done.
     give to Real(correct) / to Real(len(got)).
 done.
+
+# ---------------------------------------------------------------- persistence
+# A trained net as a JSON file: weights and biases as nested lists. Train
+# once, then load the file from a web app or a CLI without retraining —
+# this is the bridge between the neural package and app building.
+
+# Save `net` to `path` (JSON, exact float round-trip).
+fn save(net: Any, path: Text):
+    var ws := [].
+    var bs := [].
+    repeat layer in net.layers:
+        append(ws, value_of(layer.w)).
+        append(bs, value_of(layer.b)).
+    done.
+    write_file(path, json_encode({"weights": ws, "biases": bs})).
+done.
+
+# Load a net saved by save(); the weights are fresh trainable params, so the
+# loaded model can also be fine-tuned.
+fn load(path: Text) -> Any:
+    let doc := json_decode(read_file(path)).
+    var layers := [].
+    var i := 0.
+    while i < len(doc.weights):
+        append(layers, Layer(param(tensor(doc.weights[i])), param(tensor(doc.biases[i])))).
+        i <- i + 1.
+    done.
+    give Net(layers).
+done.

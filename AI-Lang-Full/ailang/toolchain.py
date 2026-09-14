@@ -79,14 +79,20 @@ def run_file(path, argv=None, check=True, fuel=50_000_000):
     source = p.read_text(encoding="utf-8")
     # relative paths inside the program resolve against the program's own
     # directory, so a script behaves the same no matter where it is run from
-    from .stdlib import set_script_dir
+    from .stdlib import script_dir, set_script_dir
 
+    # script dir is process-global; save/restore so one run never leaks its
+    # base directory into the next (tests run many programs in one process)
+    prev = script_dir()
     set_script_dir(p.parent.resolve())
-    paths = [p.parent.resolve(), Path.cwd()]
-    root = _project_root(p.parent.resolve())
-    if root is not None and root not in paths:
-        paths.append(root)
-    return run_source(source, str(p), paths, argv, check, fuel)
+    try:
+        paths = [p.parent.resolve(), Path.cwd()]
+        root = _project_root(p.parent.resolve())
+        if root is not None and root not in paths:
+            paths.append(root)
+        return run_source(source, str(p), paths, argv, check, fuel)
+    finally:
+        set_script_dir(prev)
 
 
 def eval_source(source: str, search_paths=None):

@@ -21,3 +21,6 @@ examples/showcase/*.csv
 examples/apps/*.db
 examples/apps/*.db-wal
 examples/apps/*.db-shm
+
+# trained model artifacts (created by examples/apps)
+*.almodel

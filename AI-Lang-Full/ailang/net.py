@@ -22,6 +22,7 @@ import json
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import atexit
 from urllib.parse import parse_qs, urlparse
 
 from .errors import VMError
@@ -210,9 +211,27 @@ def serve(port, handler, host="0.0.0.0", background=False):
     return None
 
 
-def serve_stop(info):
+def _shutdown_all():
+    """Stop any servers still running at interpreter exit so a suite or
+    long-running host process never keeps orphaned threads alive."""
+    for ident, httpd in list(_servers.items()):
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        _servers.pop(ident, None)
+
+
+atexit.register(_shutdown_all)
+
+
+def serve_stop(server):
     """Stop a background server started by serve(..., background: true)."""
-    ident = info.get("id") if isinstance(info, dict) else info
+    ident = server.get("id") if isinstance(server, dict) else server
     httpd = _servers.pop(ident, None)
     if httpd is None:
         raise VMError("serve_stop: no such server")

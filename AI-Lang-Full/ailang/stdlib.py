@@ -67,18 +67,18 @@ def _sort_key(v):
 
 
 # ------------------------------------------------------------------ core
-def _len(v):
-    if isinstance(v, (list, str, dict)):
-        return len(v)
-    if isinstance(v, RecordValue):
-        return len(v.data)
-    raise VMError(f"len: cannot measure {type_name(v)}")
+def _len(value):
+    if isinstance(value, (list, str, dict)):
+        return len(value)
+    if isinstance(value, RecordValue):
+        return len(value.data)
+    raise VMError(f"len: cannot measure {type_name(value)}")
 
 
-def _abs(v):
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise VMError(f"abs: needs a number, got {type_name(v)}")
-    return abs(v)
+def _abs(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VMError(f"abs: needs a number, got {type_name(value)}")
+    return abs(value)
 
 
 def _sum(items):
@@ -91,24 +91,24 @@ def _sum(items):
     return total
 
 
-def _to_int(v):
+def _to_int(value):
     from .vm import _convert
 
-    return _convert("Int", v)
+    return _convert("Int", value)
 
 
-def _to_real(v):
+def _to_real(value):
     from .vm import _convert
 
-    return _convert("Real", v)
+    return _convert("Real", value)
 
 
-def _sqrt(v):
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        raise VMError(f"sqrt: needs a number, got {type_name(v)}")
-    if v < 0:
+def _sqrt(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise VMError(f"sqrt: needs a number, got {type_name(value)}")
+    if value < 0:
         raise VMError("sqrt: cannot take the square root of a negative number")
-    return math.sqrt(v)
+    return math.sqrt(value)
 
 
 def _assert(cond, message="assertion failed"):
@@ -430,6 +430,11 @@ def set_script_dir(path):
     _SCRIPT_DIR = os.fspath(path) if path is not None else None
 
 
+def script_dir():
+    """Current script directory (the one relative paths resolve against)."""
+    return _SCRIPT_DIR
+
+
 def _resolve(path):
     """Resolve a program-supplied path against the script directory.
 
@@ -450,6 +455,25 @@ def _resolve(path):
     # neither exists: report against the script directory, which is where the
     # author almost certainly meant the file to be
     return candidate
+
+
+def _exit(code=0):
+    """Terminate the program with a status code (default 0)."""
+    from .errors import ProcessExit
+
+    raise ProcessExit(int(code))
+
+
+def _read_line():
+    """Read one line from standard input (no trailing newline); empty string
+    at end of input. The building block for interactive CLI programs."""
+    try:
+        line = sys.stdin.readline()
+    except (EOFError, OSError):
+        return ""
+    if line == "":
+        return ""
+    return line.rstrip("\n").rstrip("\r")
 
 
 def _read_file(path):
@@ -1140,12 +1164,12 @@ def _factorial(n):
     return math.factorial(i)
 
 
-def _pow(a, b):
+def _pow(base, exp):
     try:
-        return float(a) ** float(b)
+        return float(base) ** float(exp)
     except (ValueError, OverflowError) as e:
         raise VMError(
-            f"pow: {display(a)} ^ {display(b)} has no real result"
+            f"pow: {display(base)} ^ {display(exp)} has no real result"
         ) from e
 
 
@@ -1657,9 +1681,9 @@ def build_globals(argv=None):
         "len": _len,
         "type_of": type_name,
         "abs": _abs,
-        "floor": lambda v: math.floor(v),
-        "ceil": lambda v: math.ceil(v),
-        "round": lambda v, d=0: round(v, d) if d else round(v),
+        "floor": lambda value: math.floor(value),
+        "ceil": lambda value: math.ceil(value),
+        "round": lambda value, digits=0: round(value, digits) if digits else round(value),
         "sqrt": _sqrt,
         "pow": _pow,
         "min": lambda *a: min(a[0], key=_sort_key) if len(a) == 1 and isinstance(a[0], list) else min(a, key=_sort_key),
@@ -1667,10 +1691,10 @@ def build_globals(argv=None):
         "sum": _sum,
         "clock": time.time,
         "now": time.time,
-        "sleep": lambda s: time.sleep(min(float(s), 30)),
-        "print": lambda v="": (print(display(v)), None)[1],
+        "sleep": lambda seconds: time.sleep(min(float(seconds), 30)),
+        "print": lambda value="": (print(display(value)), None)[1],
         "assert": _assert,
-        "is_nothing": lambda v: v is None,
+        "is_nothing": lambda value: value is None,
         # conversions
         "str": display,
         "int": _to_int,
@@ -1679,20 +1703,20 @@ def build_globals(argv=None):
         # text
         "join": lambda items, sep="": sep.join(display(x) for x in _need_list(items, "join")),
         "split": _split,
-        "upper": lambda t: _need_text(t, "upper").upper(),
-        "lower": lambda t: _need_text(t, "lower").lower(),
-        "trim": lambda t: _need_text(t, "trim").strip(),
-        "replace": lambda t, o, n: _need_text(t, "replace").replace(o, n),
+        "upper": lambda text: _need_text(text, "upper").upper(),
+        "lower": lambda text: _need_text(text, "lower").lower(),
+        "trim": lambda text: _need_text(text, "trim").strip(),
+        "replace": lambda text, old, new: _need_text(text, "replace").replace(old, new),
         "contains": _contains,
-        "starts_with": lambda t, p: _need_text(t, "starts_with").startswith(p),
-        "ends_with": lambda t, s: _need_text(t, "ends_with").endswith(s),
+        "starts_with": lambda text, prefix: _need_text(text, "starts_with").startswith(prefix),
+        "ends_with": lambda text, suffix: _need_text(text, "ends_with").endswith(suffix),
         "format": _format,
-        "pad": lambda t, w: display(t).ljust(int(w)),
-        "pad_left": lambda t, w: display(t).rjust(int(w)),
-        "repeat_text": lambda t, n: _need_text(t, "repeat_text") * max(int(n), 0),
-        "chars": lambda t: list(_need_text(t, "chars")),
-        "code_of": lambda t: ord(_need_text(t, "code_of")[0]),
-        "text_of": lambda c: chr(int(c)),
+        "pad": lambda text, width: display(text).ljust(int(width)),
+        "pad_left": lambda text, width: display(text).rjust(int(width)),
+        "repeat_text": lambda text, times: _need_text(text, "repeat_text") * max(int(times), 0),
+        "chars": lambda text: list(_need_text(text, "chars")),
+        "code_of": lambda text: ord(_need_text(text, "code_of")[0]),
+        "text_of": lambda code: chr(int(code)),
         "index_of": _index_of,
         # lists
         "range": _range,
@@ -1842,11 +1866,13 @@ def build_globals(argv=None):
         "log": lambda x, base=None: math.log(x) if base is None else math.log(x, base),
         # data
         "json_encode": _json_encode,
+        "read_line": _read_line,
+        "exit": _exit,
         "json_decode": _json_decode,
-        "hash_text": lambda t: hashlib.sha256(_need_text(t, "hash_text").encode()).hexdigest(),
+        "hash_text": lambda text: hashlib.sha256(_need_text(text, "hash_text").encode()).hexdigest(),
         "uuid": lambda: str(_uuid.uuid4()),
         "random": _random.random,
-        "random_int": lambda a, b: _random.randint(int(a), int(b)),
+        "random_int": lambda low, high: _random.randint(int(low), int(high)),
         # io
         "read_file": _read_file,
         "write_file": _write_file,

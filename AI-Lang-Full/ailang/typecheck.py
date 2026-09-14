@@ -7,7 +7,8 @@ working while annotated code gets real guarantees.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from . import ast_nodes as A
@@ -52,6 +53,7 @@ class FnSig:
     ret: Ty
     name: str = ""
     optional: int = 0  # how many trailing params may be omitted
+    variadic: bool = False  # implementation takes *args; named args rejected
 
     @property
     def required(self):
@@ -246,6 +248,8 @@ BUILTIN_SIGS = {
     "delete_file": ([("path", TEXT)], VOID),
     "find_files": ([("root", TEXT), ("suffix", TEXT)], LIST, 1),
     "read_lines": ([("path", TEXT)], LIST),
+    "read_line": ([], TEXT),
+    "exit": ([("code", INT)], VOID, 1),
     "write_lines": ([("path", TEXT), ("lines", LIST)], VOID),
     "read_csv": ([("path", TEXT), ("sep", TEXT)], LIST, 1),
     "write_csv": ([("path", TEXT), ("rows", LIST), ("sep", TEXT)], VOID, 1),
@@ -418,6 +422,60 @@ def _edit_distance(a, b):
     return prev[-1]
 
 
+
+# -------------------------------------------------- builtin signature alignment
+
+_GLOBALS = None
+_BUILTIN_SIGS = None
+
+
+def _builtin_globals():
+    global _GLOBALS
+    if _GLOBALS is None:
+        from .stdlib import build_globals
+        _GLOBALS = build_globals([])
+    return _GLOBALS
+
+
+def _builtin_sigs():
+    """BUILTIN_SIGS reconciled against the *real* implementations: each
+    declared parameter name is replaced by the name at the same position in
+    the Python function, and implementations that take *args are marked
+    variadic (named arguments are rejected for them at check time).
+
+    This keeps the checker and the runtime from drifting: a named argument
+    that passes the checker is guaranteed to exist on the real function, so
+    `f(x: 1)` / `x |> f(a: 1)` can never leak a raw Python TypeError.
+    """
+    global _BUILTIN_SIGS
+    if _BUILTIN_SIGS is None:
+        g = _builtin_globals()
+        out = {}
+        for name, spec in BUILTIN_SIGS.items():
+            params, ret = spec[0], spec[1]
+            optional = spec[2] if len(spec) > 2 else 0
+            variadic = False
+            fn = g.get(name)
+            if fn is not None:
+                try:
+                    sig = inspect.signature(fn)
+                except (TypeError, ValueError):
+                    sig = None
+                if sig is not None:
+                    psig = list(sig.parameters.values())
+                    if any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in psig):
+                        variadic = True
+                    else:
+                        real = [p.name for p in psig]
+                        params = [
+                            (real[i] if i < len(real) else pn, pt)
+                            for i, (pn, pt) in enumerate(params)
+                        ]
+            out[name] = FnSig(params, ret, name, optional, variadic)
+        _BUILTIN_SIGS = out
+    return _BUILTIN_SIGS
+
+
 class TypeChecker:
     def __init__(self, module_resolver=None):
         self.diagnostics = []
@@ -429,10 +487,8 @@ class TypeChecker:
         self.module_resolver = module_resolver
         self.return_stack = []
         self.loop_depth = 0
-        for name, spec in BUILTIN_SIGS.items():
-            params, ret = spec[0], spec[1]
-            optional = spec[2] if len(spec) > 2 else 0
-            self.functions[name] = FnSig(params, ret, name, optional)
+        for name, sig in _builtin_sigs().items():
+            self.functions[name] = replace(sig)
             self.global_scope.declare(name, FUNCTION, False)
 
     # ------------------------------------------------------------ diagnostics
@@ -942,6 +998,17 @@ class TypeChecker:
     def check_arity(self, sig: FnSig, arg_types, node, is_record=False):
         positional = [t for name, t in arg_types if name is None]
         named = {name: t for name, t in arg_types if name is not None}
+        if sig.variadic:
+            if named:
+                self.error(f"function '{sig.name}' takes positional arguments only", node)
+                return
+            if len(positional) < 1:
+                self.error(
+                    f"function '{sig.name}' expects at least 1 argument but got {len(positional)}",
+                    node,
+                )
+                return
+            return
         total = len(positional) + len(named)
         low, high = sig.required, len(sig.params)
         if not (low <= total <= high):

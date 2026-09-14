@@ -404,3 +404,126 @@ def test_unsupported_function_is_declined_not_miscompiled():
     compiled = try_compile(fn, lambda n: None, "f", is_global=lambda n: True)
     assert compiled is not None
     assert compiled() == 1
+
+
+# ------------------------------------------------- pipeline / operator coverage
+#
+# The native compiler lifts functions to bytecode, so operator precedence and
+# the `|>` desugar must survive lifting exactly as they do in the VM.
+
+
+def test_pipeline_inside_native_function(tmp_path):
+    src = (
+        "fn add(x: Int, n: Int) -> Int:\n"
+        "    give x + n.\n"
+        "done.\n"
+        "fn half(x: Real) -> Real:\n"
+        "    give x / 2.\n"
+        "done.\n"
+        "fn f(x: Int) -> Real:\n"
+        "    give x |> add(10) |> half().\n"
+        "done.\n"
+        'emit to Text(f(7)) + " " + to Text(f(3)).\n'
+    )
+    assert both(src, tmp_path) == "8.5 6.5"
+
+
+def test_pipeline_precedence_in_lifted_conditionals(tmp_path):
+    src = (
+        "fn sign(x: Int) -> Text:\n"
+        "    when x > 0:\n"
+        '        give "pos".\n'
+        "    elif x < 0:\n"
+        '        give "neg".\n'
+        "    else:\n"
+        '        give "zero".\n'
+        "    done.\n"
+        "done.\n"
+        'emit sign(5 - 9) + sign(0) + sign(2 + 3).\n'
+    )
+    assert both(src, tmp_path) == "negzeropos"
+
+
+def test_named_args_in_native_functions(tmp_path):
+    src = (
+        "fn add2(a: Int, b: Int) -> Int:\n"
+        "    give a + b.\n"
+        "done.\n"
+        "fn f() -> Int:\n"
+        "    give add2(a: 4, b: 5) + add2(b: 6, a: 1).\n"
+        "done.\n"
+        "emit f().\n"
+    )
+    assert both(src, tmp_path) == "16"
+
+
+def test_coalesce_membership_and_pipe_in_loop(tmp_path):
+    src = (
+        "fn f(items: Any) -> Any:\n"
+        "    var out := [0].\n"
+        "    repeat x in items:\n"
+        "        when x in [0.5, 1.5]:\n"
+        "            out <- push(out, 1).\n"
+        "        done.\n"
+        "        when (x ?? 0.25) == 2.25:\n"
+        "            out <- push(out, 2).\n"
+        "        else:\n"
+        "            out <- push(out, 0).\n"
+        "        done.\n"
+        "    done.\n"
+        "    give out.\n"
+        "done.\n"
+        'emit f([0.5, 2.25, 3.0, 1.5]).\n'
+    )
+    assert both(src, tmp_path) == "[0, 1, 0, 2, 0, 1, 0]"
+
+
+def test_closure_using_pipe_in_native_code(tmp_path):
+    src = (
+        "fn make_scale(factor: Real) -> Function:\n"
+        "    give \\x -> x * factor.\n"
+        "done.\n"
+        "emit make_scale(3)(4.5).\n"
+    )
+    assert both(src, tmp_path) == "13.5"
+
+
+def test_when_with_pipe_in_nested_loops(tmp_path):
+    src = (
+        "fn f(n: Int) -> Int:\n"
+        "    var total := 0.\n"
+        "    repeat i in range(n):\n"
+        "        repeat j in range(n):\n"
+        "            when (i * 10 + j) % 3 == 0:\n"
+        "                total <- total + i + j.\n"
+        "            done.\n"
+        "        done.\n"
+        "    done.\n"
+        "    give total.\n"
+        "done.\n"
+        "emit f(5).\n"
+    )
+    assert both(src, tmp_path) == "30"
+
+
+def test_string_escapes_and_interpolation_in_native(tmp_path):
+    src = (
+        "fn greet(name: Text) -> Text:\n"
+        '    give "hi " + name + "\\n  \\"x\\".".\n'
+        "done.\n"
+        'emit greet("al").\n'
+    )
+    assert both(src, tmp_path) == 'hi al\n  "x".'
+
+def test_records_in_native_functions(tmp_path):
+    src = (
+        "record Point:\n"
+        "    x: Real.\n"
+        "    y: Real.\n"
+        "done.\n"
+        "fn dist(p: Point) -> Real:\n"
+        "    give (p.x * p.x + p.y * p.y) |> sqrt().\n"
+        "done.\n"
+        "emit dist(Point(3.0, 4.0)).\n"
+    )
+    assert both(src, tmp_path) == "5.0"

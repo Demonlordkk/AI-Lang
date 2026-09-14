@@ -191,7 +191,11 @@ emit sqrt(p.x * p.x + p.y * p.y).
 ### The pipeline operator
 
 `x |> f(a)` is exactly `f(x, a)`. It keeps data flow left-to-right and removes
-nested-call soup.
+nested-call soup. The pipe is the loosest binding operator in the language —
+lower than `+`, comparisons, and function arguments — so `1 - 6 |> abs()` is
+`abs(1 - 6)`, and `10 |> add(4) |> double()` applies left to right. Chained
+pipes compose, and they work inside call arguments, loop conditions, and
+lambdas exactly like any other expression.
 
 ```text
 emit range(20)
@@ -199,6 +203,12 @@ emit range(20)
     |> map(\x -> x * x)
     |> sum().
 ```
+
+Named arguments work through pipes too, with a hard guarantee: the checker
+reconciles every builtin's declared parameter names with its real
+implementation at startup, so `5 |> max(a: 3)` can never reach a Python
+function it was never going to match — it is a clean check error (`max` takes
+positional arguments only), not a crash.
 
 ### Errors
 
@@ -396,6 +406,7 @@ Available everywhere without imports.
 `random_int`
 
 **I/O** — `read_file` `write_file` `append_file` `env` `args` `input`
+`read_line` `exit`
 
 **Network** — `http_get` `http_post` `http_request` `serve` `serve_stop`
 
@@ -595,12 +606,18 @@ the language like any other value:
 2. **Train.** The loop above.
 3. **Evaluate.** `accuracy(probs, labels)` over the holdout, or `argmax` by
    hand for anything custom.
-4. **Serve.** The trained weights are just tensors, still live in the
-   process. `examples/apps/predictor.al` ends its training loop and starts a
-   web app in the same file: `POST /predict` runs the forward pass on the
-   request and answers with the class and a confidence. Train in AI-Lang,
-   deploy from AI-Lang — no serialization format or serving framework in
-   between.
+4. **Save.** `nn.save(net, "model.almodel")` writes the weights as a JSON
+   file — an exact float round-trip, so a loaded model predicts
+   bit-identically to the trained one.
+5. **Serve.** `examples/apps/predictor.al` is the whole story in one file:
+   train a classifier with the autodiff engine, save it, and start a web app
+   in the same process — `POST /predict` runs the forward pass on the request
+   and answers with the class and a confidence. The second run (and every
+   later run) skips training and loads the saved model instead, so the web
+   app starts in milliseconds. The same file powers a terminal app:
+   `examples/apps/cli_classifier.al` reads the same model format for its
+   `train` / `predict` / `report` commands. Train in AI-Lang, deploy from
+   AI-Lang — the model file is the only format in between.
 
 ### Two engines, one language
 
@@ -614,9 +631,9 @@ The autodiff engine has two backends with identical semantics:
   engine is live.
 
 Measured on this machine (`tools/bench_ml.py`): the same spiral-classification
-training program takes **10.2 s on the reference engine and 0.92 s on the
-numpy engine — an 11× speedup** — with bit-identical outputs. The test suite
-runs every example and differential test on both engines and asserts
+training program takes **6.3 s on the reference engine and 0.68 s on the
+numpy engine — about a 9× speedup** — with bit-identical outputs. The test
+suite runs every example and differential test on both engines and asserts
 identical output.
 
 A word about GPUs, said plainly: AI-Lang has **no built-in GPU path**. A
@@ -633,7 +650,7 @@ shipping a CUDA build of the interpreter.
 | Machine | What the model gets |
 | --- | --- |
 | Termux, Raspberry Pi, locked-down box | The reference engine — pure Python, nothing installed |
-| Desktop Python with numpy | The numpy engine, picked up automatically (~11× on training) |
+| Desktop Python with numpy | The numpy engine, picked up automatically (~9× on training) |
 | Colab / Jupyter | Same as desktop, in a single file |
 | CUDA server | The numpy engine for now; device speed is a binding away via FFI |
 
@@ -767,11 +784,19 @@ w.start(app, 8080, "127.0.0.1", true).
 | `w.json` / `w.html` / `w.text` | response builders |
 | `w.body_json(req)` | the request body decoded as a Map (`{}` when absent) |
 | `w.start(app, port, host, background)` | serve; pass the result to `serve_stop` |
+| `w.make_logger()` | request-log middleware: prints `METHOD /path -> STATUS` per request |
+| `w.make_error_handler(log)` | turns any route exception into a clean JSON 500 (and logs it) |
+| `w.make_throttle(limit, window_s)` | per-path rate limiter; over-limit requests get a clean JSON 429 |
 
 Because `dispatch` is just a function, routing logic is unit-testable: build
 the app, call `dispatch` with a request map, assert on the response map —
 that is exactly what `tests/test_webapp.py` does, plus one test that drives
 the finished app over real HTTP.
+
+The three `w.make_*` factories are the professional middleware layer: a
+production route gets logging, a 500 handler, and a rate limit with three
+lines of app setup, and each one is testable through `dispatch` without a
+server.
 
 Two complete apps ship in `examples/apps/`:
 
@@ -781,10 +806,11 @@ Two complete apps ship in `examples/apps/`:
   drives the finished app over HTTP — create, fetch, 404, delete — so the
   example is its own integration test, and it passes the two-engine parity
   gate.
-* **`predictor.al`** — trains a classifier with the autodiff engine and then
-  serves the live model as a `POST /predict` API in the same file: the
+* **`predictor.al`** — trains a classifier with the autodiff engine, saves
+  it as a model file, and serves the live model as a `POST /predict` API in
+  the same file; later runs load the saved model and skip training. The
   shortest distance in this language between "training" and "deployment" is
-  one `w.start`.
+  one `nn.save` and one `w.start`.
 
 ### Terminal apps
 
@@ -814,6 +840,38 @@ turns closed stdin into a clean stop, which is how it passes the parity gate.
 between runs. A todo CLI is a `given args[0]` over `is "add"`, `is "list"`,
 `is "done"` — a module-based todo app ships in `examples/todo_app`, and the
 web `notes.al` above is the same idea with an HTTP front end.
+
+`packages/cli` is the professional layer on top: declarative argument
+parsing, generated usage, aligned tables, a progress bar, ANSI color,
+interactive confirmation, and JSON config with defaults — all written in
+AI-Lang.
+
+```text
+use packages/cli as c.
+
+let spec := {"--rate": "real", "-e": "int", "--verbose": "flag", "--model": "text"}.
+attempt:
+    let args := c.parse(args(), spec).
+rescue e:
+    emit c.color(e.message, 31).
+    emit c.usage("classifier", spec, ["<command>  train | predict | report"]).
+    exit(2).
+done.
+emit c.table(["id", "score"], [["1", "0.97"]]).
+emit c.bar(7, 10, "training").
+```
+
+`c.parse` understands `--flag value`, `--flag=value`, `-f value`, boolean
+`--flag`, accumulating `--tag` lists, a `--` separator, and negative numbers
+(`predict -0.5 0.9` stays positional); unknown flags and bad numbers raise
+clean, descriptive errors instead of crashing. `c.config(path, defaults)`
+reads a JSON config over defaults; `c.confirm("Sure?")` reads a y/N from
+`read_line()`; and `exit(code)` terminates with a real status code.
+
+`examples/apps/cli_classifier.al` is a complete normal app built on it:
+`train` trains and saves a neural model, `predict x y` loads the model and
+answers, `report` prints a table — the same model file `predictor.al` the
+web app uses, so the ML and the apps genuinely share one artifact.
 
 ### Anything else
 
@@ -907,12 +965,14 @@ so an install is reproducible and tampering is detected:
   stats: digest mismatch (expected sha256:521cfc2dc981..., got sha256:a96c18a8b34a...)
 ```
 
-Five packages ship in `packages/`: `text` (casing, padding, word counts),
+Six packages ship in `packages/`: `text` (casing, padding, word counts),
 `collections` (set operations, rotation, frequency tables), `testing`
 (assertions that report what actually differed), `neural` (a feed-forward
-net built from the tensor operators — see
-[Building models](#building-models-automatic-differentiation)) and `webapp`
-(routing, static files and middleware for web apps — see
+net built from the tensor operators, plus model save/load — see
+[Building models](#building-models-automatic-differentiation)), `webapp`
+(routing, static files, middleware and the professional `make_*` helpers for
+web apps — see [Building apps](#building-apps)) and `cli` (argument parsing,
+usage text, tables, progress bars, color and config for terminal apps — see
 [Building apps](#building-apps)).
 
 ## Running anywhere
