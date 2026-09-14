@@ -112,6 +112,7 @@ def format_source(source: str) -> str:
                 depth = max(depth - 1, 0)
 
         normalised = _normalise(line)
+        code = _mask_strings(normalised)  # structure lives outside literals
 
         if is_continuation:
             # A continuation hangs one level in from its owning statement,
@@ -140,21 +141,23 @@ def format_source(source: str) -> str:
         bracket = max(bracket + delta, 0)
 
         # A statement is finished when brackets are balanced and it ends with
-        # `.` (statement terminator) or opens a block with `:`.
+        # `.` (statement terminator) or opens a block with `:`. Both checks
+        # must run on the string-masked line: `emit "done."` is a complete
+        # statement, and `emit "url:"` does not open a block.
         if bracket > 0:
-            if _OPENS.search(normalised):
+            if _OPENS.search(code):
                 cont_depth += 1
             continued = True
-        elif _OPENS.search(normalised):
+        elif _OPENS.search(code):
             if not is_continuation:
                 depth += 1
             else:
                 cont_depth += 1
             continued = False
-        elif normalised.endswith("."):
+        elif code.endswith("."):
             continued = False
             cont_depth = 0
-        elif normalised.endswith(":"):
+        elif code.endswith(":"):
             continued = False
         else:
             # e.g. a line ending in `|>` or a dangling operator
@@ -163,6 +166,32 @@ def format_source(source: str) -> str:
     while out and not out[-1]:
         out.pop()
     return "\n".join(out) + ("\n" if out else "")
+
+
+def _mask_strings(line: str) -> str:
+    """Return `line` with the *contents* of text literals removed.
+
+    Statement-structure checks (does this line end with `.`, open a block
+    with `:`?) must look at code, not string data -- `emit "done."` is a
+    complete statement, and the `:` inside `"url:"` is not a block opener.
+    """
+    out = []
+    in_str = False
+    esc = False
+    for c in line:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            else:
+                out.append(c)
+    return "".join(out)
 
 
 def _normalise(line: str) -> str:

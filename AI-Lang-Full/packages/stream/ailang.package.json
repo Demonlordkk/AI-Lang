@@ -1,0 +1,1 @@
+{"name": "stream", "version": "1.0.0", "description": "Lazy infinite streams written in AI-Lang: build one from a zero-arg next-value function, then take, map, filter, find and zip — infinite data with the memory cost of one value.", "dependencies": {}}

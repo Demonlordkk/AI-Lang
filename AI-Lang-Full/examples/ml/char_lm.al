@@ -5,7 +5,7 @@
 # unrolled recurrence is a plain `while` loop -- no special "RNN" primitive.
 # Every arrow in the computation graph is recorded by the t_* ops, so
 # backward() flows the cross-entropy loss back through all 200+ unrolled
-# steps to the weight matrices, and adamw updates them.
+# steps (135 of them) to the weight matrices, and adamw updates them.
 #
 #   * ce_t       -- softmax cross-entropy, summed over the sequence
 #   * adamw      -- the modern default optimizer
@@ -13,7 +13,7 @@
 seed(3).
 
 let base := "the dog barks and the fox jumps and the dog jumps and the fox barks ".
-let text := base + base + base.
+let text := base + base.
 
 var vocab := [].
 repeat ch in chars(text):
@@ -64,14 +64,14 @@ done.
 emit "RNN char LM: {L} characters, {vsize} symbols, hidden {H}".
 var epoch := 0.
 var ls := 0.0.
-while epoch < 120:
+while epoch < 80:
     zero_grad(params).
     let loss := seq_loss().
     backward(loss).
     adamw_step(opt).
     ls <- value_of(loss).
 
-    when epoch % 40 == 0:
+    when epoch % 20 == 0:
         emit "  step {pad_left(to Text(epoch), 3)}  loss {round(ls, 5)}".
     done.
     epoch <- epoch + 1.

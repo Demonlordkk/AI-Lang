@@ -457,6 +457,51 @@ def _resolve(path):
     return candidate
 
 
+def _memo(fn):
+    """Memoize a one-argument function: repeated calls with equal arguments
+    return the cached result instead of recomputing. The cache is a normal
+    dict, so keys must be hashable (numbers, text, lists)."""
+    _need_fn(fn, "memo")
+    cache = {}
+
+    def wrapper(arg):
+        key = _hashable_key(arg)
+        if key in cache:
+            return cache[key]
+        val = fn(arg)
+        cache[key] = val
+        return val
+
+    wrapper.ailang_name = "memo(" + getattr(fn, "ailang_name", getattr(fn, "__name__", "fn")) + ")"
+    return wrapper
+
+
+def _memo_rec(fn):
+    """Memoize a recursive one-argument function: the wrapper is passed to
+    the body as `self`, so recursive calls go through the cache.
+
+        let fib := memo_rec(fn(self: Function, n: Int) -> Int:
+            when n < 2:
+                give n.
+            done.
+            give self(n - 1) + self(n - 2).
+        done).
+    """
+    _need_fn(fn, "memo_rec")
+    cache = {}
+
+    def wrapper(arg):
+        key = _hashable_key(arg)
+        if key in cache:
+            return cache[key]
+        val = fn(wrapper, arg)
+        cache[key] = val
+        return val
+
+    wrapper.ailang_name = "memo_rec(" + getattr(fn, "ailang_name", getattr(fn, "__name__", "fn")) + ")"
+    return wrapper
+
+
 def _exit(code=0):
     """Terminate the program with a status code (default 0)."""
     from .errors import ProcessExit
@@ -1868,6 +1913,8 @@ def build_globals(argv=None):
         "json_encode": _json_encode,
         "read_line": _read_line,
         "exit": _exit,
+        "memo": _memo,
+        "memo_rec": _memo_rec,
         "json_decode": _json_decode,
         "hash_text": lambda text: hashlib.sha256(_need_text(text, "hash_text").encode()).hexdigest(),
         "uuid": lambda: str(_uuid.uuid4()),
@@ -1959,6 +2006,7 @@ def build_globals(argv=None):
         "retry": _retry,
         "timed": _timed,
         "args": lambda: list(argv or []),
+        "script_dir": script_dir,
         "input": lambda prompt="": input(display(prompt)),
         # net
         "http_get": _http_get,

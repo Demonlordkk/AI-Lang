@@ -287,6 +287,49 @@ emit [1, 2, 3, 4, 5, 6]
     assert out(src) == "56"
 
 
+def test_pipeline_works_in_every_position():
+    """The pipe must behave identically in every syntactic position, on both
+    engines (the 'pipeline precedence bug' regression matrix)."""
+    src = r"""
+fn double(x: Int) -> Int:
+    give x * 2.
+done.
+fn is_big(x: Int) -> Bool:
+    give x > 10.
+done.
+fn add2(a: Int, n: Int) -> Int:
+    give a + n.
+done.
+record Point:
+    x: Int.
+    y: Int.
+done.
+fn f1(x: Int) -> Int:
+    give x |> double().
+done.
+emit f1(3).
+let y := 5 |> double().
+emit y.
+var z := 1.
+z <- 4 |> double().
+emit z.
+emit to Text((1 |> Point(9)).y).
+1 |> print().
+emit "v={3 |> double()}".
+emit sum(map(range(4), \x -> x |> double())).
+let g := double.
+emit 5 |> g().
+emit 5 |> add2(n: 3).
+when 12 |> is_big():
+    emit "big".
+done.
+emit 1 |> double() |> double() |> double().
+emit 5 |> double.
+"""
+    expected = '6\n10\n8\n9\n1\nv=6\n12\n10\n8\nbig\n8\n10'
+    assert out(src) == expected
+
+
 def test_pipeline_is_lowest_precedence():
     """`a |> f(b)` binds as `f(a, b)` — the pipe is looser than every other
     operator, and chained pipes apply left to right."""

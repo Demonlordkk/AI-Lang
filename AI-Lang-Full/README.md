@@ -14,7 +14,7 @@ systems you build with them. Nothing in the language is specialised to one
 domain: machine learning is a library, not the language.
 
 It runs anywhere. AI-Lang depends on **no third-party packages** — only a
-host Python runtime — and ships as a single 353 KB file you can copy to a
+host Python runtime — and ships as a single 365 KB file you can copy to a
 device and run with no install step. One exception, deliberately optional: if
 numpy is already installed (Colab, a scientific Python, a server), the tensor
 engine transparently accelerates on it; without numpy the reference engine
@@ -385,6 +385,8 @@ Available everywhere without imports.
 **Core** — `len` `type_of` `abs` `floor` `ceil` `round` `sqrt` `pow` `min`
 `max` `sum` `exp` `log` `clock` `now` `sleep` `print` `assert` `is_nothing`
 
+**Function caching** — `memo` `memo_rec`
+
 **Convert** — `str` `int` `real` `bool`
 
 **Text** — `join` `split` `upper` `lower` `trim` `replace` `contains`
@@ -405,8 +407,8 @@ Available everywhere without imports.
 **Data** — `json_encode` `json_decode` `hash_text` `uuid` `random`
 `random_int`
 
-**I/O** — `read_file` `write_file` `append_file` `env` `args` `input`
-`read_line` `exit`
+**I/O** — `read_file` `write_file` `append_file` `env` `args` `script_dir`
+`input` `read_line` `exit`
 
 **Network** — `http_get` `http_post` `http_request` `serve` `serve_stop`
 
@@ -461,6 +463,58 @@ let top     := max_by(people, \p -> p.salary).name.
 ```
 
 `examples/analytics.al` puts these together in a short end-to-end report.
+
+## Beyond the usual
+
+A few capabilities that are uncommon even in established languages — built
+into the language's standard library or shipped packages, so every program
+gets them:
+
+**Lazy infinite streams.** `packages/stream` (itself written in AI-Lang)
+wraps a zero-arg next-value function in an infinite sequence: the state
+lives in the closure, nothing computes until you ask for a value, and a
+stream of a million values costs the memory of one.
+
+```text
+use packages/stream as s.
+
+var a := 0.
+var b := 1.
+let fib := s.stream(fn() -> Int:
+    let t := a.
+    a <- b.
+    b <- t + b.
+    give t.
+done).
+
+emit s.stream_take(s.stream_map(fib, \x -> x * x), 5).
+```
+
+`stream_take`, `stream_map`, `stream_filter`, `stream_find` and `stream_zip`
+compose the way pipelines do. The ML side uses the same primitive:
+`examples/ml/sine_regression.al` generates its training points as a stream
+slice, so model code and app code share one lazy-data story.
+`examples/streams.al` shows the whole package end to end.
+
+**Memoization as a builtin.** `memo(f)` caches a one-argument function;
+`memo_rec(f)` passes the wrapper to the body as `self`, so *recursive*
+functions get cached recursion for free:
+
+```text
+let fib := memo_rec(fn(self: Function, n: Int) -> Int:
+    when n < 2:
+        give n.
+    done.
+    give self(n - 1) + self(n - 2).
+done).
+emit fib(30).   # 832040, instantly
+```
+
+**Property-based testing.** `packages/testing` adds `prop_test(check, n,
+seed)`: run a property on `n` random inputs, report the first counterexample
+with its value, and keep the seed so a failure reproduces exactly.
+
+---
 
 ## Building models: automatic differentiation
 
@@ -798,7 +852,7 @@ production route gets logging, a 500 handler, and a rate limit with three
 lines of app setup, and each one is testable through `dispatch` without a
 server.
 
-Two complete apps ship in `examples/apps/`:
+Four complete apps ship in `examples/apps/`:
 
 * **`notes.al`** — a full notes app: SQLite storage, a JSON API
   (`GET/POST /notes`, `GET/DELETE /notes/:id`), a single-page HTML UI served
@@ -811,6 +865,13 @@ Two complete apps ship in `examples/apps/`:
   the same file; later runs load the saved model and skip training. The
   shortest distance in this language between "training" and "deployment" is
   one `nn.save` and one `w.start`.
+* **`cli_classifier.al`** — the same model, as a normal terminal app:
+  `train` / `predict x y` / `report` built on the cli package.
+* **`tasks.al`** — a professional *normal* app with no ML at all: a terminal
+  task manager (`add`, `list --all --limit N`, `done`, `rm`, `stats`,
+  `clear` with two-step confirmation) pairing the cli package's tables,
+  colors and argument parsing with JSON persistence in a file next to the
+  script. State, parsing and presentation are all ordinary AI-Lang.
 
 ### Terminal apps
 
@@ -872,6 +933,10 @@ reads a JSON config over defaults; `c.confirm("Sure?")` reads a y/N from
 `train` trains and saves a neural model, `predict x y` loads the model and
 answers, `report` prints a table — the same model file `predictor.al` the
 web app uses, so the ML and the apps genuinely share one artifact.
+`examples/apps/tasks.al` is the other complete normal app: a task manager
+that pairs the same toolkit with JSON persistence, so "normal app building"
+has a reference on both sides — apps that talk to a model and apps that
+just manage data.
 
 ### Anything else
 
@@ -965,15 +1030,17 @@ so an install is reproducible and tampering is detected:
   stats: digest mismatch (expected sha256:521cfc2dc981..., got sha256:a96c18a8b34a...)
 ```
 
-Six packages ship in `packages/`: `text` (casing, padding, word counts),
+Seven packages ship in `packages/`: `text` (casing, padding, word counts),
 `collections` (set operations, rotation, frequency tables), `testing`
-(assertions that report what actually differed), `neural` (a feed-forward
-net built from the tensor operators, plus model save/load — see
+(assertions that report what actually differed, plus `prop_test`, a
+property-based test runner), `neural` (a feed-forward net built from the
+tensor operators, plus model save/load — see
 [Building models](#building-models-automatic-differentiation)), `webapp`
 (routing, static files, middleware and the professional `make_*` helpers for
-web apps — see [Building apps](#building-apps)) and `cli` (argument parsing,
+web apps — see [Building apps](#building-apps)), `cli` (argument parsing,
 usage text, tables, progress bars, color and config for terminal apps — see
-[Building apps](#building-apps)).
+[Building apps](#building-apps)) and `stream` (lazy infinite streams — see
+[Beyond the usual](#beyond-the-usual)).
 
 ## Running anywhere
 
@@ -993,7 +1060,7 @@ Build the standalone interpreter:
 python3 tools/make_bundle.py
 ```
 
-That writes `ailang-bundle.pyz`, a single 353 KB file:
+That writes `ailang-bundle.pyz`, a single 365 KB file:
 
 ```bash
 python3 ailang-bundle.pyz run program.al

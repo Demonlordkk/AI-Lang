@@ -41,8 +41,15 @@ def _try_import():
 
 
 def have() -> bool:
-    """True when the numpy acceleration path is active."""
-    return _try_import() is not None
+    """True when the numpy acceleration path is active.
+
+    Called on every tensor op, so the steady state must be a single flag
+    read: the expensive import work happens exactly once.
+    """
+    global _tried, _np
+    if not _tried:
+        _try_import()
+    return _np is not None
 
 
 def np():

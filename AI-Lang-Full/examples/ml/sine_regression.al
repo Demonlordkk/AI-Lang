@@ -10,8 +10,20 @@
 
 seed(7).
 
+use packages/stream as s.
+
+# The training data is a *lazy stream*: an infinite counter, mapped to the
+# x-axis, with exactly n values taken for the fit. The same stream package
+# powers app-side data pipelines -- one lazy-data primitive across ML and
+# apps, nothing materialized until it is needed.
 let n := 60.
-let flat := map(range(n), \i -> -1.5 + 4.5 * to Real(i) / to Real(n - 1)).
+var idx := 0.
+let counter := s.stream(fn() -> Int:
+    let v := idx.
+    idx <- idx + 1.
+    give v.
+done).
+let flat := s.stream_take(s.stream_map(counter, \v -> -1.5 + 4.5 * to Real(v) / to Real(n - 1)), n).
 let xs := map(flat, \x -> [x]).
 var ys := map(flat, \x -> sin(x)).
 ys[7] <- ys[7] + 1.5.
