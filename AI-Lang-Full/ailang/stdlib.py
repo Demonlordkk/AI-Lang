@@ -973,6 +973,129 @@ def _timed(fn):
     return {"result": r, "seconds": time.perf_counter() - t0}
 
 
+
+
+# ------------------------------------------------------------------ autodiff
+def _ad():
+    from . import autodiff
+
+    return autodiff
+
+
+def _tensor(value, requires_grad=False):
+    from .autodiff import Tensor
+
+    return Tensor.of(value, bool(requires_grad))
+
+
+def _param(value):
+    """A tensor that accumulates gradients — the weights you want trained."""
+    from .autodiff import Tensor
+
+    return Tensor.of(value, True)
+
+
+def _is_tensor(v):
+    from .autodiff import Tensor
+
+    return isinstance(v, Tensor)
+
+
+def _value_of(t):
+    from .autodiff import Tensor
+
+    return t.value() if isinstance(t, Tensor) else t
+
+
+def _grad_of(t):
+    from .autodiff import Tensor
+
+    if not isinstance(t, Tensor):
+        raise VMError(f"grad_of: needs a tensor, got {type_name(t)}")
+    g = t.grad_value()
+    if g is None:
+        raise VMError(
+            "grad_of: no gradient yet — call backward(loss) before reading gradients"
+        )
+    return g
+
+
+def _zero_grad(*tensors):
+    from .autodiff import Tensor
+
+    for t in tensors:
+        if isinstance(t, list):
+            for x in t:
+                if isinstance(x, Tensor):
+                    x.zero_grad()
+        elif isinstance(t, Tensor):
+            t.zero_grad()
+    return None
+
+
+def _sgd_step(params, rate):
+    """In-place gradient descent update over a list of params."""
+    from .autodiff import Tensor
+
+    if isinstance(params, Tensor):
+        params = [params]
+    rate = float(rate)
+    for t in _need_list(params, "sgd_step", "params"):
+        if not isinstance(t, Tensor):
+            raise VMError(f"sgd_step: expected tensors, found {type_name(t)}")
+        if t.grad is None:
+            continue
+        d, g = t.data, t.grad
+        for i in range(len(d)):
+            d[i] -= rate * g[i]
+    return None
+
+
+def _adam_state(params):
+    from .autodiff import Tensor
+
+    if isinstance(params, Tensor):
+        params = [params]
+    return {
+        "t": 0,
+        "m": [[0.0] * p.size for p in params],
+        "v": [[0.0] * p.size for p in params],
+        "params": params,
+    }
+
+
+def _adam_step(state, rate=0.01, b1=0.9, b2=0.999, eps=1e-8):
+    """Adam update. Converges far faster than plain SGD on most models."""
+    params = state["params"]
+    state["t"] += 1
+    t = state["t"]
+    rate = float(rate)
+    for pi, p in enumerate(params):
+        if p.grad is None:
+            continue
+        m, v = state["m"][pi], state["v"][pi]
+        d, g = p.data, p.grad
+        for i in range(len(d)):
+            m[i] = b1 * m[i] + (1.0 - b1) * g[i]
+            v[i] = b2 * v[i] + (1.0 - b2) * g[i] * g[i]
+            mh = m[i] / (1.0 - b1 ** t)
+            vh = v[i] / (1.0 - b2 ** t)
+            d[i] -= rate * mh / (math.sqrt(vh) + eps)
+    return None
+
+
+def _randn(rows, cols=None, scale=None, seed=None):
+    """Gaussian init, scaled by 1/sqrt(fan_in) by default (Xavier-style)."""
+    rng = _random.Random(seed) if seed is not None else _random
+    r = _need_int(rows, "randn", "rows")
+    if cols is None:
+        sd = float(scale) if scale is not None else 1.0
+        return [rng.gauss(0.0, sd) for _ in range(r)]
+    c = _need_int(cols, "randn", "cols")
+    sd = float(scale) if scale is not None else (1.0 / math.sqrt(max(r, 1)))
+    return [[rng.gauss(0.0, sd) for _ in range(c)] for _ in range(r)]
+
+
 # ------------------------------------------------------------------ install
 def build_globals(argv=None):
     env = {
@@ -1073,6 +1196,43 @@ def build_globals(argv=None):
         "transpose": _transpose,
         "identity": _identity,
         "zeros": _zeros,
+        # autodiff / tensors
+        "tensor": _tensor,
+        "param": _param,
+        "is_tensor": _is_tensor,
+        "value_of": _value_of,
+        "grad_of": _grad_of,
+        "zero_grad": _zero_grad,
+        "backward": lambda t: _ad().backward(t),
+        "sgd_step": _sgd_step,
+        "adam": _adam_state,
+        "adam_step": _adam_step,
+        "randn": _randn,
+        "shape_of": lambda t: list(_ad().T(t).shape),
+        # tensor math (differentiable)
+        "t_add": lambda a, b: _ad().add(a, b),
+        "t_sub": lambda a, b: _ad().sub(a, b),
+        "t_mul": lambda a, b: _ad().mul(a, b),
+        "t_div": lambda a, b: _ad().div(a, b),
+        "t_pow": lambda a, p: _ad().power(a, p),
+        "t_neg": lambda a: _ad().neg(a),
+        "t_exp": lambda a: _ad().t_exp(a),
+        "t_log": lambda a: _ad().t_log(a),
+        "t_sqrt": lambda a: _ad().t_sqrt(a),
+        "t_abs": lambda a: _ad().t_abs(a),
+        "t_sigmoid": lambda a: _ad().t_sigmoid(a),
+        "t_relu": lambda a: _ad().t_relu(a),
+        "t_tanh": lambda a: _ad().t_tanh(a),
+        "t_softmax": lambda a: _ad().t_softmax(a),
+        "t_matmul": lambda a, b: _ad().matmul(a, b),
+        "t_transpose": lambda a: _ad().transpose(a),
+        "t_reshape": lambda a, s: _ad().reshape(a, s),
+        "sum_t": lambda a: _ad().t_sum(a),
+        "mean_t": lambda a: _ad().t_mean(a),
+        "mse_t": lambda p, y: _ad().mse_loss(p, y),
+        "mae_t": lambda p, y: _ad().mae_loss(p, y),
+        "bce_t": lambda p, y: _ad().bce_loss(p, y),
+        "ce_t": lambda p, y: _ad().ce_loss(p, y),
         # machine learning
         "sigmoid": _sigmoid,
         "relu": _relu,

@@ -278,10 +278,82 @@ Available everywhere without imports.
 
 ---
 
-## Machine learning
+## Building models: automatic differentiation
 
-The numeric layer is built into the language, with no dependencies. A complete
-logistic regression trained by gradient descent:
+AI-Lang is built for *writing* learning algorithms, not just calling them. The
+language computes derivatives for you, so you never hand-derive calculus.
+
+Mark the values you want trained with `param`, write the forward pass with
+ordinary operators, then call `backward`:
+
+```text
+let w := param(3.0).
+backward(t_mul(w, w)).      # d(w^2)/dw
+emit grad_of(w).            # 6.0
+```
+
+That scales to a full network. Here is XOR — a problem no linear model can
+solve — as a 2-layer net:
+
+```text
+let w1 := param(randn(2, 4)).
+let b1 := param(zeros(4)).
+let w2 := param(randn(4, 1)).
+let b2 := param(zeros(1)).
+let weights := [w1, b1, w2, b2].
+let opt := adam(weights).
+
+fn forward(x: Any) -> Any:
+    let hidden := t_tanh(t_add(t_matmul(x, w1), b1)).
+    give t_sigmoid(t_add(t_matmul(hidden, w2), b2)).
+done.
+
+var epoch := 0.
+while epoch < 2000:
+    zero_grad(weights).
+    backward(bce_t(forward(inputs), targets)).
+    adam_step(opt, 0.05).
+    epoch <- epoch + 1.
+done.
+```
+
+```
+epoch    0   loss 0.74488
+epoch 1500   loss 0.00024
+accuracy: 4/4
+```
+
+There is no derivative anywhere in that program. Compare
+`examples/ml/logistic.al` (6 lines of hand-derived gradient math) with
+`examples/ml/logistic_autodiff.al` (the same model, 0 lines) — the training
+loop collapses from 20 lines to 6.
+
+**Autodiff vocabulary**
+
+| Purpose | Functions |
+| --- | --- |
+| Create | `param` `tensor` `randn` `zeros` |
+| Inspect | `value_of` `grad_of` `shape_of` `is_tensor` |
+| Math | `t_add` `t_sub` `t_mul` `t_div` `t_pow` `t_neg` `t_exp` `t_log` `t_sqrt` `t_abs` |
+| Layers | `t_matmul` `t_transpose` `t_reshape` |
+| Activations | `t_sigmoid` `t_relu` `t_tanh` `t_softmax` |
+| Reduce | `sum_t` `mean_t` |
+| Losses | `mse_t` `mae_t` `bce_t` `ce_t` |
+| Train | `backward` `zero_grad` `sgd_step` `adam` `adam_step` |
+
+Tensors broadcast (a bias vector adds across every row), shapes are checked
+with readable errors, and `backward` is iterative so network depth is not
+limited by recursion.
+
+Every gradient is verified two ways in the test suite: against closed-form
+derivatives, and against central-difference numerical gradients (agreement to
+~1e-10) for matmul chains, softmax/cross-entropy, sigmoid/BCE, broadcasting,
+and a 2-layer network.
+
+## Fixed-form models
+
+For standard tasks the closed-form helpers are still there, no gradients
+needed:
 
 ```text
 fn train(rows: List, labels: List, epochs: Int, rate: Real) -> Any:
@@ -308,8 +380,8 @@ fn train(rows: List, labels: List, epochs: Int, rate: Real) -> Any:
 done.
 ```
 
-See `examples/ml/logistic.al` — it converges to 100% accuracy on separable
-data in under 0.2s.
+See `examples/ml/logistic.al` for the hand-written version and
+`examples/ml/neural_net.al` for the autodiff one.
 
 Data analysis is a one-liner:
 
