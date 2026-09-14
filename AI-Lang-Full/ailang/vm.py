@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .errors import AILangRaise, VMError
+from .opcodes import NAMES, OPS
 from .values import Module, RecordType, RecordValue, display, is_truthy, type_name
+
+# bind opcode ints as module-level constants for fast local lookup
+globals().update(OPS)
 
 
 def _builtin_names():
@@ -159,137 +163,355 @@ class VM:
             self.depth -= 1
 
     # -------------------------------------------------------------- execution
-    def execute(self, fn, env: Environment, program=None):
+    def execute(self, fn, env, program=None):
+        """Interpreter loop.
+
+        Dispatch is on small integers through a chain ordered by measured
+        frequency, and the hottest arithmetic/compare/loop opcodes are
+        specialised so they never touch the generic type-dispatch helpers.
+        """
         program = program if program is not None else self.program
         code = fn.code
-        stack: List[Any] = []
-        iters: List[Any] = []
-        traps: List[tuple] = []  # (target, err_name, stack, iter, scope depths)
-        scopes: List[Environment] = []
+        stack = []
+        push = stack.append
+        pop = stack.pop
+        iters = []
+        traps = []
+        scopes = []
         ip = 0
         n = len(code)
+        fuel = self.fuel
+
+        # local aliases: attribute lookups in a hot loop are expensive
+        _PUSH = PUSH; _LOAD = LOAD; _STORE = STORE; _SET = SET
+        _ADD_NN = ADD_NN; _SUB_NN = SUB_NN; _MUL_NN = MUL_NN
+        _LT_NN = LT_NN; _LE_NN = LE_NN; _GT_NN = GT_NN; _GE_NN = GE_NN
+        _JUMP = JUMP; _JUMP_IF_FALSE = JUMP_IF_FALSE
+        _ITER_NEXT = ITER_NEXT; _CALL = CALL; _RETURN = RETURN
+        _BINARY = BINARY; _INC_FAST = INC_FAST; _ADD_CONST = ADD_CONST
 
         while ip < n:
-            self.fuel -= 1
-            if self.fuel < 0:
+            fuel -= 1
+            if fuel < 0:
+                self.fuel = fuel
                 raise VMError("execution limit exceeded")
             ins = code[ip]
             op = ins[0]
             ip += 1
 
             try:
-                if op == "PUSH":
-                    stack.append(ins[1])
-
-                elif op == "LOAD":
-                    stack.append(env.lookup(ins[1]))
-
-                elif op == "STORE":
-                    env.declare(ins[1], stack.pop(), ins[2])
-
-                elif op == "SET":
-                    env.assign(ins[1], stack.pop())
-
-                elif op == "SET_INDEX":
-                    value = stack.pop()
-                    key = stack.pop()
-                    obj = stack.pop()
-                    if isinstance(obj, list):
-                        if not isinstance(key, int) or isinstance(key, bool):
-                            raise VMError("list index must be an Int")
-                        if not -len(obj) <= key < len(obj):
-                            raise VMError(f"index {key} out of range for list of {len(obj)}")
-                        obj[key] = value
-                    elif isinstance(obj, dict):
-                        obj[_hashable(key)] = value
+                # ---- hottest opcodes first -------------------------------
+                if op == _LOAD:
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            push(v[name])
+                            break
+                        e = e.parent
                     else:
-                        raise VMError(f"cannot index-assign into {type_name(obj)}")
+                        raise VMError(f"undefined name '{name}'")
 
-                elif op == "SET_FIELD":
-                    value = stack.pop()
-                    obj = stack.pop()
-                    if isinstance(obj, RecordValue):
-                        obj.set(ins[1], value)
-                    elif isinstance(obj, dict):
-                        obj[ins[1]] = value
+                elif op == _PUSH:
+                    push(ins[1])
+
+                elif op == _ADD_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a + b)
                     else:
-                        raise VMError(f"cannot set field on {type_name(obj)}")
+                        push(_binary("+", a, b))
 
-                elif op == "PRINT":
-                    print(display(stack.pop()))
-
-                elif op == "POP":
-                    stack.pop()
-
-                elif op == "TO_BOOL":
-                    stack.append(is_truthy(stack.pop()))
-
-                elif op == "UNARY":
-                    v = stack.pop()
-                    if ins[1] == "not":
-                        stack.append(not is_truthy(v))
+                elif op == _SUB_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a - b)
                     else:
-                        if isinstance(v, bool) or not isinstance(v, (int, float)):
-                            raise VMError(f"cannot negate {type_name(v)}")
-                        stack.append(-v)
+                        push(_binary("-", a, b))
 
-                elif op == "BINARY":
-                    b = stack.pop()
-                    a = stack.pop()
-                    stack.append(_binary(ins[1], a, b))
+                elif op == _MUL_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a * b)
+                    else:
+                        push(_binary("*", a, b))
 
-                elif op == "CONVERT":
-                    stack.append(_convert(ins[1], stack.pop()))
+                elif op == _LT_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a < b)
+                    else:
+                        push(_binary("<", a, b))
 
-                elif op == "MAKE_LIST":
+                elif op == _GT_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a > b)
+                    else:
+                        push(_binary(">", a, b))
+
+                elif op == _LE_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a <= b)
+                    else:
+                        push(_binary("<=", a, b))
+
+                elif op == _GE_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a >= b)
+                    else:
+                        push(_binary(">=", a, b))
+
+                elif op == _JUMP_IF_FALSE:
+                    v = pop()
+                    if v is False or v is None:
+                        ip = ins[1]
+                    elif v is not True and not is_truthy(v):
+                        ip = ins[1]
+
+                elif op == _JUMP:
+                    ip = ins[1]
+
+                elif op == _ITER_NEXT:
+                    it = iters[-1]
+                    nxt = next(it, _SENTINEL)
+                    if nxt is _SENTINEL:
+                        iters.pop()
+                        ip = ins[1]
+                    else:
+                        index, value = nxt
+                        ev = env.vars
+                        ev[ins[2]] = value
+                        env.immutable.discard(ins[2])
+                        if ins[3]:
+                            ev[ins[3]] = index
+
+                elif op == _CALL:
                     count = ins[1]
-                    if count == 0:
-                        stack.append([])
+                    if count:
+                        args = stack[-count:]
+                        del stack[-count:]
                     else:
+                        args = []
+                    callee = pop()
+                    if callee.__class__ is Closure:
+                        self.fuel = fuel
+                        push(self.invoke(callee, args))
+                        fuel = self.fuel
+                    else:
+                        self.fuel = fuel
+                        push(self.call_value(callee, args))
+                        fuel = self.fuel
+
+                elif op == _SET:
+                    name = ins[1]
+                    value = pop()
+                    e = env
+                    while e is not None:
+                        if name in e.vars:
+                            if name in e.immutable:
+                                raise VMError(
+                                    f"cannot assign to '{name}': it is a let binding "
+                                    f"(declare it with 'var' to allow mutation)"
+                                )
+                            e.vars[name] = value
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+
+                elif op == _INC_FAST:
+                    # var <- var + <const>   (single opcode, no stack traffic)
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        if name in e.vars:
+                            if name in e.immutable:
+                                raise VMError(
+                                    f"cannot assign to '{name}': it is a let binding "
+                                    f"(declare it with 'var' to allow mutation)"
+                                )
+                            cur = e.vars[name]
+                            if cur.__class__ is int:
+                                e.vars[name] = cur + ins[2]
+                            else:
+                                e.vars[name] = _binary("+", cur, ins[2])
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+
+                elif op == _ADD_CONST:
+                    a = pop()
+                    if a.__class__ is int:
+                        push(a + ins[1])
+                    else:
+                        push(_binary("+", a, ins[1]))
+
+                elif op == _STORE:
+                    env.declare(ins[1], pop(), ins[2])
+
+                elif op == _RETURN:
+                    self.fuel = fuel
+                    return pop() if stack else None
+
+                elif op == _BINARY:
+                    b = pop(); a = pop()
+                    push(_binary(ins[1], a, b))
+
+                # ---- everything else -------------------------------------
+                elif op == EQ:
+                    b = pop(); a = pop()
+                    push(_equal(a, b))
+
+                elif op == NE:
+                    b = pop(); a = pop()
+                    push(not _equal(a, b))
+
+                elif op == DIV_NN:
+                    b = pop(); a = pop()
+                    push(_binary("/", a, b))
+
+                elif op == MOD_NN:
+                    b = pop(); a = pop()
+                    if a.__class__ is int and b.__class__ is int and b:
+                        push(a % b)
+                    else:
+                        push(_binary("%", a, b))
+
+                elif op == POP:
+                    pop()
+
+                elif op == INDEX:
+                    key = pop(); obj = pop()
+                    if obj.__class__ is list and key.__class__ is int:
+                        if -len(obj) <= key < len(obj):
+                            push(obj[key])
+                        else:
+                            raise VMError(
+                                f"index {key} is out of range for a list of {len(obj)}"
+                            )
+                    elif obj.__class__ is dict:
+                        k = _hashable(key)
+                        if k not in obj:
+                            raise VMError(f"map has no key {display(key)}")
+                        push(obj[k])
+                    else:
+                        push(_index(obj, key))
+
+                elif op == FIELD:
+                    push(_field(pop(), ins[1]))
+
+                elif op == PRINT:
+                    print(display(pop()))
+
+                elif op == TO_BOOL:
+                    push(is_truthy(pop()))
+
+                elif op == UNARY:
+                    v = pop()
+                    if ins[1] == "not":
+                        push(not is_truthy(v))
+                    else:
+                        if v.__class__ is bool or not isinstance(v, (int, float)):
+                            raise VMError(f"cannot negate {type_name(v)}")
+                        push(-v)
+
+                elif op == MAKE_LIST:
+                    count = ins[1]
+                    if count:
                         items = stack[-count:]
                         del stack[-count:]
-                        stack.append(items)
+                        push(items)
+                    else:
+                        push([])
 
-                elif op == "MAKE_MAP":
+                elif op == MAKE_MAP:
                     count = ins[1]
                     out = {}
                     if count:
-                        flat = stack[-count * 2 :]
-                        del stack[-count * 2 :]
+                        flat = stack[-count * 2:]
+                        del stack[-count * 2:]
                         for i in range(0, len(flat), 2):
                             out[_hashable(flat[i])] = flat[i + 1]
-                    stack.append(out)
+                    push(out)
 
-                elif op == "INDEX":
-                    key = stack.pop()
-                    obj = stack.pop()
-                    stack.append(_index(obj, key))
+                elif op == RANGE_INIT:
+                    src = pop()
+                    if src.__class__ is not int:
+                        raise VMError("range loop needs an Int bound")
+                    iters.append(iter(range(src)))
 
-                elif op == "FIELD":
-                    obj = stack.pop()
-                    stack.append(_field(obj, ins[1]))
-
-                elif op == "CALL" or op == "CALL_KW":
-                    count = ins[1]
-                    if count == 0:
-                        args = []
+                elif op == RANGE_NEXT:
+                    it = iters[-1]
+                    nxt = next(it, _SENTINEL)
+                    if nxt is _SENTINEL:
+                        iters.pop()
+                        ip = ins[1]
                     else:
+                        env.vars[ins[2]] = nxt
+
+                elif op == ITER_INIT:
+                    iters.append(_make_iter(pop()))
+
+                elif op == ITER_BREAK:
+                    if iters:
+                        iters.pop()
+                    ip = ins[1]
+
+                elif op == ITER_END:
+                    pass
+
+                elif op == SCOPE_PUSH:
+                    scopes.append(env)
+                    env = Environment(env)
+
+                elif op == SCOPE_POP:
+                    if scopes:
+                        env = scopes.pop()
+
+                elif op == JUMP_IF_FALSE_KEEP:
+                    if not is_truthy(stack[-1]):
+                        stack[-1] = False
+                        ip = ins[1]
+
+                elif op == JUMP_IF_TRUE_KEEP:
+                    if is_truthy(stack[-1]):
+                        stack[-1] = True
+                        ip = ins[1]
+
+                elif op == JUMP_IF_TRUE:
+                    if is_truthy(pop()):
+                        ip = ins[1]
+
+                elif op == JUMP_IF_SOME:
+                    if stack[-1] is not None:
+                        ip = ins[1]
+
+                elif op == CALL_KW:
+                    count = ins[1]
+                    if count:
                         args = stack[-count:]
                         del stack[-count:]
-                    callee = stack.pop()
+                    else:
+                        args = []
+                    callee = pop()
+                    names = ins[2]
                     kwargs = {}
-                    if op == "CALL_KW":
-                        names = ins[2]
-                        positional = []
-                        for name, value in zip(names, args):
-                            if name is None:
-                                positional.append(value)
-                            else:
-                                kwargs[name] = value
-                        args = positional
-                    stack.append(self.call_value(callee, args, kwargs))
+                    positional = []
+                    for nm, value in zip(names, args):
+                        if nm is None:
+                            positional.append(value)
+                        else:
+                            kwargs[nm] = value
+                    self.fuel = fuel
+                    push(self.call_value(callee, positional, kwargs))
+                    fuel = self.fuel
 
-                elif op == "CLOSURE":
+                elif op == CLOSURE:
                     fcode = program.functions[ins[1]]
                     clo = Closure(fcode, env, self, program)
                     if ins[2]:
@@ -298,14 +520,51 @@ class VM:
                         else:
                             env.declare(ins[2], clo, False)
                     else:
-                        stack.append(clo)
+                        push(clo)
 
-                elif op == "RECORD":
+                elif op == SET_INDEX:
+                    value = pop(); key = pop(); obj = pop()
+                    if obj.__class__ is list:
+                        if key.__class__ is not int:
+                            raise VMError("list index must be an Int")
+                        if not -len(obj) <= key < len(obj):
+                            raise VMError(
+                                f"index {key} out of range for list of {len(obj)}"
+                            )
+                        obj[key] = value
+                    elif obj.__class__ is dict:
+                        obj[_hashable(key)] = value
+                    else:
+                        raise VMError(f"cannot index-assign into {type_name(obj)}")
+
+                elif op == SET_FIELD:
+                    value = pop(); obj = pop()
+                    if obj.__class__ is RecordValue:
+                        obj.set(ins[1], value)
+                    elif obj.__class__ is dict:
+                        obj[ins[1]] = value
+                    else:
+                        raise VMError(f"cannot set field on {type_name(obj)}")
+
+                elif op == CONVERT:
+                    push(_convert(ins[1], pop()))
+
+                elif op == TRY_PUSH:
+                    traps.append((ins[1], ins[2], len(stack), len(iters), len(scopes)))
+
+                elif op == TRY_POP:
+                    if traps:
+                        traps.pop()
+
+                elif op == RAISE:
+                    raise AILangRaise(pop())
+
+                elif op == RECORD:
                     name = ins[1]
                     if not env.has(name):
                         env.declare(name, RecordType(name, program.records[name]), False)
 
-                elif op == "IMPORT":
+                elif op == IMPORT:
                     path, alias = ins[1], ins[2]
                     if self.module_loader is None:
                         raise VMError(f"cannot import '{path}': no module loader configured")
@@ -315,79 +574,19 @@ class VM:
                     else:
                         env.declare(alias, module, False)
 
-                elif op == "JUMP":
-                    ip = ins[1]
+                elif op == RETURN_NONE:
+                    self.fuel = fuel
+                    return None
 
-                elif op == "JUMP_IF_FALSE":
-                    if not is_truthy(stack.pop()):
-                        ip = ins[1]
+                elif op == DUP:
+                    push(stack[-1])
 
-                elif op == "JUMP_IF_FALSE_KEEP":
-                    if not is_truthy(stack[-1]):
-                        stack[-1] = False
-                        ip = ins[1]
-
-                elif op == "JUMP_IF_TRUE_KEEP":
-                    if is_truthy(stack[-1]):
-                        stack[-1] = True
-                        ip = ins[1]
-
-                elif op == "JUMP_IF_SOME":
-                    if stack[-1] is not None:
-                        ip = ins[1]
-
-                elif op == "ITER_INIT":
-                    src = stack.pop()
-                    iters.append(_make_iter(src))
-
-                elif op == "ITER_NEXT":
-                    target, var, idx_var = ins[1], ins[2], ins[3]
-                    it = iters[-1]
-                    nxt = next(it, _SENTINEL)
-                    if nxt is _SENTINEL:
-                        iters.pop()
-                        ip = target
-                    else:
-                        index, value = nxt
-                        env.vars[var] = value
-                        env.immutable.discard(var)
-                        if idx_var:
-                            env.vars[idx_var] = index
-
-                elif op == "ITER_BREAK":
-                    if iters:
-                        iters.pop()
-                    ip = ins[1]
-
-                elif op == "ITER_END":
-                    pass
-
-                elif op == "SCOPE_PUSH":
-                    scopes.append(env)
-                    env = Environment(env)
-
-                elif op == "SCOPE_POP":
-                    if scopes:
-                        env = scopes.pop()
-
-                elif op == "TRY_PUSH":
-                    traps.append((ins[1], ins[2], len(stack), len(iters), len(scopes)))
-
-                elif op == "TRY_POP":
-                    if traps:
-                        traps.pop()
-
-                elif op == "RAISE":
-                    raise AILangRaise(stack.pop())
-
-                elif op == "RETURN":
-                    return stack.pop() if stack else None
-
-                elif op == "HALT":
+                elif op == HALT:
+                    self.fuel = fuel
                     return None
 
                 else:
-                    raise VMError(f"unknown opcode {op}")
+                    raise VMError(f"unknown opcode {NAMES.get(op, op)}")
 
             except _Break:
                 raise
@@ -395,6 +594,7 @@ class VM:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 if not traps:
+                    self.fuel = fuel
                     raise _promote(exc)
                 target, err_name, sdepth, idepth, scdepth = traps.pop()
                 del stack[sdepth:]
@@ -405,6 +605,7 @@ class VM:
                 env.immutable.discard(err_name)
                 ip = target
 
+        self.fuel = fuel
         return None
 
     def call_value(self, callee, args, kwargs=None):

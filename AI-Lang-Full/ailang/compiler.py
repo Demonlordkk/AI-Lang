@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Optional
 
 from . import ast_nodes as A
 from .errors import CompileError
+from .opcodes import OPS
+
+globals().update(OPS)
 
 
 @dataclass
@@ -62,6 +65,7 @@ class Compiler:
     # ------------------------------------------------------------------ entry
     def compile(self, program: A.Program) -> ProgramCode:
         ctx = _Ctx(self, None)
+        ctx.hoist(program.statements)
         for s in program.statements:
             ctx.stmt(s)
         ctx.emit("HALT")
@@ -82,9 +86,12 @@ class _Ctx:
         self.consts: List[Any] = []
         self.scope = scope if scope is not None else _FnScope(None, params)
         self.loops: List[dict] = []
+        self._hoisted: Dict[int, bool] = {}
 
     # ------------------------------------------------------------- emit utils
     def emit(self, op, *args, line=0):
+        if op.__class__ is str:
+            op = OPS[op]
         self.code.append((op, *args))
         return len(self.code) - 1
 
@@ -94,6 +101,16 @@ class _Ctx:
 
     def here(self):
         return len(self.code)
+
+    def hoist(self, body):
+        """Pre-bind every function declared in `body` so order is irrelevant."""
+        for s in body:
+            if isinstance(s, A.Fn):
+                code = self.compile_function(s.name, s.params, s.body, s.line)
+                self.owner.functions[code.name] = code
+                self.scope.declare(s.name)
+                self.emit("CLOSURE", code.name, s.name, line=s.line)
+                self._hoisted[id(s)] = True
 
     # -------------------------------------------------------------- statements
     def stmt(self, s):
@@ -119,6 +136,19 @@ class _Ctx:
     def _s_Assign(self, s):
         t = s.target
         if isinstance(t, A.Name):
+            # `i <- i + 1` becomes a single INC_FAST opcode
+            e = s.expr
+            if (
+                isinstance(e, A.Binary)
+                and e.op in ("+", "-")
+                and isinstance(e.left, A.Name)
+                and e.left.value == t.value
+                and isinstance(e.right, A.Literal)
+                and e.right.value.__class__ is int
+            ):
+                delta = e.right.value if e.op == "+" else -e.right.value
+                self.emit("INC_FAST", t.value, delta, line=s.line)
+                return
             self.expr(s.expr)
             self.emit("SET", t.value, line=s.line)
         elif isinstance(t, A.Index):
@@ -160,6 +190,8 @@ class _Ctx:
         self.emit("RECORD", s.name, line=s.line)
 
     def _s_Fn(self, s):
+        if self._hoisted.pop(id(s), False):
+            return
         code = self.compile_function(s.name, s.params, s.body, s.line)
         self.owner.functions[code.name] = code
         self.scope.declare(s.name)
@@ -196,6 +228,33 @@ class _Ctx:
             self.patch(b, self.here())
 
     def _s_Repeat(self, s):
+        it = s.iterable
+        # `repeat i in range(n):` iterates lazily instead of materialising a list
+        if (
+            not s.index_name
+            and isinstance(it, A.Call)
+            and isinstance(it.fn, A.Name)
+            and it.fn.value == "range"
+            and len(it.args) == 1
+            and it.args[0][0] is None
+        ):
+            self.expr(it.args[0][1])
+            self.emit("RANGE_INIT", line=s.line)
+            start = self.here()
+            nxt = self.emit("RANGE_NEXT", None, s.name)
+            self.scope.declare(s.name)
+            self.loops.append({"continue": start, "breaks": [], "scoped": True})
+            self.emit("SCOPE_PUSH")
+            for x in s.body:
+                self.stmt(x)
+            self.emit("SCOPE_POP")
+            self.emit("JUMP", start)
+            self.patch(nxt, self.here())
+            frame = self.loops.pop()
+            for b in frame["breaks"]:
+                self.patch(b, self.here())
+            self.emit("ITER_END")
+            return
         self.expr(s.iterable)
         self.emit("ITER_INIT", line=s.line)
         start = self.here()
@@ -247,6 +306,7 @@ class _Ctx:
         pnames = [p for p, _ in params]
         inner_scope = _FnScope(self.scope, pnames)
         sub = _Ctx(self.owner, inner_scope)
+        sub.hoist(body)
         for x in body:
             sub.stmt(x)
         sub.emit("PUSH", None)
@@ -323,7 +383,11 @@ class _Ctx:
             return
         self.expr(n.left)
         self.expr(n.right)
-        self.emit("BINARY", op, line=n.line)
+        fast = _FAST_BINARY.get(op)
+        if fast is not None:
+            self.emit(fast, line=n.line)
+        else:
+            self.emit("BINARY", op, line=n.line)
 
     def _e_Index(self, n):
         self.expr(n.obj)
@@ -353,3 +417,19 @@ class _Ctx:
 
 def compile_program(program: A.Program) -> ProgramCode:
     return Compiler().compile(program)
+
+
+# operator -> specialised opcode name
+_FAST_BINARY = {
+    "+": "ADD_NN",
+    "-": "SUB_NN",
+    "*": "MUL_NN",
+    "/": "DIV_NN",
+    "%": "MOD_NN",
+    "<": "LT_NN",
+    "<=": "LE_NN",
+    ">": "GT_NN",
+    ">=": "GE_NN",
+    "==": "EQ",
+    "!=": "NE",
+}

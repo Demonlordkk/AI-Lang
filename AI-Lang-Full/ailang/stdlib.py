@@ -183,7 +183,40 @@ def _last(items):
 
 
 def _push(items, value):
+    """Pure append: returns a new list (O(n))."""
     return _need_list(items, "push") + [value]
+
+
+def _append(items, value):
+    """In-place append: O(1) amortised. Use in accumulation loops."""
+    _need_list(items, "append").append(value)
+    return items
+
+
+def _extend(items, more):
+    _need_list(items, "extend").extend(_need_list(more, "extend", "more"))
+    return items
+
+
+def _insert(items, index, value):
+    items = _need_list(items, "insert")
+    items.insert(_need_int(index, "insert", "index"), value)
+    return items
+
+
+def _pop_at(items, index=-1):
+    items = _need_list(items, "pop")
+    if not items:
+        raise VMError("pop: list is empty")
+    idx = _need_int(index, "pop", "index") if index != -1 else -1
+    if not -len(items) <= idx < len(items):
+        raise VMError(f"pop: index {idx} out of range for list of {len(items)}")
+    return items.pop(idx)
+
+
+def _clear(items):
+    _need_list(items, "clear").clear()
+    return items
 
 
 def _slice(items, start, stop):
@@ -474,6 +507,472 @@ def _await_all(tasks):
     return out
 
 
+
+
+# ------------------------------------------------------------------ numeric
+def _dot(a, b):
+    a = _need_list(a, "dot", "a"); b = _need_list(b, "dot", "b")
+    if len(a) != len(b):
+        raise VMError(f"dot: length mismatch {len(a)} vs {len(b)}")
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _vec_op(name, f):
+    def op(a, b):
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                raise VMError(f"{name}: length mismatch {len(a)} vs {len(b)}")
+            return [f(x, y) for x, y in zip(a, b)]
+        if isinstance(a, list):
+            return [f(x, b) for x in a]
+        if isinstance(b, list):
+            return [f(a, y) for y in b]
+        return f(a, b)
+    op.__name__ = name
+    return op
+
+
+def _mean(xs):
+    xs = _need_list(xs, "mean")
+    if not xs:
+        raise VMError("mean: list is empty")
+    return sum(xs) / len(xs)
+
+
+def _variance(xs, sample=False):
+    xs = _need_list(xs, "variance")
+    n = len(xs)
+    if n < 2:
+        raise VMError("variance: need at least 2 values")
+    m = sum(xs) / n
+    return sum((x - m) ** 2 for x in xs) / ((n - 1) if sample else n)
+
+
+def _stddev(xs, sample=False):
+    return math.sqrt(_variance(xs, sample))
+
+
+def _median(xs):
+    xs = sorted(_need_list(xs, "median"))
+    n = len(xs)
+    if not n:
+        raise VMError("median: list is empty")
+    mid = n // 2
+    return float(xs[mid]) if n % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+def _percentile(xs, q):
+    xs = sorted(_need_list(xs, "percentile"))
+    if not xs:
+        raise VMError("percentile: list is empty")
+    if not 0 <= q <= 100:
+        raise VMError("percentile: q must be between 0 and 100")
+    if len(xs) == 1:
+        return float(xs[0])
+    pos = (len(xs) - 1) * (q / 100.0)
+    lo = int(pos)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def _normalize(xs):
+    xs = _need_list(xs, "normalize")
+    if not xs:
+        return []
+    lo, hi = min(xs), max(xs)
+    if hi == lo:
+        return [0.0] * len(xs)
+    span = hi - lo
+    return [(x - lo) / span for x in xs]
+
+
+def _standardize(xs):
+    xs = _need_list(xs, "standardize")
+    if len(xs) < 2:
+        raise VMError("standardize: need at least 2 values")
+    m = sum(xs) / len(xs)
+    sd = math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+    if sd == 0:
+        return [0.0] * len(xs)
+    return [(x - m) / sd for x in xs]
+
+
+def _correlation(a, b):
+    a = _need_list(a, "correlation", "a"); b = _need_list(b, "correlation", "b")
+    if len(a) != len(b):
+        raise VMError(f"correlation: length mismatch {len(a)} vs {len(b)}")
+    if len(a) < 2:
+        raise VMError("correlation: need at least 2 points")
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    da = math.sqrt(sum((x - ma) ** 2 for x in a))
+    db = math.sqrt(sum((y - mb) ** 2 for y in b))
+    if da == 0 or db == 0:
+        return 0.0
+    return num / (da * db)
+
+
+# ------------------------------------------------------------------ matrices
+def _shape(m):
+    if not isinstance(m, list):
+        raise VMError("shape: needs a List")
+    if m and isinstance(m[0], list):
+        return [len(m), len(m[0])]
+    return [len(m)]
+
+
+def _matmul(a, b):
+    a = _need_list(a, "matmul", "a"); b = _need_list(b, "matmul", "b")
+    if not a or not b:
+        raise VMError("matmul: empty matrix")
+    if not isinstance(a[0], list) or not isinstance(b[0], list):
+        raise VMError("matmul: both arguments must be 2-D lists")
+    n, k, k2, m = len(a), len(a[0]), len(b), len(b[0])
+    if k != k2:
+        raise VMError(f"matmul: inner dimensions differ ({k} vs {k2})")
+    bt = list(zip(*b))
+    return [[sum(x * y for x, y in zip(row, col)) for col in bt] for row in a]
+
+
+def _transpose(m):
+    m = _need_list(m, "transpose")
+    if not m:
+        return []
+    if not isinstance(m[0], list):
+        return [[x] for x in m]
+    return [list(col) for col in zip(*m)]
+
+
+def _identity(n):
+    n = _need_int(n, "identity", "n")
+    return [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+
+
+def _zeros(rows, cols=None):
+    r = _need_int(rows, "zeros", "rows")
+    if cols is None:
+        return [0.0] * r
+    return [[0.0] * _need_int(cols, "zeros", "cols") for _ in range(r)]
+
+
+# ------------------------------------------------------------------ ml
+def _sigmoid(x):
+    if isinstance(x, list):
+        return [_sigmoid(v) for v in x]
+    if x < -500:
+        return 0.0
+    if x > 500:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _relu(x):
+    if isinstance(x, list):
+        return [_relu(v) for v in x]
+    return x if x > 0 else 0.0
+
+
+def _tanh(x):
+    if isinstance(x, list):
+        return [_tanh(v) for v in x]
+    return math.tanh(x)
+
+
+def _softmax(xs):
+    xs = _need_list(xs, "softmax")
+    if not xs:
+        return []
+    mx = max(xs)
+    exps = [math.exp(x - mx) for x in xs]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def _argmax(xs):
+    xs = _need_list(xs, "argmax")
+    if not xs:
+        raise VMError("argmax: list is empty")
+    best, bi = xs[0], 0
+    for i, v in enumerate(xs):
+        if v > best:
+            best, bi = v, i
+    return bi
+
+
+def _argmin(xs):
+    xs = _need_list(xs, "argmin")
+    if not xs:
+        raise VMError("argmin: list is empty")
+    best, bi = xs[0], 0
+    for i, v in enumerate(xs):
+        if v < best:
+            best, bi = v, i
+    return bi
+
+
+def _mse(pred, actual):
+    pred = _need_list(pred, "mse", "pred"); actual = _need_list(actual, "mse", "actual")
+    if len(pred) != len(actual):
+        raise VMError(f"mse: length mismatch {len(pred)} vs {len(actual)}")
+    if not pred:
+        raise VMError("mse: empty input")
+    return sum((p - a) ** 2 for p, a in zip(pred, actual)) / len(pred)
+
+
+def _mae(pred, actual):
+    pred = _need_list(pred, "mae", "pred"); actual = _need_list(actual, "mae", "actual")
+    if len(pred) != len(actual):
+        raise VMError(f"mae: length mismatch {len(pred)} vs {len(actual)}")
+    if not pred:
+        raise VMError("mae: empty input")
+    return sum(abs(p - a) for p, a in zip(pred, actual)) / len(pred)
+
+
+def _cross_entropy(pred, actual, eps=1e-12):
+    pred = _need_list(pred, "cross_entropy", "pred")
+    actual = _need_list(actual, "cross_entropy", "actual")
+    if len(pred) != len(actual):
+        raise VMError("cross_entropy: length mismatch")
+    return -sum(a * math.log(max(p, eps)) for p, a in zip(pred, actual))
+
+
+def _accuracy(pred, actual):
+    pred = _need_list(pred, "accuracy", "pred")
+    actual = _need_list(actual, "accuracy", "actual")
+    if len(pred) != len(actual):
+        raise VMError("accuracy: length mismatch")
+    if not pred:
+        raise VMError("accuracy: empty input")
+    return sum(1 for p, a in zip(pred, actual) if _eq(p, a)) / len(pred)
+
+
+def _linear_fit(xs, ys):
+    """Least-squares fit. Returns {slope, intercept, r2}."""
+    xs = _need_list(xs, "linear_fit", "xs"); ys = _need_list(ys, "linear_fit", "ys")
+    if len(xs) != len(ys):
+        raise VMError("linear_fit: length mismatch")
+    n = len(xs)
+    if n < 2:
+        raise VMError("linear_fit: need at least 2 points")
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        raise VMError("linear_fit: all x values are identical")
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot else 1.0
+    return {"slope": slope, "intercept": intercept, "r2": r2}
+
+
+def _train_test_split(items, ratio=0.8, seed=None):
+    items = _need_list(items, "train_test_split")
+    rng = _random.Random(seed) if seed is not None else _random
+    shuffled = list(items)
+    rng.shuffle(shuffled)
+    cut = int(len(shuffled) * float(ratio))
+    return {"train": shuffled[:cut], "test": shuffled[cut:]}
+
+
+def _shuffle(items, seed=None):
+    out = list(_need_list(items, "shuffle"))
+    (_random.Random(seed) if seed is not None else _random).shuffle(out)
+    return out
+
+
+def _sample(items, k, seed=None):
+    items = _need_list(items, "sample")
+    k = _need_int(k, "sample", "k")
+    if k > len(items):
+        raise VMError(f"sample: k={k} exceeds list length {len(items)}")
+    rng = _random.Random(seed) if seed is not None else _random
+    return rng.sample(items, k)
+
+
+def _one_hot(index, size):
+    i = _need_int(index, "one_hot", "index")
+    n = _need_int(size, "one_hot", "size")
+    if not 0 <= i < n:
+        raise VMError(f"one_hot: index {i} out of range for size {n}")
+    return [1.0 if j == i else 0.0 for j in range(n)]
+
+
+def _bincount(items):
+    out = {}
+    for x in _need_list(items, "bincount"):
+        k = _hashable_key(x)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _hashable_key(v):
+    if isinstance(v, list):
+        return tuple(v)
+    return v
+
+
+
+
+# ------------------------------------------------------------------ automation
+def _list_dir(path="."):
+    try:
+        return sorted(os.listdir(str(path)))
+    except OSError as e:
+        raise VMError(f"list_dir: {e}") from e
+
+
+def _path_exists(path):
+    return os.path.exists(str(path))
+
+
+def _is_dir(path):
+    return os.path.isdir(str(path))
+
+
+def _make_dir(path):
+    try:
+        os.makedirs(str(path), exist_ok=True)
+        return None
+    except OSError as e:
+        raise VMError(f"make_dir: {e}") from e
+
+
+def _delete_file(path):
+    try:
+        os.remove(str(path))
+        return None
+    except OSError as e:
+        raise VMError(f"delete_file: {e}") from e
+
+
+def _find_files(root, suffix=""):
+    out = []
+    try:
+        for base, _dirs, files in os.walk(str(root)):
+            for f in sorted(files):
+                if not suffix or f.endswith(str(suffix)):
+                    out.append(os.path.join(base, f))
+    except OSError as e:
+        raise VMError(f"find_files: {e}") from e
+    return sorted(out)
+
+
+def _read_lines(path):
+    return [ln for ln in _read_file(path).split("\n")]
+
+
+def _write_lines(path, lines):
+    return _write_file(path, "\n".join(display(x) for x in _need_list(lines, "write_lines")))
+
+
+def _read_csv(path, sep=","):
+    """Parse a CSV with a header row into a List of Maps."""
+    text = _read_file(path)
+    rows = [r for r in text.split("\n") if r.strip()]
+    if not rows:
+        return []
+    header = [h.strip() for h in rows[0].split(sep)]
+    out = []
+    for line in rows[1:]:
+        cells = [c.strip() for c in line.split(sep)]
+        entry = {}
+        for i, name in enumerate(header):
+            entry[name] = _coerce(cells[i]) if i < len(cells) else None
+        out.append(entry)
+    return out
+
+
+def _write_csv(path, rows, sep=","):
+    rows = _need_list(rows, "write_csv", "rows")
+    if not rows:
+        return _write_file(path, "")
+    if not isinstance(rows[0], dict):
+        raise VMError("write_csv: rows must be a List of Maps")
+    header = list(rows[0].keys())
+    lines = [sep.join(header)]
+    for r in rows:
+        lines.append(sep.join(display(r.get(h, "")) for h in header))
+    return _write_file(path, "\n".join(lines) + "\n")
+
+
+def _coerce(text):
+    """Best-effort scalar conversion used by read_csv."""
+    t = text.strip()
+    if t == "":
+        return None
+    low = t.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        if ("." in t) or ("e" in low):
+            return float(t)
+        return int(t)
+    except ValueError:
+        return t
+
+
+def _run_command(cmd, timeout=60):
+    """Run a shell command; returns {code, out, err}."""
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            str(cmd), shell=True, capture_output=True, text=True, timeout=float(timeout)
+        )
+        return {"code": r.returncode, "out": r.stdout, "err": r.stderr}
+    except subprocess.TimeoutExpired:
+        raise VMError(f"run: command timed out after {timeout}s")
+    except Exception as e:
+        raise VMError(f"run: {e}") from e
+
+
+def _timestamp(fmt="%Y-%m-%dT%H:%M:%S"):
+    return time.strftime(str(fmt), time.localtime())
+
+
+def _parallel_map(items, fn, workers=8):
+    """Apply fn to every item concurrently, preserving order."""
+    items = _need_list(items, "parallel_map")
+    _need_fn(fn, "parallel_map")
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        futures = [pool.submit(fn, x) for x in items]
+        out = []
+        for f in futures:
+            try:
+                out.append(f.result(timeout=300))
+            except Exception as e:
+                raise VMError(f"parallel_map: {e}") from e
+        return out
+
+
+def _retry(fn, attempts=3, delay=0.5):
+    """Call fn, retrying on failure with linear backoff."""
+    _need_fn(fn, "retry")
+    last = None
+    for i in range(max(1, int(attempts))):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i + 1 < int(attempts):
+                time.sleep(float(delay) * (i + 1))
+    raise VMError(f"retry: all {attempts} attempts failed: {last}")
+
+
+def _timed(fn):
+    """Run fn and report how long it took: {result, seconds}."""
+    _need_fn(fn, "timed")
+    t0 = time.perf_counter()
+    r = fn()
+    return {"result": r, "seconds": time.perf_counter() - t0}
+
+
 # ------------------------------------------------------------------ install
 def build_globals(argv=None):
     env = {
@@ -524,6 +1023,11 @@ def build_globals(argv=None):
         "first": _first,
         "last": _last,
         "push": _push,
+        "append": _append,
+        "extend": _extend,
+        "insert": _insert,
+        "pop": _pop_at,
+        "clear": _clear,
         "concat": _concat,
         "slice": _slice,
         "reverse": _reverse,
@@ -549,6 +1053,45 @@ def build_globals(argv=None):
         "set": _set,
         "remove": _remove,
         "merge": _merge,
+        # numeric / statistics
+        "dot": _dot,
+        "vadd": _vec_op("vadd", lambda a, b: a + b),
+        "vsub": _vec_op("vsub", lambda a, b: a - b),
+        "vmul": _vec_op("vmul", lambda a, b: a * b),
+        "vdiv": _vec_op("vdiv", lambda a, b: a / b if b else 0.0),
+        "mean": _mean,
+        "median": _median,
+        "variance": _variance,
+        "stddev": _stddev,
+        "percentile": _percentile,
+        "normalize": _normalize,
+        "standardize": _standardize,
+        "correlation": _correlation,
+        # matrices
+        "shape": _shape,
+        "matmul": _matmul,
+        "transpose": _transpose,
+        "identity": _identity,
+        "zeros": _zeros,
+        # machine learning
+        "sigmoid": _sigmoid,
+        "relu": _relu,
+        "tanh": _tanh,
+        "softmax": _softmax,
+        "argmax": _argmax,
+        "argmin": _argmin,
+        "mse": _mse,
+        "mae": _mae,
+        "cross_entropy": _cross_entropy,
+        "accuracy": _accuracy,
+        "linear_fit": _linear_fit,
+        "train_test_split": _train_test_split,
+        "shuffle": _shuffle,
+        "sample": _sample,
+        "one_hot": _one_hot,
+        "bincount": _bincount,
+        "exp": math.exp,
+        "log": lambda x, base=None: math.log(x) if base is None else math.log(x, base),
         # data
         "json_encode": _json_encode,
         "json_decode": _json_decode,
@@ -561,6 +1104,22 @@ def build_globals(argv=None):
         "write_file": _write_file,
         "append_file": _append_file,
         "env": lambda name: os.environ.get(str(name)),
+        # automation / filesystem
+        "list_dir": _list_dir,
+        "path_exists": _path_exists,
+        "is_dir": _is_dir,
+        "make_dir": _make_dir,
+        "delete_file": _delete_file,
+        "find_files": _find_files,
+        "read_lines": _read_lines,
+        "write_lines": _write_lines,
+        "read_csv": _read_csv,
+        "write_csv": _write_csv,
+        "run": _run_command,
+        "timestamp": _timestamp,
+        "parallel_map": _parallel_map,
+        "retry": _retry,
+        "timed": _timed,
         "args": lambda: list(argv or []),
         "input": lambda prompt="": input(display(prompt)),
         # net
