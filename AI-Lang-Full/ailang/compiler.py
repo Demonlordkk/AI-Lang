@@ -74,11 +74,42 @@ class Compiler:
             ctx.stmt(s)
         ctx.emit("HALT")
         main = FunctionCode("<main>", [], ctx.code, ctx.consts)
-        return ProgramCode(main, self.functions, self.records, self.imports)
+        program = ProgramCode(main, self.functions, self.records, self.imports)
+        from .peephole import optimise_program
+
+        return optimise_program(program)
 
     def anon_name(self, hint="lambda"):
         self._anon += 1
         return f"<{hint}#{self._anon}>"
+
+
+
+def _declares(body):
+    """True if a block body introduces bindings needing their own scope.
+
+    Loop bodies get a fresh Environment per iteration so that `let` inside the
+    loop is legal on every pass. When a body declares nothing that allocation
+    is pure overhead, so we skip emitting the scope entirely. Nested `when`
+    branches are inspected too, since they share the enclosing scope; an
+    `attempt` always needs a frame because `rescue` binds the error name.
+    """
+    for st in body:
+        k = st.__class__.__name__
+        if k in ("Let", "Var", "Record", "Fn", "Use"):
+            return True
+        if k == "When":
+            for br in st.branches:
+                if _declares(br.body):
+                    return True
+            if st.else_body and _declares(st.else_body):
+                return True
+        elif k == "Attempt":
+            return True
+        elif k in ("Repeat", "While"):
+            if _declares(st.body):
+                return True
+    return False
 
 
 class _Ctx:
@@ -201,6 +232,7 @@ class _Ctx:
         self.scope.declare(s.name)
         self.emit("CLOSURE", code.name, s.name, line=s.line)
 
+
     def _s_When(self, s):
         end_jumps = []
         for br in s.branches:
@@ -220,11 +252,14 @@ class _Ctx:
         start = self.here()
         self.expr(s.cond)
         exit_jump = self.emit("JUMP_IF_FALSE", None, line=s.line)
-        self.loops.append({"continue": start, "breaks": [], "scoped": True})
-        self.emit("SCOPE_PUSH")
+        scoped = _declares(s.body)
+        self.loops.append({"continue": start, "breaks": [], "scoped": scoped})
+        if scoped:
+            self.emit("SCOPE_PUSH")
         for x in s.body:
             self.stmt(x)
-        self.emit("SCOPE_POP")
+        if scoped:
+            self.emit("SCOPE_POP")
         self.emit("JUMP", start)
         self.patch(exit_jump, self.here())
         frame = self.loops.pop()
@@ -247,11 +282,14 @@ class _Ctx:
             start = self.here()
             nxt = self.emit("RANGE_NEXT", None, s.name)
             self.scope.declare(s.name)
-            self.loops.append({"continue": start, "breaks": [], "scoped": True})
-            self.emit("SCOPE_PUSH")
+            scoped = _declares(s.body)
+            self.loops.append({"continue": start, "breaks": [], "scoped": scoped})
+            if scoped:
+                self.emit("SCOPE_PUSH")
             for x in s.body:
                 self.stmt(x)
-            self.emit("SCOPE_POP")
+            if scoped:
+                self.emit("SCOPE_POP")
             self.emit("JUMP", start)
             self.patch(nxt, self.here())
             frame = self.loops.pop()
@@ -266,11 +304,14 @@ class _Ctx:
         self.scope.declare(s.name)
         if s.index_name:
             self.scope.declare(s.index_name)
-        self.loops.append({"continue": start, "breaks": [], "scoped": True})
-        self.emit("SCOPE_PUSH")
+        scoped = _declares(s.body)
+        self.loops.append({"continue": start, "breaks": [], "scoped": scoped})
+        if scoped:
+            self.emit("SCOPE_PUSH")
         for x in s.body:
             self.stmt(x)
-        self.emit("SCOPE_POP")
+        if scoped:
+            self.emit("SCOPE_POP")
         self.emit("JUMP", start)
         self.patch(nxt, self.here())
         frame = self.loops.pop()

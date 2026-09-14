@@ -276,6 +276,42 @@ counts[0] +<- 10.
 Each form means exactly its longhand (`total <- total + i`) and is typed
 identically — `/<-` yields `Real`, matching AI-Lang's division rule.
 
+### Destructuring
+
+Pull several values out of a list or map in one binding. The subject is
+evaluated once.
+
+```text
+let [first, second] := pair().
+let {name, age} := person.
+```
+
+### Multi-way branching
+
+`given` tests one subject against several values. It replaces a ladder of
+`elif` comparisons and evaluates the subject exactly once.
+
+```text
+given response.status:
+is 200:
+    emit "ok".
+is 301, 302:
+    emit "redirect".
+else:
+    emit "error {response.status}".
+done.
+```
+
+### Membership
+
+`in` and `not in` read as prose and work on lists, maps and text:
+
+```text
+when user not in banned and "admin" in user.roles:
+    grant(user).
+done.
+```
+
 ## Standard library
 
 Available everywhere without imports.
@@ -324,6 +360,33 @@ Available everywhere without imports.
 `run` `timestamp` `retry` `timed`
 
 ---
+
+### Working with collections
+
+Each of these replaces a loop and a temporary variable:
+
+| Operation | Result |
+| --- | --- |
+| `group_by(xs, f)` | map of key to the items sharing it |
+| `count_by(xs, f)` / `counts(xs)` | how many fall in each bucket |
+| `sum_by(xs, f)` | total of a projection |
+| `max_by(xs, f)` / `min_by(xs, f)` | the extreme item, not just its value |
+| `partition(xs, f)` | `[matching, rest]` in one pass |
+| `chunk(xs, n)` / `windows(xs, n)` | fixed blocks / sliding runs |
+| `take`, `drop`, `take_while`, `drop_while` | prefixes and suffixes |
+| `zip_with(a, b, f)` | element-wise combine |
+| `flat_map(xs, f)` | map then flatten one level |
+| `pluck(xs, "field")` | one field from every item |
+| `index_where(xs, f)` | first matching index, or `-1` |
+| `sort_desc(xs)` | descending sort |
+
+```text
+let by_team := group_by(people, \p -> p.team).
+let payroll := sum_by(people, \p -> p.salary).
+let top     := max_by(people, \p -> p.salary).name.
+```
+
+`examples/analytics.al` puts these together in a short end-to-end report.
 
 ## Building models: automatic differentiation
 
@@ -486,9 +549,10 @@ Measured on this machine:
 
 | Workload | Before | After | Gain |
 | --- | --- | --- | --- |
-| Mixed benchmark (fib 22, 200k loop, 20k list) | 1.485s | 1.037s | 1.43x |
+| Mixed benchmark (fib 22, 200k loop, 20k list) | 1.485s | 0.886s | 1.68x |
 | 50k element accumulation (`append`) | 3.395s | 0.243s | 14.0x |
-| Call-heavy recursion (fib 24) | 0.543s | 0.506s | 1.07x |
+| fib 21 + 300k arithmetic loop | 1.118s | 0.778s | 1.44x |
+| Call-heavy recursion (fib 24) | 0.543s | 0.468s | 1.16x |
 
 Key optimisations:
 
@@ -499,6 +563,12 @@ Key optimisations:
 * In-place `append` removes the O(n²) copy from accumulation loops
 * Calls bind parameters in one `dict(zip(...))` and share a precomputed
   immutable-parameter set instead of rebuilding it per invocation
+* Loop bodies that declare no bindings skip their per-iteration scope
+  entirely: a 300k-iteration loop went from 300,001 environment allocations
+  to one
+* A bytecode peephole pass fuses adjacent instruction pairs (`LOAD;LOAD`,
+  `LOAD;PUSH`, `LOAD;ADD_NN`, `LOAD;FIELD`, ...) so the hot path makes one
+  dispatch instead of two. Fusion never crosses a jump target
 
 ## Testing
 

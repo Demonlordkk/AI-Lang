@@ -418,10 +418,44 @@ def _json_decode(text):
 
 
 # ------------------------------------------------------------------ io
+# Relative paths in a program resolve against the directory of the program
+# that used them, not whatever directory the shell happened to be in. A
+# script is therefore portable: it behaves the same from anywhere.
+_SCRIPT_DIR = None
+
+
+def set_script_dir(path):
+    """Set the base directory relative paths resolve against."""
+    global _SCRIPT_DIR
+    _SCRIPT_DIR = os.fspath(path) if path is not None else None
+
+
+def _resolve(path):
+    """Resolve a program-supplied path against the script directory.
+
+    An absolute path is returned untouched. A relative path is taken from the
+    script's own directory; if nothing is there but the file exists relative
+    to the working directory, that is used instead so existing shell-relative
+    invocations keep working.
+    """
+    if not isinstance(path, str) or _SCRIPT_DIR is None:
+        return path
+    if os.path.isabs(path):
+        return path
+    candidate = os.path.join(_SCRIPT_DIR, path)
+    if os.path.exists(candidate):
+        return candidate
+    if os.path.exists(path):
+        return path
+    # neither exists: report against the script directory, which is where the
+    # author almost certainly meant the file to be
+    return candidate
+
+
 def _read_file(path):
     _need_text(path, "read_file", "path")
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(_resolve(path), "r", encoding="utf-8") as f:
             return f.read()
     except OSError as e:
         raise VMError(f"read_file: {e}") from e
@@ -430,7 +464,7 @@ def _read_file(path):
 def _write_file(path, content):
     _need_text(path, "write_file", "path")
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(_resolve(path), "w", encoding="utf-8") as f:
             f.write(display(content))
         return None
     except OSError as e:
@@ -439,7 +473,7 @@ def _write_file(path, content):
 
 def _append_file(path, content):
     try:
-        with open(path, "a", encoding="utf-8") as f:
+        with open(_resolve(path), "a", encoding="utf-8") as f:
             f.write(display(content))
         return None
     except OSError as e:
@@ -818,22 +852,22 @@ def _hashable_key(v):
 # ------------------------------------------------------------------ automation
 def _list_dir(path="."):
     try:
-        return sorted(os.listdir(str(path)))
+        return sorted(os.listdir(_resolve(str(path))))
     except OSError as e:
         raise VMError(f"list_dir: {e}") from e
 
 
 def _path_exists(path):
-    return os.path.exists(str(path))
+    return os.path.exists(_resolve(str(path)))
 
 
 def _is_dir(path):
-    return os.path.isdir(str(path))
+    return os.path.isdir(_resolve(str(path)))
 
 
 def _make_dir(path):
     try:
-        os.makedirs(str(path), exist_ok=True)
+        os.makedirs(_resolve(str(path)), exist_ok=True)
         return None
     except OSError as e:
         raise VMError(f"make_dir: {e}") from e
@@ -841,7 +875,7 @@ def _make_dir(path):
 
 def _delete_file(path):
     try:
-        os.remove(str(path))
+        os.remove(_resolve(str(path)))
         return None
     except OSError as e:
         raise VMError(f"delete_file: {e}") from e
@@ -1097,6 +1131,192 @@ def _randn(rows, cols=None, scale=None, seed=None):
 
 
 # ------------------------------------------------------------------ install
+
+# --------------------------------------------------- collection operations
+# Each of these replaces a loop and a temporary variable at the call site.
+def _group_by(items, key):
+    """Bucket items by a key function: group_by(people, \\p -> p.team)."""
+    items = _need_list(items, "group_by")
+    _need_fn(key, "group_by", "key")
+    out = {}
+    for x in items:
+        out.setdefault(_hashable_key(key(x)), []).append(x)
+    return out
+
+
+def _count_by(items, key):
+    """How many items fall in each bucket."""
+    items = _need_list(items, "count_by")
+    _need_fn(key, "count_by", "key")
+    out = {}
+    for x in items:
+        k = _hashable_key(key(x))
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _sum_by(items, key):
+    """Total a numeric projection without an accumulator loop."""
+    items = _need_list(items, "sum_by")
+    _need_fn(key, "sum_by", "key")
+    total = 0
+    for x in items:
+        v = key(x)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise VMError(f"sum_by: expected a number but got {type_name(v)}")
+        total += v
+    return total
+
+
+def _max_by(items, key):
+    items = _need_list(items, "max_by")
+    _need_fn(key, "max_by", "key")
+    if not items:
+        raise VMError("max_by: the list is empty")
+    return max(items, key=lambda x: _sort_key(key(x)))
+
+
+def _min_by(items, key):
+    items = _need_list(items, "min_by")
+    _need_fn(key, "min_by", "key")
+    if not items:
+        raise VMError("min_by: the list is empty")
+    return min(items, key=lambda x: _sort_key(key(x)))
+
+
+def _chunk(items, size):
+    """Split into fixed-size pieces: chunk([1,2,3,4,5], 2)."""
+    items = _need_list(items, "chunk")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise VMError("chunk: size must be an Int of at least 1")
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _windows(items, size):
+    """Every consecutive run of `size` items (sliding window)."""
+    items = _need_list(items, "windows")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise VMError("windows: size must be an Int of at least 1")
+    if size > len(items):
+        return []
+    return [items[i:i + size] for i in range(len(items) - size + 1)]
+
+
+def _partition(items, fn):
+    """Split into [matching, not_matching] in one pass."""
+    items = _need_list(items, "partition")
+    _need_fn(fn, "partition")
+    yes, no = [], []
+    for x in items:
+        (yes if is_truthy(fn(x)) else no).append(x)
+    return [yes, no]
+
+
+def _take(items, n):
+    items = _need_list(items, "take")
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise VMError("take: count must be an Int")
+    return items[:max(n, 0)]
+
+
+def _drop(items, n):
+    items = _need_list(items, "drop")
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise VMError("drop: count must be an Int")
+    return items[max(n, 0):]
+
+
+def _take_while(items, fn):
+    items = _need_list(items, "take_while")
+    _need_fn(fn, "take_while")
+    out = []
+    for x in items:
+        if not is_truthy(fn(x)):
+            break
+        out.append(x)
+    return out
+
+
+def _drop_while(items, fn):
+    items = _need_list(items, "drop_while")
+    _need_fn(fn, "drop_while")
+    i = 0
+    while i < len(items) and is_truthy(fn(items[i])):
+        i += 1
+    return items[i:]
+
+
+def _zip_with(a, b, fn):
+    """Combine two lists element-wise."""
+    a = _need_list(a, "zip_with")
+    b = _need_list(b, "zip_with")
+    _need_fn(fn, "zip_with")
+    return [fn(x, y) for x, y in zip(a, b)]
+
+
+def _flat_map(items, fn):
+    """Map then flatten one level."""
+    items = _need_list(items, "flat_map")
+    _need_fn(fn, "flat_map")
+    out = []
+    for x in items:
+        r = fn(x)
+        out.extend(r) if isinstance(r, list) else out.append(r)
+    return out
+
+
+def _pluck(items, field):
+    """Pull one field out of every record or map in a list."""
+    items = _need_list(items, "pluck")
+    name = str(field)
+    out = []
+    for x in items:
+        if isinstance(x, dict):
+            if name not in x:
+                raise VMError(f"pluck: no key {display(name)}")
+            out.append(x[name])
+        else:
+            out.append(_field_of(x, name))
+    return out
+
+
+def _field_of(obj, name):
+    getter = getattr(obj, "get", None)
+    if getter is not None:
+        return getter(name)
+    raise VMError(f"pluck: cannot read '{name}' from {type_name(obj)}")
+
+
+def _hashable_key(v):
+    if isinstance(v, (list, dict)):
+        return display(v)
+    return v
+
+
+def _sort_desc(items):
+    return sorted(_need_list(items, "sort_desc"), key=_sort_key, reverse=True)
+
+
+def _index_where(items, fn):
+    """First index matching a predicate, or -1."""
+    items = _need_list(items, "index_where")
+    _need_fn(fn, "index_where")
+    for i, x in enumerate(items):
+        if is_truthy(fn(x)):
+            return i
+    return -1
+
+
+def _counts(items):
+    """Frequency table of a list of values."""
+    items = _need_list(items, "counts")
+    out = {}
+    for x in items:
+        k = _hashable_key(x)
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
 def build_globals(argv=None):
     env = {
         # core
@@ -1156,6 +1376,24 @@ def build_globals(argv=None):
         "reverse": _reverse,
         "sort": _sort,
         "sort_by": _sort_by,
+        "sort_desc": _sort_desc,
+        "group_by": _group_by,
+        "count_by": _count_by,
+        "sum_by": _sum_by,
+        "max_by": _max_by,
+        "min_by": _min_by,
+        "chunk": _chunk,
+        "windows": _windows,
+        "partition": _partition,
+        "take": _take,
+        "drop": _drop,
+        "take_while": _take_while,
+        "drop_while": _drop_while,
+        "zip_with": _zip_with,
+        "flat_map": _flat_map,
+        "pluck": _pluck,
+        "index_where": _index_where,
+        "counts": _counts,
         "map": _map,
         "filter": _filter,
         "reduce": _reduce,

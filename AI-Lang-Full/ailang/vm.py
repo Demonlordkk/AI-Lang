@@ -199,6 +199,10 @@ class VM:
         _JUMP = JUMP; _JUMP_IF_FALSE = JUMP_IF_FALSE
         _ITER_NEXT = ITER_NEXT; _CALL = CALL; _RETURN = RETURN
         _BINARY = BINARY; _INC_FAST = INC_FAST; _ADD_CONST = ADD_CONST
+        _LOAD_LOAD = LOAD_LOAD; _LOAD_PUSH = LOAD_PUSH
+        _LOAD_ADD_NN = LOAD_ADD_NN; _LOAD_LT_NN = LOAD_LT_NN
+        _LOAD_FIELD = LOAD_FIELD
+        _LOAD_INDEX = LOAD_INDEX
 
         while ip < n:
             fuel -= 1
@@ -222,6 +226,114 @@ class VM:
                         e = e.parent
                     else:
                         raise VMError(f"undefined name '{name}'")
+
+                # ---- fused pairs: one dispatch instead of two -------------
+                elif op == _LOAD_PUSH:
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            push(v[name])
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+                    push(ins[2])
+
+                elif op == _LOAD_LOAD:
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            push(v[name])
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+                    name = ins[2]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            push(v[name])
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+
+                elif op == _LOAD_ADD_NN:
+                    # stack already holds the left operand; the local is right
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            b = v[name]
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+                    a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a + b)
+                    else:
+                        push(_binary("+", a, b))
+
+                elif op == _LOAD_LT_NN:
+                    # stack already holds the left operand; the local is right
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            b = v[name]
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+                    a = pop()
+                    if a.__class__ is int and b.__class__ is int:
+                        push(a < b)
+                    else:
+                        push(_binary("<", a, b))
+
+                elif op == _LOAD_FIELD:
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            push(_field(v[name], ins[2]))
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+
+                elif op == _LOAD_INDEX:
+                    # LOAD pushed the key; the object is already on the stack
+                    name = ins[1]
+                    e = env
+                    while e is not None:
+                        v = e.vars
+                        if name in v:
+                            key = v[name]
+                            break
+                        e = e.parent
+                    else:
+                        raise VMError(f"undefined name '{name}'")
+                    obj = pop()
+                    if obj.__class__ is list and key.__class__ is int:
+                        if -len(obj) <= key < len(obj):
+                            push(obj[key])
+                        else:
+                            raise VMError(
+                                f"index {key} is out of range for a list of {len(obj)}"
+                            )
+                    else:
+                        push(_index(obj, key))
+
 
                 elif op == _PUSH:
                     push(ins[1])

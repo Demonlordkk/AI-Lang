@@ -65,7 +65,9 @@ class Parser:
     def program(self) -> A.Program:
         stmts = []
         while not self.at("EOF"):
-            stmts.append(self.statement())
+            st = self.statement()
+            # a statement may expand to several nodes (destructuring)
+            stmts.extend(st) if isinstance(st, list) else stmts.append(st)
         return A.Program(stmts)
 
     def block(self, *, enders=("DONE",), consume_done=True, consume_dot=True) -> List:
@@ -82,7 +84,8 @@ class Parser:
                 raise ParseError("unterminated block: missing 'done.'", t.line, t.col)
             if k in enders:
                 break
-            body.append(self.statement())
+            st = self.statement()
+            body.extend(st) if isinstance(st, list) else body.append(st)
         if consume_done:
             self.take("DONE", "end of block")
             if consume_dot:
@@ -96,6 +99,12 @@ class Parser:
 
         if k == "LET" or k == "VAR":
             self.i += 1
+            node = A.Let if k == "LET" else A.Var
+
+            # destructuring: `let [a, b] := pair.` / `let {name, age} := person.`
+            if self.at("LBRACKET") or self.at("LBRACE"):
+                return self._destructure(node, t)
+
             name = self.take("IDENT", "binding name").value
             declared = None
             if self.match("COLON"):
@@ -103,8 +112,10 @@ class Parser:
             self.take("DEFINE", "binding (use ':=')")
             expr = self.expr()
             self.dot()
-            node = A.Let if k == "LET" else A.Var
             return node(name, expr, declared, t.line, t.col)
+
+        if k == "GIVEN":
+            return self._given(t)
 
         if k == "EMIT":
             self.i += 1
@@ -290,6 +301,92 @@ class Parser:
             node = piece if node is None else A.Binary(node, "+", piece, tok.line, tok.col)
         return node if node is not None else A.Literal("", tok.line, tok.col)
 
+    def _destructure(self, node, t):
+        """Lower `let [a, b] := xs.` and `let {x, y} := m.` into plain bindings.
+
+        The subject is evaluated once into a hidden temporary, then each name
+        is bound to an index (for lists) or a field (for maps). Because this
+        expands to ordinary Let/Var nodes, the type checker, compiler and VM
+        need no special cases.
+        """
+        is_list = self.at("LBRACKET")
+        close = "RBRACKET" if is_list else "RBRACE"
+        self.i += 1
+        names = []
+        while not self.at(close):
+            n = self.take("IDENT", "name in destructuring pattern")
+            names.append(n)
+            if not self.match("COMMA"):
+                break
+        self.take(close, "']'" if is_list else "'}'")
+        if not names:
+            raise ParseError("destructuring needs at least one name", t.line, t.col)
+        self.take("DEFINE", "binding (use ':=')")
+        subject = self.expr()
+        self.dot()
+
+        # a hidden temporary keeps the subject from being evaluated repeatedly
+        tmp = f"__d{t.line}_{t.col}"
+        out = [A.Let(tmp, subject, None, t.line, t.col)]
+        for i, n in enumerate(names):
+            src = A.Name(tmp, n.line, n.col)
+            if is_list:
+                access = A.Index(src, A.Literal(i, n.line, n.col), n.line, n.col)
+            else:
+                access = A.Field(src, n.value, n.line, n.col)
+            out.append(node(n.value, access, None, n.line, n.col))
+        return out
+
+    def _given(self, t):
+        """`given x: is 1: ... is 2, 3: ... else: ... done.`
+
+        A multi-way branch on one subject. It lowers to the same When node a
+        chain of `elif`s would produce, with the subject evaluated once into a
+        hidden temporary, so there is no new runtime machinery and no
+        fall-through surprises.
+        """
+        self.i += 1
+        subject = self.expr()
+        self.take("COLON", "':' after the given subject")
+        tmp = f"__g{t.line}_{t.col}"
+
+        branches = []
+        else_body = None
+        while True:
+            k = self.cur().kind
+            if k == "IS":
+                it = self.cur()
+                self.i += 1
+                values = [self.expr()]
+                while self.match("COMMA"):
+                    values.append(self.expr())
+                self.take("COLON", "':' after the given value")
+                body = self.block(enders=("IS", "ELSE", "DONE"), consume_done=False)
+                cond = None
+                for v in values:
+                    test = A.Binary(
+                        A.Name(tmp, it.line, it.col), "==", v, it.line, it.col
+                    )
+                    cond = test if cond is None else A.Binary(
+                        cond, "or", test, it.line, it.col
+                    )
+                branches.append(A.Branch(cond, body))
+                continue
+            if k == "ELSE":
+                self.i += 1
+                self.take("COLON", "':' after else")
+                else_body = self.block(enders=("DONE",), consume_done=False)
+                continue
+            break
+        self.take("DONE", "'done' to close the given block")
+        self.dot()
+        if not branches and else_body is None:
+            raise ParseError("given needs at least one 'is' branch", t.line, t.col)
+        return [
+            A.Let(tmp, subject, None, t.line, t.col),
+            A.When(branches, else_body, t.line, t.col),
+        ]
+
     def param_list(self):
         self.take("LPAREN", "parameter list")
         params = []
@@ -358,11 +455,40 @@ class Parser:
 
     def comparison(self):
         left = self.term()
-        while self.cur().kind in _COMPARE:
-            t = self.cur()
-            op = _COMPARE[t.kind]
-            self.i += 1
-            left = A.Binary(left, op, self.term(), t.line, t.col)
+        while True:
+            k = self.cur().kind
+            if k in _COMPARE:
+                t = self.cur()
+                op = _COMPARE[t.kind]
+                self.i += 1
+                left = A.Binary(left, op, self.term(), t.line, t.col)
+                continue
+            # membership reads as prose: `when name in names:` and
+            # `when key not in seen:`. Lowered to the `contains` builtin.
+            if k == "IN":
+                t = self.cur()
+                self.i += 1
+                right = self.term()
+                left = A.Call(
+                    A.Name("contains", t.line, t.col),
+                    [(None, right), (None, left)],
+                    t.line,
+                    t.col,
+                )
+                continue
+            if k == "NOT" and self.peek(1).kind == "IN":
+                t = self.cur()
+                self.i += 2
+                right = self.term()
+                inner = A.Call(
+                    A.Name("contains", t.line, t.col),
+                    [(None, right), (None, left)],
+                    t.line,
+                    t.col,
+                )
+                left = A.Unary("not", inner, t.line, t.col)
+                continue
+            break
         return left
 
     def term(self):

@@ -62,6 +62,11 @@ def run_source(
 def run_file(path, argv=None, check=True, fuel=50_000_000):
     p = Path(path)
     source = p.read_text(encoding="utf-8")
+    # relative paths inside the program resolve against the program's own
+    # directory, so a script behaves the same no matter where it is run from
+    from .stdlib import set_script_dir
+
+    set_script_dir(p.parent.resolve())
     return run_source(source, str(p), [p.parent.resolve(), Path.cwd()], argv, check, fuel)
 
 

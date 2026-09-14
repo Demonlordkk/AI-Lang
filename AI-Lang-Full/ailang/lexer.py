@@ -50,6 +50,8 @@ KEYWORDS = {
     "stop": "STOP",
     "next": "NEXT",
     "raise": "RAISE",
+    "given": "GIVEN",
+    "is": "IS",
     "attempt": "ATTEMPT",
     "rescue": "RESCUE",
     "true": "BOOL",

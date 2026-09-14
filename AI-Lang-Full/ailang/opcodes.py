@@ -39,6 +39,13 @@ _NAMES = [
     "TRY_PUSH", "TRY_POP", "RAISE",
     # misc
     "PRINT", "RECORD", "IMPORT", "HALT",
+    # superinstructions: fused pairs that remove stack round-trips
+    "LOAD_LOAD",      # push two locals at once
+    "LOAD_PUSH",      # push a local then a constant
+    "LOAD_ADD_NN",    # stack value + local
+    "LOAD_LT_NN",     # stack value < local
+    "LOAD_FIELD",     # local.field in one step
+    "LOAD_INDEX",     # index a stacked object by a local
 ]
 
 # name -> int, and the reverse for disassembly / serialisation
