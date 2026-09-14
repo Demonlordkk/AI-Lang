@@ -62,6 +62,18 @@ def run_source(
     return vm
 
 
+def _project_root(start: Path):
+    """Nearest ancestor directory holding the project marker, if any.
+
+    A project is rooted where `ailang.project.json` lives; packages in
+    `packages/` at that root are importable from anywhere inside it.
+    """
+    for d in (start, *start.parents):
+        if (d / "ailang.project.json").is_file():
+            return d
+    return None
+
+
 def run_file(path, argv=None, check=True, fuel=50_000_000):
     p = Path(path)
     source = p.read_text(encoding="utf-8")
@@ -70,7 +82,11 @@ def run_file(path, argv=None, check=True, fuel=50_000_000):
     from .stdlib import set_script_dir
 
     set_script_dir(p.parent.resolve())
-    return run_source(source, str(p), [p.parent.resolve(), Path.cwd()], argv, check, fuel)
+    paths = [p.parent.resolve(), Path.cwd()]
+    root = _project_root(p.parent.resolve())
+    if root is not None and root not in paths:
+        paths.append(root)
+    return run_source(source, str(p), paths, argv, check, fuel)
 
 
 def eval_source(source: str, search_paths=None):

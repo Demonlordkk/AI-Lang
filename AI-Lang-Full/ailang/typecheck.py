@@ -332,6 +332,7 @@ BUILTIN_SIGS = {
     "await_all": ([("tasks", LIST)], LIST),
     "http_get": ([("url", TEXT), ("headers", MAP)], MAP, 1),
     "http_post": ([("url", TEXT), ("body", ANY), ("headers", MAP)], MAP, 2),
+    "http_request": ([("url", TEXT), ("method", TEXT), ("body", ANY), ("headers", MAP)], MAP, 2),
 }
 
 

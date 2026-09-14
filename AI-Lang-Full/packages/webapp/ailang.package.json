@@ -1,0 +1,1 @@
+{"name": "webapp", "version": "1.0.0", "description": "Web-app toolkit written in AI-Lang: routing with path parameters, static files, middleware, and response helpers on top of serve().", "dependencies": {}}

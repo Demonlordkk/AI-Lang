@@ -25,11 +25,11 @@ emit "fastest {fastest.user} ({fastest.ms}ms), slowest {slowest.user} ({slowest.
 
 repeat e in raw:
     given e.action:
-        is "login":
-            next.
-            is "query":
-                when e.ms > 500:
-                    emit "slow query by {e.user}".
-                done.
-            done.
+    is "login":
+        next.
+    is "query":
+        when e.ms > 500:
+            emit "slow query by {e.user}".
         done.
+    done.
+done.

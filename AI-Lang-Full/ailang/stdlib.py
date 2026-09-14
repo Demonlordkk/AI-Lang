@@ -488,7 +488,7 @@ def _http_post(url, body=None, headers=None):
     return _http_request(url, "POST", body, headers)
 
 
-def _http_request(url, method, body, headers):
+def _http_request(url, method, body=None, headers=None):
     _need_text(url, "http", "url")
     data = None
     hdrs = {"User-Agent": "AI-Lang/2.0"}
@@ -1937,6 +1937,7 @@ def build_globals(argv=None):
         # net
         "http_get": _http_get,
         "http_post": _http_post,
+        "http_request": _http_request,
         # concurrency
         "spawn": _spawn,
         "await_all": _await_all,

@@ -18,6 +18,9 @@ import re
 INDENT = "    "
 _OPENS = re.compile(r":\s*$")
 _CLOSERS = ("done", "else", "elif", "rescue")
+# a `given` branch line, e.g. `is 200:` or `is 301, 302:`. Branches are
+# siblings of the `given`, not nested blocks, so they need their own rule.
+_IS_BRANCH = re.compile(r"^is\s")
 # two-plus spaces after a comma or `:=` means the author is aligning columns
 _ALIGNED = re.compile(r'(,|:=)  +\S|\S  +:=')
 
@@ -84,6 +87,20 @@ def format_source(source: str) -> str:
             continue
 
         is_continuation = bracket > 0 or continued
+
+        if _IS_BRANCH.match(line):
+            # A `given` branch: a sibling of the `given` line, one level up
+            # from the branch body that follows it.
+            normalised = _normalise(line)
+            if is_continuation:
+                extra = max(cont_depth - 1, 0)
+                out.append(INDENT * (depth + extra) + normalised)
+            else:
+                out.append(INDENT * max(depth - 1, 0) + normalised)
+            delta, _ = _scan(normalised)
+            bracket = max(bracket + delta, 0)
+            continued = bracket > 0
+            continue
 
         closer = _is_closer(line)
         if closer:

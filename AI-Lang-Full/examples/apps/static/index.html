@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Notes</title>
+<style>
+body { font-family: sans-serif; max-width: 560px; margin: 40px auto; color: #222; }
+h1 { font-weight: 300; }
+li { margin: 8px 0; }
+input, button { padding: 4px 6px; }
+.muted { color: #888; }
+</style>
+</head>
+<body>
+<h1>Notes</h1>
+<p>
+  <input id="t" placeholder="a note" size="30">
+  <button onclick="add()">Add</button>
+</p>
+<ul id="list"></ul>
+<p class="muted">served by an AI-Lang web app (SQLite + webapp package)</p>
+<script>
+function load() {
+  fetch("/notes").then(function (r) { return r.json(); }).then(function (rs) {
+    var ul = document.getElementById("list");
+    ul.innerHTML = "";
+    rs.forEach(function (n) {
+      var li = document.createElement("li");
+      var btn = document.createElement("button");
+      btn.textContent = "x";
+      btn.onclick = function () { del(n.id); };
+      li.appendChild(document.createTextNode(n.title + ": " + n.body + " "));
+      li.appendChild(btn);
+      ul.appendChild(li);
+    });
+  });
+}
+function add() {
+  var el = document.getElementById("t");
+  var t = el.value;
+  el.value = "";
+  fetch("/notes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: t })
+  }).then(load);
+}
+function del(id) {
+  fetch("/notes/" + id, { method: "DELETE" }).then(load);
+}
+load();
+</script>
+</body>
+</html>

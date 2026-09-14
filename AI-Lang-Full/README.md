@@ -397,7 +397,7 @@ Available everywhere without imports.
 
 **I/O** — `read_file` `write_file` `append_file` `env` `args` `input`
 
-**Network** — `http_get` `http_post`
+**Network** — `http_get` `http_post` `http_request` `serve` `serve_stop`
 
 **Concurrency** — `spawn` `await_all` `parallel_map`
 
@@ -536,6 +536,72 @@ No `LSTM` class, no `Sequence`: the recurrence, the loss and the greedy
 decoding loop are all plain AI-Lang, which is also why it runs on the
 reference engine with nothing installed.
 
+### A training guide
+
+**Choose the loss to match the target.**
+
+| Task | Loss | Note |
+| --- | --- | --- |
+| Regression (predict a number) | `mse_t`, `mae_t`, `huber_t` | `huber_t` resists outlier spikes |
+| Binary classification, probabilities | `bce_t` | predictions in (0,1) — compose with `t_sigmoid` |
+| Binary classification, raw logits | `bce_logits_t` | numerically stable, no `t_sigmoid` needed |
+| Multiclass, one-hot labels | `ce_t` | compose with `t_softmax` |
+| Regularisation | `l2_penalty_t` | add a small multiple to the loss |
+
+**Choose the optimizer.** `sgd_step` is the baseline; `momentum(params, rate, mu)`
+smooths it; `adam(params, rate)` adapts the rate per parameter; `adamw(params,
+rate, wd)` — Adam with decoupled weight decay — is the modern default for
+nets, and what the examples use. All three are created the same way and
+stepped with the same `*_step(state)` call, so switching is a one-line change.
+`clip_grad(params, 1.0)` before a step bounds the update when one bad batch
+sends a gradient wild.
+
+**The loop.** Seed first so runs are reproducible, keep the rate in the
+0.01–0.05 neighbourhood for `adamw`, and print the loss now and then so you
+can see it fall:
+
+```text
+seed(7).
+let opt := adamw(weights, 0.02, 0.0).
+var epoch := 0.
+while epoch < epochs:
+    zero_grad(weights).
+    let loss := ce_t(t_softmax(logits(x)), y).
+    backward(loss).
+    adamw_step(opt).
+    epoch <- epoch + 1.
+    when epoch % 100 == 0:
+        emit "epoch {epoch}  loss {round(value_of(loss), 5)}".
+    done.
+done.
+```
+
+**When it doesn't learn**, in order of frequency: the rate is too high (loss
+jumps — divide by 10) or too low (loss barely moves — multiply by 10); labels
+and outputs misaligned (spot-check `argmax(probs[i]) == labels[i]` on a few
+rows); a broadcastable-but-wrong shape (`(3,)` where `(3,1)` is expected —
+ask `shape_of(...)`); the net has no hidden layer (linear models can't
+separate non-linear data — XOR is the canonical case); or the data itself has
+no signal.
+
+### From data to deployment
+
+A model in AI-Lang is data plus functions, so it flows through the rest of
+the language like any other value:
+
+1. **Load.** `read_csv` gives typed rows — numbers stay numbers, booleans stay
+   booleans; `one_hot` encodes categorical targets; `train_test_split` and
+   `shuffle` keep an honest holdout out of the loop.
+2. **Train.** The loop above.
+3. **Evaluate.** `accuracy(probs, labels)` over the holdout, or `argmax` by
+   hand for anything custom.
+4. **Serve.** The trained weights are just tensors, still live in the
+   process. `examples/apps/predictor.al` ends its training loop and starts a
+   web app in the same file: `POST /predict` runs the forward pass on the
+   request and answers with the class and a confidence. Train in AI-Lang,
+   deploy from AI-Lang — no serialization format or serving framework in
+   between.
+
 ### Two engines, one language
 
 The autodiff engine has two backends with identical semantics:
@@ -561,6 +627,19 @@ host library that already owns the GPU, and keep writing the model in
 AI-Lang. That is a binding away, not a language change, and it is a
 deliberate design decision: the core stays dependency-free rather than
 shipping a CUDA build of the interpreter.
+
+### Where it runs
+
+| Machine | What the model gets |
+| --- | --- |
+| Termux, Raspberry Pi, locked-down box | The reference engine — pure Python, nothing installed |
+| Desktop Python with numpy | The numpy engine, picked up automatically (~11× on training) |
+| Colab / Jupyter | Same as desktop, in a single file |
+| CUDA server | The numpy engine for now; device speed is a binding away via FFI |
+
+The program is the same on every row. `ml_backend()` tells you which engine
+is live, `AILANG_NUMPY=0` forces the reference engine, and `seed(...)` makes
+any two of them agree bit for bit.
 
 ## Fixed-form models
 
@@ -648,6 +727,100 @@ and stop later with `serve_stop`.
 Raw TCP is available for protocols that are not HTTP: `tcp_listen`,
 `tcp_accept`, `tcp_connect`, `tcp_send`, `tcp_receive`, `tcp_close`.
 
+## Building apps
+
+A service is one shape of app. The language covers the others the same way:
+a **web app** is a function from request to response, a **terminal app** is a
+loop, a **CLI app** is a function of `args`. The language provides the
+plumbing — HTTP, sockets, SQLite, the file system, JSON, text — and
+`packages/webapp` provides the structure on top of it. Like ML, apps are a
+capability of the language, not a separate framework.
+
+### Web apps with the webapp package
+
+`packages/webapp` adds routing with path parameters, static files and
+middleware on top of `serve`:
+
+```text
+use packages/webapp as w.
+
+let app := w.new().
+
+w.route(app, "GET", "/notes/:id", fn(req: Map) -> Map:
+    give w.json(200, {"id": req.params.id}).
+done).
+w.static(app, "/", "static").       # static/index.html becomes the homepage
+w.middleware(app, fn(req: Map, cont: Function) -> Map:
+    give cont(req).                  # runs around every request
+done).
+
+w.start(app, 8080, "127.0.0.1", true).
+```
+
+| Piece | Function |
+| --- | --- |
+| `w.new()` | an empty app |
+| `w.route(app, method, pattern, handler)` | a route; `:name` in the pattern lands in `req.params.name` |
+| `w.static(app, prefix, dir)` | serve files under `prefix`, `index.html` as the prefix fallback, `..` rejected |
+| `w.middleware(app, fn)` | `fn(req, cont)` around every request — routes, static files, 404s; call `cont` to continue |
+| `w.dispatch(app, req)` | the whole router as a plain function — no server, so tests drive it directly |
+| `w.json` / `w.html` / `w.text` | response builders |
+| `w.body_json(req)` | the request body decoded as a Map (`{}` when absent) |
+| `w.start(app, port, host, background)` | serve; pass the result to `serve_stop` |
+
+Because `dispatch` is just a function, routing logic is unit-testable: build
+the app, call `dispatch` with a request map, assert on the response map —
+that is exactly what `tests/test_webapp.py` does, plus one test that drives
+the finished app over real HTTP.
+
+Two complete apps ship in `examples/apps/`:
+
+* **`notes.al`** — a full notes app: SQLite storage, a JSON API
+  (`GET/POST /notes`, `GET/DELETE /notes/:id`), a single-page HTML UI served
+  from `static/`, and a middleware that counts requests. Its final block
+  drives the finished app over HTTP — create, fetch, 404, delete — so the
+  example is its own integration test, and it passes the two-engine parity
+  gate.
+* **`predictor.al`** — trains a classifier with the autodiff engine and then
+  serves the live model as a `POST /predict` API in the same file: the
+  shortest distance in this language between "training" and "deployment" is
+  one `w.start`.
+
+### Terminal apps
+
+A terminal app is a loop with `input`. End-of-input raises, so apps exit
+cleanly by turning that into a value:
+
+```text
+while true:
+    var line := "".
+    attempt:
+        line <- input("> ").
+    rescue e:
+        stop.            # EOF: a normal exit, not a crash
+    done.
+    ...
+done.
+```
+
+`examples/apps/calc_tui.al` is a calculator REPL built exactly this way:
+interactive in a terminal (type `3 + 4`, errors like division by zero are
+rescued and shown), and safe to run unattended — the same `attempt`/`rescue`
+turns closed stdin into a clean stop, which is how it passes the parity gate.
+
+### CLI apps
+
+`args` carries the command line; `store_open` and `db_open` carry state
+between runs. A todo CLI is a `given args[0]` over `is "add"`, `is "list"`,
+`is "done"` — a module-based todo app ships in `examples/todo_app`, and the
+web `notes.al` above is the same idea with an HTTP front end.
+
+### Anything else
+
+Anything that is not HTTP is a socket away (`tcp_listen` and friends, shown
+above), and anything that is not in the standard library is a foreign
+function away. The app is the program; the language never gets in the way.
+
 ## Storage
 
 Durable storage with transactions, backed by SQLite:
@@ -734,9 +907,13 @@ so an install is reproducible and tampering is detected:
   stats: digest mismatch (expected sha256:521cfc2dc981..., got sha256:a96c18a8b34a...)
 ```
 
-Three packages ship in `packages/`: `text` (casing, padding, word counts),
-`collections` (set operations, rotation, frequency tables) and `testing`
-(assertions that report what actually differed).
+Five packages ship in `packages/`: `text` (casing, padding, word counts),
+`collections` (set operations, rotation, frequency tables), `testing`
+(assertions that report what actually differed), `neural` (a feed-forward
+net built from the tensor operators — see
+[Building models](#building-models-automatic-differentiation)) and `webapp`
+(routing, static files and middleware for web apps — see
+[Building apps](#building-apps)).
 
 ## Running anywhere
 
@@ -832,7 +1009,7 @@ The backend refuses anything it cannot model exactly -- closures that capture
 or mutate an enclosing scope, named arguments, records -- and those functions
 keep running on the VM. Set `AILANG_NATIVE=0` to disable it entirely; the test
 suite runs both ways, and every differential scenario in the suite — plus
-each of the 19 shipped examples — is executed on both backends and asserted
+each of the 22 shipped examples — is executed on both backends and asserted
 to produce identical output, exit codes and error text.
 
 ## Testing
