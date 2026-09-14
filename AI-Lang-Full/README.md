@@ -13,9 +13,13 @@ scripts, data work, automation, simulations, tools, and the models and AI
 systems you build with them. Nothing in the language is specialised to one
 domain: machine learning is a library, not the language.
 
-It runs anywhere. AI-Lang depends on **no third-party packages at all** — only
-a host Python runtime — and ships as a single 191 KB file you can copy to a
-device and run with no install step.
+It runs anywhere. AI-Lang depends on **no third-party packages** — only a
+host Python runtime — and ships as a single 353 KB file you can copy to a
+device and run with no install step. One exception, deliberately optional: if
+numpy is already installed (Colab, a scientific Python, a server), the tensor
+engine transparently accelerates on it; without numpy the reference engine
+runs the exact same program, just slower. Either way nothing needs to be
+installed for the language itself.
 
 ```text
 let users := [
@@ -407,6 +411,13 @@ Available everywhere without imports.
 `mse` `mae` `cross_entropy` `accuracy` `linear_fit` `one_hot`
 `train_test_split` `shuffle` `sample`
 
+**Tensors & autodiff** — `tensor` `param` `zeros` `randn` `seed` `value_of`
+`grad_of` `shape_of` `is_tensor` `ml_backend` `backward` `zero_grad`
+`sgd_step` `momentum` `momentum_step` `adam` `adam_step` `adamw` `adamw_step`
+`clip_grad` and the differentiable `t_*` operators, which also accept the
+plain `+` `-` `*` `/` and unary `-` on tensors. Full table in
+[Building models](#building-models-automatic-differentiation).
+
 **Automation** — `read_csv` `write_csv` `read_lines` `write_lines`
 `list_dir` `find_files` `path_exists` `is_dir` `make_dir` `delete_file`
 `run` `timestamp` `retry` `timed`
@@ -490,27 +501,66 @@ There is no derivative anywhere in that program. Compare
 `examples/ml/logistic_autodiff.al` (the same model, 0 lines) — the training
 loop collapses from 20 lines to 6.
 
+**Operators.** Tensor math uses the ordinary operators, not a parallel
+vocabulary: `+`, `-`, `*`, `/` and unary `-` on a tensor take the same
+differentiable path as the `t_*` functions, and broadcast like them (`a * 2.0`
+scales every element). Exponentiation is `t_pow`. So a squared-error loss is
+just `mean_t((t_matmul(x, w) - y) * (t_matmul(x, w) - y))`.
+
 **Autodiff vocabulary**
 
 | Purpose | Functions |
 | --- | --- |
-| Create | `param` `tensor` `randn` `zeros` |
-| Inspect | `value_of` `grad_of` `shape_of` `is_tensor` |
+| Create | `param` `tensor` `zeros` `randn` `seed` |
+| Inspect | `value_of` `grad_of` `shape_of` `is_tensor` `ml_backend` |
 | Math | `t_add` `t_sub` `t_mul` `t_div` `t_pow` `t_neg` `t_exp` `t_log` `t_sqrt` `t_abs` |
-| Layers | `t_matmul` `t_transpose` `t_reshape` |
+| Layers | `t_matmul` `t_transpose` `t_reshape` `t_slice` `t_gather` `t_concat` |
 | Activations | `t_sigmoid` `t_relu` `t_tanh` `t_softmax` |
+| Element-wise | `t_clip` `where_t` `l2_norm_t` |
 | Reduce | `sum_t` `mean_t` |
-| Losses | `mse_t` `mae_t` `bce_t` `ce_t` |
-| Train | `backward` `zero_grad` `sgd_step` `adam` `adam_step` |
+| Losses | `mse_t` `mae_t` `bce_t` `bce_logits_t` `ce_t` `huber_t` `l2_penalty_t` |
+| Train | `backward` `zero_grad` `sgd_step` `momentum` `momentum_step` `adam` `adam_step` `adamw` `adamw_step` `clip_grad` |
 
 Tensors broadcast (a bias vector adds across every row), shapes are checked
 with readable errors, and `backward` is iterative so network depth is not
-limited by recursion.
+limited by recursion. Optimizer state lives in an opaque handle returned by
+`momentum` / `adam` / `adamw`, so the training loop is the same six lines no
+matter which optimizer you pick, and `clip_grad` clamps before any step.
 
-Every gradient is verified two ways in the test suite: against closed-form
-derivatives, and against central-difference numerical gradients (agreement to
-~1e-10) for matmul chains, softmax/cross-entropy, sigmoid/BCE, broadcasting,
-and a 2-layer network.
+**Sequence models.** Anything the language can loop over, it can unroll.
+`examples/ml/char_lm.al` trains a character-level RNN — the recurrent
+connection `h <- t_tanh(t_add(t_matmul(h, w_hh), ...))` written as an
+ordinary assignment inside an explicit unrolling loop — and it learns to
+continue `the dog ...` with `barks and the fox jumps and the fox jumps...`.
+No `LSTM` class, no `Sequence`: the recurrence, the loss and the greedy
+decoding loop are all plain AI-Lang, which is also why it runs on the
+reference engine with nothing installed.
+
+### Two engines, one language
+
+The autodiff engine has two backends with identical semantics:
+
+* **Reference** — pure Python, zero dependencies. This is what Termux, a
+  Raspberry Pi, or any locked-down machine gets.
+* **numpy accelerator** — if numpy is importable at startup, the same
+  differentiable operations run on numpy arrays. No API change, no separate
+  program: `AILANG_NUMPY=0` turns it off, and `ml_backend()` reports which
+  engine is live.
+
+Measured on this machine (`tools/bench_ml.py`): the same spiral-classification
+training program takes **10.2 s on the reference engine and 0.92 s on the
+numpy engine — an 11× speedup** — with bit-identical outputs. The test suite
+runs every example and differential test on both engines and asserts
+identical output.
+
+A word about GPUs, said plainly: AI-Lang has **no built-in GPU path**. A
+Colab notebook or CUDA server gets the numpy accelerator, which is a large
+constant factor but not a device migration. The intended path to real
+device-speed training is the language's foreign-function interface — bind a
+host library that already owns the GPU, and keep writing the model in
+AI-Lang. That is a binding away, not a language change, and it is a
+deliberate design decision: the core stays dependency-free rather than
+shipping a CUDA build of the interpreter.
 
 ## Fixed-form models
 
@@ -690,11 +740,15 @@ Three packages ship in `packages/`: `text` (casing, padding, word counts),
 
 ## Running anywhere
 
-AI-Lang imports only the host runtime's standard library. There is no numpy,
-no build step, and no native extension anywhere in the implementation —
-including the automatic-differentiation engine, which is written from scratch.
-A test in the suite walks every import in the source and fails if a
-third-party package ever appears.
+AI-Lang imports only the host runtime's standard library. There is no build
+step and no native extension anywhere in the implementation — including the
+automatic-differentiation engine, which is written from scratch. A test in
+the suite walks every import in the source and fails if a third-party package
+ever appears, with exactly one whitelisted exception: **numpy is an optional
+accelerator, not a dependency**. It is imported lazily and only when present;
+`AILANG_NUMPY=0` — or simply not having numpy installed — runs the language
+on the pure-Python reference engine, which is the entire story on Termux, a
+Raspberry Pi, or any machine without pip.
 
 Build the standalone interpreter:
 
@@ -702,7 +756,7 @@ Build the standalone interpreter:
 python3 tools/make_bundle.py
 ```
 
-That writes `ailang-bundle.pyz`, a single 191 KB file:
+That writes `ailang-bundle.pyz`, a single 353 KB file:
 
 ```bash
 python3 ailang-bundle.pyz run program.al
@@ -742,6 +796,14 @@ Measured on this machine:
 | Call-heavy recursion (fib 24) | 0.543s | 0.200s | 2.7x |
 | 50k element accumulation (`append`) | 3.395s | 0.243s | 14.0x |
 
+(Absolute times are from the machine where they were recorded; ratios are
+stable. On this machine fib 24 measures 0.681 s VM / 0.271 s native.)
+
+Training workloads scale differently: the same spiral-classification program
+measures **10.2 s on the reference engine vs 0.92 s on the numpy engine**
+(`tools/bench_ml.py`, 11× on this machine). See
+[Two engines, one language](#two-engines-one-language).
+
 Key optimisations:
 
 * Integer opcodes with a dispatch chain ordered by measured frequency
@@ -769,8 +831,9 @@ still `false` and `6 / 3` is still `2.0`.
 The backend refuses anything it cannot model exactly -- closures that capture
 or mutate an enclosing scope, named arguments, records -- and those functions
 keep running on the VM. Set `AILANG_NATIVE=0` to disable it entirely; the test
-suite runs both ways and 45 differential tests assert the two backends produce
-identical output, exit codes and error text.
+suite runs both ways, and every differential scenario in the suite — plus
+each of the 19 shipped examples — is executed on both backends and asserted
+to produce identical output, exit codes and error text.
 
 ## Testing
 
@@ -801,6 +864,8 @@ source → lexer → parser → AST → type checker → optimizer → compiler 
 | `ailang/compiler.py` | Bytecode generation, closure conversion |
 | `ailang/vm.py` | Stack machine with lexical scope chain |
 | `ailang/stdlib.py` | Built-in functions |
+| `ailang/autodiff.py` | Reference tensor engine + reverse-mode autodiff |
+| `ailang/accel.py` | Optional numpy backend (same operations, numpy arrays) |
 | `ailang/modules.py` | Module resolution and caching |
 | `ailang/bytecode.py` | Deterministic artifact serialization |
 | `ailang/cli.py` | Command-line interface |
@@ -818,4 +883,7 @@ python3 -m pytest tests/ -q        # via pytest
 ## Status
 
 The reference implementation runs on Python. Semantics, diagnostics and the
-bytecode format are stable; raw execution speed is not the current priority.
+bytecode format are stable. Speed is handled in layers: the native backend
+roughly 2.5× for general code, and the optional numpy engine an order of
+magnitude more for tensor workloads — while the core stays pure Python with
+no required dependencies.

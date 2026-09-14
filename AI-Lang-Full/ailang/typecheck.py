@@ -150,6 +150,12 @@ BUILTIN_SIGS = {
     "sgd_step": ([("params", ANY), ("rate", ANY)], VOID),
     "adam": ([("params", ANY)], MAP),
     "adam_step": ([("state", MAP), ("rate", ANY), ("b1", ANY), ("b2", ANY), ("eps", ANY)], VOID, 4),
+    "momentum": ([("params", ANY), ("rate", ANY), ("mu", ANY)], MAP, 2),
+    "momentum_step": ([("state", MAP), ("rate", ANY), ("mu", ANY)], VOID, 2),
+    "adamw": ([("params", ANY), ("rate", ANY), ("wd", ANY)], MAP, 2),
+    "adamw_step": ([("state", MAP), ("rate", ANY), ("wd", ANY), ("b1", ANY), ("b2", ANY), ("eps", ANY)], VOID, 5),
+    "clip_grad": ([("params", ANY), ("max_norm", ANY)], VOID),
+    "seed": ([("n", ANY)], VOID),
     "randn": ([("rows", INT), ("cols", INT), ("scale", ANY), ("seed", ANY)], LIST, 3),
     "shape_of": ([("t", ANY)], LIST),
     "t_add": ([("a", ANY), ("b", ANY)], ANY),
@@ -169,6 +175,16 @@ BUILTIN_SIGS = {
     "t_matmul": ([("a", ANY), ("b", ANY)], ANY),
     "t_transpose": ([("a", ANY)], ANY),
     "t_reshape": ([("a", ANY), ("shape", LIST)], ANY),
+    "t_slice": ([("t", ANY), ("start", ANY), ("stop", ANY), ("axis", ANY)], ANY, 2),
+    "t_gather": ([("t", ANY), ("indices", LIST)], ANY),
+    "t_concat": ([("a", ANY), ("b", ANY), ("axis", ANY)], ANY, 1),
+    "t_clip": ([("t", ANY), ("low", ANY), ("high", ANY)], ANY),
+    "where_t": ([("cond", LIST), ("a", ANY), ("b", ANY)], ANY),
+    "l2_norm_t": ([("t", ANY)], ANY),
+    "bce_logits_t": ([("logits", ANY), ("target", ANY)], ANY),
+    "huber_t": ([("pred", ANY), ("target", ANY), ("delta", ANY)], ANY, 1),
+    "l2_penalty_t": ([("value", ANY)], ANY),
+    "ml_backend": ([], TEXT),
     "sum_t": ([("a", ANY)], ANY),
     "mean_t": ([("a", ANY)], ANY),
     "mse_t": ([("pred", ANY), ("target", ANY)], ANY),
@@ -486,21 +502,32 @@ class TypeChecker:
         def ok(name):
             return not name or name in TYPE_NAMES or name in self.records
 
+        def check_fn_like(fn_node):
+            for pname, ptype in fn_node.params:
+                if not ok(ptype):
+                    self._unknown_type(ptype, fn_node)
+            if not ok(fn_node.return_type):
+                self._unknown_type(fn_node.return_type, fn_node)
+            visit(fn_node.body)
+
         def visit(stmts):
             for s in stmts:
                 if isinstance(s, (A.Fn, A.FnExpr)):
-                    for pname, ptype in s.params:
-                        if not ok(ptype):
-                            self._unknown_type(ptype, s)
-                    if not ok(s.return_type):
-                        self._unknown_type(s.return_type, s)
-                    visit(s.body)
+                    check_fn_like(s)
                 elif isinstance(s, A.Record):
                     for _f, ftype in s.fields:
                         if not ok(ftype):
                             self._unknown_type(ftype, s)
-                elif isinstance(s, A.Let) and not ok(getattr(s, "declared_type", None)):
-                    self._unknown_type(s.declared_type, s)
+                elif isinstance(s, A.Let):
+                    if not ok(getattr(s, "declared_type", None)):
+                        self._unknown_type(s.declared_type, s)
+                    # lambdas bound in a let carry their own annotations
+                    if isinstance(s.expr, A.FnExpr):
+                        check_fn_like(s.expr)
+                    elif isinstance(s.expr, A.Call):
+                        for _name, arg in s.expr.args:
+                            if isinstance(arg, A.FnExpr):
+                                check_fn_like(arg)
                 else:
                     for attr in ("body", "else_body", "rescue_body"):
                         inner = getattr(s, attr, None)
@@ -692,7 +719,11 @@ class TypeChecker:
         saved_loop = self.loop_depth
         self.loop_depth = 0
         self.push("function")
+        seen = set()
         for pname, ptype in params:
+            if pname in seen:
+                self.error(f"function '{name}' has a duplicate parameter '{pname}'", node)
+            seen.add(pname)
             self.scope.declare(pname, ty(ptype), False)
         # nested declarations are visible within the function body
         self.hoist(body, self.scope)

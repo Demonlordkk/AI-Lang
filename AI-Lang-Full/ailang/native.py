@@ -268,6 +268,16 @@ class _Gen:
         if isinstance(s, (A.Let, A.Var)):
             self.locals.add(s.name)
             self.w(f"{s.name} = {self.expr(s.expr)}")
+        elif isinstance(s, A.While):
+            # a loop compiled to host bytecode would otherwise run forever
+            # without touching the interpreter's fuel meter; the per-iteration
+            # check gives it exactly the same "execution limit exceeded"
+            # behaviour a bytecode loop has
+            self.w(f"while _tr({self.expr(s.cond)}):")
+            self.depth += 1
+            self.w("_fc()")
+            self.body(s.body)
+            self.depth -= 1
 
         elif isinstance(s, A.Assign):
             t = s.target
@@ -310,15 +320,11 @@ class _Gen:
                 self.body(s.else_body)
                 self.depth -= 1
 
-        elif isinstance(s, A.While):
-            self.w(f"while _tr({self.expr(s.cond)}):")
-            self.depth += 1
-            self.body(s.body)
-            self.depth -= 1
-
         elif isinstance(s, A.Repeat):
             self.locals.add(s.name)
             it = s.iterable
+            # `_fcit` wraps the iterable so each iteration charges the shared
+            # fuel meter, matching the interpreter's per-instruction cost.
             # `repeat i in range(n)` maps onto a native counted loop
             if (
                 not s.index_name
@@ -328,15 +334,17 @@ class _Gen:
                 and len(it.args) == 1
                 and it.args[0][0] is None
             ):
-                self.w(f"for {s.name} in range(_rng({self.expr(it.args[0][1])})):")
+                self.w(
+                    f"for {s.name} in _fcit(range(_rng({self.expr(it.args[0][1])}))):"
+                )
             elif s.index_name:
                 self.locals.add(s.index_name)
                 self.w(
                     f"for {s.index_name}, {s.name} in "
-                    f"enumerate(_iter({self.expr(it)})):"
+                    f"_fcit(enumerate(_iter({self.expr(it)}))):"
                 )
             else:
-                self.w(f"for {s.name} in _iter({self.expr(it)}):")
+                self.w(f"for {s.name} in _fcit(_iter({self.expr(it)})):")
             self.depth += 1
             self.body(s.body)
             self.depth -= 1
@@ -393,12 +401,30 @@ class _Gen:
 
 
 # ------------------------------------------------------------------- runtime
-def _make_runtime(lookup):
+def _make_runtime(lookup, fuel_box=None):
     """Helpers the generated code calls. Each mirrors the VM exactly."""
-    from .errors import AILangRaise
+    from .errors import AILangRaise, VMError
     from .values import RecordValue
     from .vm import _binary, _equal, _field, _hashable, _index
     from .vm import _convert, _error_value
+
+    def _fuel_check(_box=fuel_box, _count=[256]):
+        # Charge one unit of the shared budget per iteration. The box is
+        # decremented every time and only tested every 256 charges, so a
+        # simple loop pays a few list operations, not a comparison storm.
+        if _box is None:
+            return
+        _box[0] -= 1
+        _count[0] -= 1
+        if not _count[0]:
+            _count[0] = 256
+            if _box[0] <= 0:
+                raise VMError("execution limit exceeded")
+
+    def _fuel_iter(it):
+        for item in it:
+            _fuel_check()
+            yield item
 
     def _unary(op, v):
         if op == "not":
@@ -463,6 +489,8 @@ def _make_runtime(lookup):
         "_rng": _rng,
         "_raise": _raise,
         "_errval": _error_value,
+        "_fc": _fuel_check,
+        "_fcit": _fuel_iter,
     }
 
 
@@ -470,13 +498,15 @@ def enabled():
     return os.environ.get("AILANG_NATIVE", "1") != "0"
 
 
-def try_compile(fn_node, lookup, name="<fn>", is_global=None):
+def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None):
     """Compile one AI-Lang function to a host function, or return None.
 
     `lookup` resolves a free name against the global scope. `is_global` says
     whether a name exists there; any free name that does not is a capture from
     an enclosing scope, which a cached host function cannot model, so the
-    function is left to the interpreter.
+    function is left to the interpreter. `fuel_box` is the VM's shared fuel
+    budget; the generated loops charge it so a runaway loop is bounded exactly
+    as it would be on the interpreter.
     """
     if not enabled():
         return None
@@ -504,7 +534,7 @@ def try_compile(fn_node, lookup, name="<fn>", is_global=None):
     except Exception:
         return None
 
-    env = _make_runtime(lookup)
+    env = _make_runtime(lookup, fuel_box)
     try:
         code = compile(src, f"<ailang:{name}>", "exec")
         exec(code, env)

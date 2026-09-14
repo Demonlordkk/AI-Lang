@@ -123,6 +123,12 @@ class VM:
         self.globals.vars.setdefault("false", False)
         self.globals.vars.setdefault("nothing", None)
         self.fuel = fuel
+        # The authoritative remaining-fuel counter. `self.fuel` mirrors it for
+        # API compatibility, and `execute()` caches it in a local for speed,
+        # but the box is what the native backend decrements, so a loop compiled
+        # to host bytecode hits the same "execution limit exceeded" wall an
+        # interpreter loop does instead of running forever.
+        self._fbox = [fuel]
         self.depth = 0
         self.program = None
         self.module_loader = module_loader
@@ -149,9 +155,11 @@ class VM:
             # The compiled function is cached on FunctionCode, which every
             # closure built from this source shares. Resolving free names
             # against one closure's environment would leak that environment
-            # into all the others, so free names are resolved against the
-            # globals only -- and `captures` (names taken from an enclosing
-            # scope) disqualify the function entirely.
+            # into all the others, so free names may be baked in only when
+            # the *defining* closure's own scope chain resolves them to the
+            # global scope. A name shadowed by an enclosing local must stay
+            # on the VM, or the compiled code would silently read the global
+            # instead of the captured value.
             if code.body is not None and not code.captures:
                 from .native import try_compile
 
@@ -162,12 +170,25 @@ class VM:
                         return _g.vars[name]
                     raise VMError(f"undefined name '{name}'")
 
+                def _resolves_to_global(nm, _chain=closure.env, _g=globals_env):
+                    e = _chain
+                    while e is not None:
+                        if nm in e.vars:
+                            return e is _g
+                        e = e.parent
+                    return False
+
                 code.native = try_compile(
                     code, _lookup, code.name,
-                    is_global=lambda nm, _g=globals_env: nm in _g.vars,
+                    is_global=_resolves_to_global, fuel_box=self._fbox,
                 )
 
         if code.native is not None and not kwargs and len(args) == nparams:
+            # The native code decrements the shared fuel box directly, while
+            # the interpreter decrements a local that is only synced here, so
+            # reconcile the two at every call boundary.
+            if self._fbox[0]:
+                self.fuel = min(self.fuel, self._fbox[0])
             self.depth += 1
             if self.depth > self.MAX_DEPTH:
                 self.depth -= 1
@@ -193,6 +214,9 @@ class VM:
                 raise
             finally:
                 self.depth -= 1
+                # the box is the authoritative meter while native code ran
+                if self._fbox[0]:
+                    self.fuel = min(self.fuel, self._fbox[0])
 
         if not kwargs:
             if len(args) != nparams:
@@ -243,7 +267,7 @@ class VM:
                 e = e.parent
             raise VMError(f"undefined name '{name}'")
 
-        runtime = _make_runtime(_lookup)
+        runtime = _make_runtime(_lookup, self._fbox)
         try:
             exec(compile(src, f"<ailang:loop{idx}>", "exec"), runtime)
         except Exception:
@@ -271,9 +295,14 @@ class VM:
         scopes = []
         ip = 0
         n = len(code)
-        fuel = self.fuel
+        # The fuel box is the shared budget: native code decrements it while
+        # the interpreter runs, and call boundaries keep the two in step, so
+        # entering a frame always sees the true remaining budget.
+        fuel = self._fbox[0] if self._fbox[0] else self.fuel
+        self.fuel = fuel
 
         # local aliases: attribute lookups in a hot loop are expensive
+        _box = self._fbox
         _PUSH = PUSH; _LOAD = LOAD; _STORE = STORE; _SET = SET
         _ADD_NN = ADD_NN; _SUB_NN = SUB_NN; _MUL_NN = MUL_NN
         _LT_NN = LT_NN; _LE_NN = LE_NN; _GT_NN = GT_NN; _GE_NN = GE_NN
@@ -288,6 +317,7 @@ class VM:
         while ip < n:
             fuel -= 1
             if fuel < 0:
+                _box[0] = fuel
                 self.fuel = fuel
                 raise VMError("execution limit exceeded")
             ins = code[ip]
@@ -470,9 +500,7 @@ class VM:
 
                 elif op == _JUMP_IF_FALSE:
                     v = pop()
-                    if v is False or v is None:
-                        ip = ins[1]
-                    elif v is not True and not is_truthy(v):
+                    if not is_truthy(v):
                         ip = ins[1]
 
                 elif op == _JUMP:
@@ -504,13 +532,17 @@ class VM:
                         args = []
                     callee = pop()
                     if callee.__class__ is Closure:
+                        _box[0] = fuel
                         self.fuel = fuel
                         push(self.invoke(callee, args))
-                        fuel = self.fuel
+                        fuel = _box[0]
+                        self.fuel = fuel
                     else:
+                        _box[0] = fuel
                         self.fuel = fuel
                         push(self.call_value(callee, args))
-                        fuel = self.fuel
+                        fuel = _box[0]
+                        self.fuel = fuel
 
                 elif op == _SET:
                     name = ins[1]
@@ -561,6 +593,7 @@ class VM:
                     env.declare(ins[1], pop(), ins[2])
 
                 elif op == _RETURN:
+                    _box[0] = fuel
                     self.fuel = fuel
                     return pop() if stack else None
 
@@ -622,9 +655,14 @@ class VM:
                     if ins[1] == "not":
                         push(not is_truthy(v))
                     else:
-                        if v.__class__ is bool or not isinstance(v, (int, float)):
+                        if _is_tensor(v):
+                            from . import autodiff
+
+                            push(autodiff.neg(v))
+                        elif v.__class__ is bool or not isinstance(v, (int, float)):
                             raise VMError(f"cannot negate {type_name(v)}")
-                        push(-v)
+                        else:
+                            push(-v)
 
                 elif op == MAKE_LIST:
                     count = ins[1]
@@ -686,7 +724,13 @@ class VM:
                             e = e.parent
                         else:
                             raise VMError(f"undefined name '{nm}'")
-                    out = fn(*vals)
+                    _box[0] = fuel
+                    self.fuel = fuel
+                    try:
+                        out = fn(*vals)
+                    finally:
+                        fuel = _box[0]
+                        self.fuel = fuel
                     for nm, val in zip(carried, out):
                         e = env
                         while e is not None:
@@ -743,9 +787,13 @@ class VM:
                             positional.append(value)
                         else:
                             kwargs[nm] = value
+                    if len(names) != len(set(names)):
+                        raise VMError("duplicate value for a named argument")
+                    _box[0] = fuel
                     self.fuel = fuel
                     push(self.call_value(callee, positional, kwargs))
-                    fuel = self.fuel
+                    fuel = _box[0]
+                    self.fuel = fuel
 
                 elif op == CLOSURE:
                     fcode = program.functions[ins[1]]
@@ -811,6 +859,7 @@ class VM:
                         env.declare(alias, module, False)
 
                 elif op == RETURN_NONE:
+                    _box[0] = fuel
                     self.fuel = fuel
                     return None
 
@@ -818,6 +867,7 @@ class VM:
                     push(stack[-1])
 
                 elif op == HALT:
+                    _box[0] = fuel
                     self.fuel = fuel
                     return None
 
@@ -830,6 +880,7 @@ class VM:
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                     raise
                 if not traps:
+                    _box[0] = fuel
                     self.fuel = fuel
                     # attach the source line of the failing instruction so a
                     # runtime error points at the statement that caused it
@@ -846,6 +897,7 @@ class VM:
                     env.immutable.discard(err_name)
                 ip = target
 
+        _box[0] = fuel
         self.fuel = fuel
         return None
 
@@ -881,7 +933,9 @@ def _make_iter(src):
 
 def _hashable(key):
     if isinstance(key, list):
-        return tuple(key)
+        # nested lists become nested tuples, so [[1], [2]] is a valid key;
+        # a Map anywhere inside still fails with a clear AI-Lang error
+        return tuple(_hashable(x) for x in key)
     if isinstance(key, dict):
         raise VMError("a Map cannot be used as a Map key")
     return key
@@ -928,6 +982,19 @@ def _numeric(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+_TENSOR = None
+
+
+def _is_tensor(v):
+    # Lazy: autodiff is optional at import time and this runs on the hot path.
+    global _TENSOR
+    if _TENSOR is None:
+        from .autodiff import Tensor
+
+        _TENSOR = Tensor
+    return type(v) is _TENSOR
+
+
 def _binary(op, a, b):
     if op == "==":
         return _equal(a, b)
@@ -942,6 +1009,19 @@ def _binary(op, a, b):
         else:
             raise VMError(f"cannot compare {type_name(a)} with {type_name(b)} using '{op}'")
         return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op]
+
+    if _is_tensor(a) or _is_tensor(b):
+        from . import autodiff
+
+        ops = {
+            "+": autodiff.add,
+            "-": autodiff.sub,
+            "*": autodiff.mul,
+            "/": autodiff.div,
+        }
+        if op in ops:
+            return ops[op](a, b)
+        raise VMError(f"cannot apply '{op}' to {type_name(a)} and {type_name(b)}")
 
     if op == "+":
         if isinstance(a, str) or isinstance(b, str):

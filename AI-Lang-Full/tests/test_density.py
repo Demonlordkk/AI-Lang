@@ -179,6 +179,10 @@ def test_no_external_dependencies():
             elif isinstance(node, pyast.ImportFrom) and node.level == 0 and node.module:
                 foreign.add(node.module.split(".")[0])
     foreign -= set(stdlib) | {"ailang"}
+    # numpy is an *optional* accelerator: `accel` imports it lazily, only when
+    # present, and AILANG_NUMPY=0 (or its mere absence) runs the language on
+    # the pure-Python engine, so it does not violate "stdlib only"
+    foreign -= {"numpy"}
     assert not foreign, f"non-stdlib imports found: {sorted(foreign)}"
 
 

@@ -1,0 +1,1 @@
+{"name": "neural", "version": "1.0.0", "description": "Feed-forward network components written in AI-Lang itself: a net, its forward pass, and a training loop.", "dependencies": {}}

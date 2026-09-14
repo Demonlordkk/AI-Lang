@@ -655,12 +655,28 @@ def _shape(m):
     return [len(m)]
 
 
+def _check_rectangular(m, fname):
+    if not m or not isinstance(m[0], list):
+        return
+    width = len(m[0])
+    for i, row in enumerate(m):
+        if not isinstance(row, list):
+            raise VMError(f"{fname}: row {i} is not a list")
+        if len(row) != width:
+            raise VMError(
+                f"{fname}: ragged matrix — row 0 has {width} columns, "
+                f"row {i} has {len(row)}"
+            )
+
+
 def _matmul(a, b):
     a = _need_list(a, "matmul", "a"); b = _need_list(b, "matmul", "b")
     if not a or not b:
         raise VMError("matmul: empty matrix")
     if not isinstance(a[0], list) or not isinstance(b[0], list):
         raise VMError("matmul: both arguments must be 2-D lists")
+    _check_rectangular(a, "matmul")
+    _check_rectangular(b, "matmul")
     n, k, k2, m = len(a), len(a[0]), len(b), len(b[0])
     if k != k2:
         raise VMError(f"matmul: inner dimensions differ ({k} vs {k2})")
@@ -674,6 +690,7 @@ def _transpose(m):
         return []
     if not isinstance(m[0], list):
         return [[x] for x in m]
+    _check_rectangular(m, "transpose")
     return [list(col) for col in zip(*m)]
 
 
@@ -767,6 +784,11 @@ def _cross_entropy(pred, actual, eps=1e-12):
     actual = _need_list(actual, "cross_entropy", "actual")
     if len(pred) != len(actual):
         raise VMError("cross_entropy: length mismatch")
+    for p in pred:
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= p <= 1.0:
+            raise VMError(
+                f"cross_entropy: probabilities must be between 0 and 1, got {display(p)}"
+            )
     return -sum(a * math.log(max(p, eps)) for p, a in zip(pred, actual))
 
 
@@ -841,14 +863,6 @@ def _bincount(items):
     return out
 
 
-def _hashable_key(v):
-    if isinstance(v, list):
-        return tuple(v)
-    return v
-
-
-
-
 # ------------------------------------------------------------------ automation
 def _list_dir(path="."):
     try:
@@ -884,7 +898,7 @@ def _delete_file(path):
 def _find_files(root, suffix=""):
     out = []
     try:
-        for base, _dirs, files in os.walk(str(root)):
+        for base, _dirs, files in os.walk(_resolve(str(root))):
             for f in sorted(files):
                 if not suffix or f.endswith(str(suffix)):
                     out.append(os.path.join(base, f))
@@ -901,21 +915,82 @@ def _write_lines(path, lines):
     return _write_file(path, "\n".join(display(x) for x in _need_list(lines, "write_lines")))
 
 
+def _parse_csv_rows(text, sep):
+    """Split CSV text into rows of cells, honouring quoted fields.
+
+    A quoted field may contain the separator, newlines and doubled quotes
+    ("" inside a quoted field is a literal ").
+    """
+    rows = []
+    row = []
+    cell = []
+    i = 0
+    n = len(text)
+    in_quotes = False
+    while i < n:
+        ch = text[i]
+        if in_quotes:
+            if ch == '"':
+                if i + 1 < n and text[i + 1] == '"':
+                    cell.append('"')
+                    i += 2
+                    continue
+                in_quotes = False
+                i += 1
+                continue
+            cell.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_quotes = True
+            i += 1
+        elif ch == sep:
+            row.append("".join(cell))
+            cell = []
+            i += 1
+        elif ch == "\n":
+            row.append("".join(cell))
+            rows.append(row)
+            row = []
+            cell = []
+            i += 1
+        elif ch == "\r":
+            i += 1
+        else:
+            cell.append(ch)
+            i += 1
+    row.append("".join(cell))
+    rows.append(row)
+    out = []
+    for r in rows:
+        # a bare blank line is not a row
+        if len(r) == 1 and r[0].strip() == "":
+            continue
+        out.append([c.strip() for c in r])
+    return out
+
+
 def _read_csv(path, sep=","):
     """Parse a CSV with a header row into a List of Maps."""
     text = _read_file(path)
-    rows = [r for r in text.split("\n") if r.strip()]
+    rows = _parse_csv_rows(text, sep)
     if not rows:
         return []
-    header = [h.strip() for h in rows[0].split(sep)]
+    header = rows[0]
     out = []
-    for line in rows[1:]:
-        cells = [c.strip() for c in line.split(sep)]
+    for cells in rows[1:]:
         entry = {}
         for i, name in enumerate(header):
             entry[name] = _coerce(cells[i]) if i < len(cells) else None
         out.append(entry)
     return out
+
+
+def _csv_escape(value, sep):
+    s = display(value)
+    if sep in s or '"' in s or "\n" in s or "\r" in s:
+        return '"' + s.replace('"', '""') + '"'
+    return s
 
 
 def _write_csv(path, rows, sep=","):
@@ -925,9 +1000,9 @@ def _write_csv(path, rows, sep=","):
     if not isinstance(rows[0], dict):
         raise VMError("write_csv: rows must be a List of Maps")
     header = list(rows[0].keys())
-    lines = [sep.join(header)]
+    lines = [sep.join(_csv_escape(h, sep) for h in header)]
     for r in rows:
-        lines.append(sep.join(display(r.get(h, "")) for h in header))
+        lines.append(sep.join(_csv_escape(r.get(h, ""), sep) for h in header))
     return _write_file(path, "\n".join(lines) + "\n")
 
 
@@ -1065,6 +1140,15 @@ def _factorial(n):
     return math.factorial(i)
 
 
+def _pow(a, b):
+    try:
+        return float(a) ** float(b)
+    except (ValueError, OverflowError) as e:
+        raise VMError(
+            f"pow: {display(a)} ^ {display(b)} has no real result"
+        ) from e
+
+
 # ------------------------------------------------------------------ graphics
 def _gfx():
     from . import graphics
@@ -1098,6 +1182,20 @@ def _ad():
     from . import autodiff
 
     return autodiff
+
+
+def _accel():
+    from . import accel
+
+    return accel
+
+
+def _seed(n):
+    """Fix the global random stream (random, randn, shuffle, sample)."""
+    if n is None:
+        return None
+    _random.seed(int(n))
+    return None
 
 
 def _tensor(value, requires_grad=False):
@@ -1151,34 +1249,97 @@ def _zero_grad(*tensors):
     return None
 
 
+def _param_list(params, fname):
+    """Accept a tensor or a List of tensors; return the list."""
+    from .autodiff import Tensor
+
+    if isinstance(params, Tensor):
+        return [params]
+    ts = _need_list(params, fname, "params")
+    for t in ts:
+        if not isinstance(t, Tensor):
+            raise VMError(f"{fname}: expected tensors, found {type_name(t)}")
+    return ts
+
+
+def _is_arr(v):
+    from . import accel
+
+    return accel.is_arr(v)
+
+
+def _asarr(v):
+    from . import accel
+
+    return accel.asarr(v)
+
+
 def _sgd_step(params, rate):
     """In-place gradient descent update over a list of params."""
     from .autodiff import Tensor
 
-    if isinstance(params, Tensor):
-        params = [params]
     rate = float(rate)
-    for t in _need_list(params, "sgd_step", "params"):
-        if not isinstance(t, Tensor):
-            raise VMError(f"sgd_step: expected tensors, found {type_name(t)}")
+    for t in _param_list(params, "sgd_step"):
         if t.grad is None:
             continue
         d, g = t.data, t.grad
-        for i in range(len(d)):
-            d[i] -= rate * g[i]
+        if _is_arr(d):
+            d -= rate * _asarr(g)
+        else:
+            for i in range(len(d)):
+                d[i] -= rate * g[i]
+    return None
+
+
+def _momentum_state(params, rate=0.01, mu=0.9):
+    """SGD with momentum: v <- mu*v + grad; param <- param - rate*v."""
+    return {
+        "t": 0,
+        "v": [
+            _asarr([0.0] * p.size) if _is_arr(p.data) else [0.0] * p.size
+            for p in _param_list(params, "momentum")
+        ],
+        "params": _param_list(params, "momentum"),
+        "rate": float(rate),
+        "mu": float(mu),
+    }
+
+
+def _momentum_step(state, rate=None, mu=None):
+    """One momentum update over the state created by `momentum`."""
+    rate = state["rate"] if rate is None else float(rate)
+    mu = state["mu"] if mu is None else float(mu)
+    params = state["params"]
+    for pi, p in enumerate(params):
+        if p.grad is None:
+            continue
+        v, d, g = state["v"][pi], p.data, p.grad
+        if _is_arr(d):
+            # v <- mu*v + g  (decay the old velocity, THEN add the gradient)
+            v *= mu
+            v += _asarr(g)
+            d -= rate * v
+        else:
+            for i in range(len(d)):
+                v[i] = mu * v[i] + g[i]
+                d[i] -= rate * v[i]
     return None
 
 
 def _adam_state(params):
     from .autodiff import Tensor
 
-    if isinstance(params, Tensor):
-        params = [params]
     return {
         "t": 0,
-        "m": [[0.0] * p.size for p in params],
-        "v": [[0.0] * p.size for p in params],
-        "params": params,
+        "m": [
+            _asarr([0.0] * p.size) if _is_arr(p.data) else [0.0] * p.size
+            for p in _param_list(params, "adam")
+        ],
+        "v": [
+            _asarr([0.0] * p.size) if _is_arr(p.data) else [0.0] * p.size
+            for p in _param_list(params, "adam")
+        ],
+        "params": _param_list(params, "adam"),
     }
 
 
@@ -1193,12 +1354,99 @@ def _adam_step(state, rate=0.01, b1=0.9, b2=0.999, eps=1e-8):
             continue
         m, v = state["m"][pi], state["v"][pi]
         d, g = p.data, p.grad
-        for i in range(len(d)):
-            m[i] = b1 * m[i] + (1.0 - b1) * g[i]
-            v[i] = b2 * v[i] + (1.0 - b2) * g[i] * g[i]
-            mh = m[i] / (1.0 - b1 ** t)
-            vh = v[i] / (1.0 - b2 ** t)
-            d[i] -= rate * mh / (math.sqrt(vh) + eps)
+        if _is_arr(d):
+            np_ = _accel().np()
+            ga = _asarr(g)
+            m = m * b1 + (1.0 - b1) * ga
+            v = v * b2 + (1.0 - b2) * ga * ga
+            mh = m / (1.0 - b1 ** t)
+            vh = v / (1.0 - b2 ** t)
+            d -= rate * mh / (np_.sqrt(vh) + eps)
+            state["m"][pi], state["v"][pi] = m, v
+        else:
+            for i in range(len(d)):
+                m[i] = b1 * m[i] + (1.0 - b1) * g[i]
+                v[i] = b2 * v[i] + (1.0 - b2) * g[i] * g[i]
+                mh = m[i] / (1.0 - b1 ** t)
+                vh = v[i] / (1.0 - b2 ** t)
+                d[i] -= rate * mh / (math.sqrt(vh) + eps)
+    return None
+
+
+def _adamw_state(params, rate=0.001, wd=0.01):
+    """Adam with decoupled weight decay — the modern default."""
+    return {
+        "t": 0,
+        "m": [
+            _asarr([0.0] * p.size) if _is_arr(p.data) else [0.0] * p.size
+            for p in _param_list(params, "adamw")
+        ],
+        "v": [
+            _asarr([0.0] * p.size) if _is_arr(p.data) else [0.0] * p.size
+            for p in _param_list(params, "adamw")
+        ],
+        "params": _param_list(params, "adamw"),
+        "rate": float(rate),
+        "wd": float(wd),
+    }
+
+
+def _adamw_step(state, rate=None, wd=None, b1=0.9, b2=0.999, eps=1e-8):
+    """One AdamW update: Adam step plus `wd * param` weight decay."""
+    rate = state["rate"] if rate is None else float(rate)
+    wd = state["wd"] if wd is None else float(wd)
+    params = state["params"]
+    state["t"] += 1
+    t = state["t"]
+    for pi, p in enumerate(params):
+        if p.grad is None:
+            continue
+        m, v = state["m"][pi], state["v"][pi]
+        d, g = p.data, p.grad
+        if _is_arr(d):
+            np_ = _accel().np()
+            ga = _asarr(g)
+            m = m * b1 + (1.0 - b1) * ga
+            v = v * b2 + (1.0 - b2) * ga * ga
+            mh = m / (1.0 - b1 ** t)
+            vh = v / (1.0 - b2 ** t)
+            d -= rate * (mh / (np_.sqrt(vh) + eps) + wd * d)
+            state["m"][pi], state["v"][pi] = m, v
+        else:
+            for i in range(len(d)):
+                m[i] = b1 * m[i] + (1.0 - b1) * g[i]
+                v[i] = b2 * v[i] + (1.0 - b2) * g[i] * g[i]
+                mh = m[i] / (1.0 - b1 ** t)
+                vh = v[i] / (1.0 - b2 ** t)
+                d[i] -= rate * (mh / (math.sqrt(vh) + eps) + wd * d[i])
+    return None
+
+
+def _clip_grad(params, max_norm):
+    """Scale every gradient so the global norm across `params` <= max_norm."""
+    from .autodiff import Tensor
+
+    max_norm = float(max_norm)
+    ts = _param_list(params, "clip_grad")
+    total = 0.0
+    for t in ts:
+        if t.grad is None:
+            continue
+        if _is_arr(t.data):
+            total += float((t.grad ** 2).sum())
+        else:
+            total += sum(g * g for g in t.grad)
+    total = math.sqrt(total)
+    if total > max_norm:
+        scale = max_norm / total
+        for t in ts:
+            if t.grad is None:
+                continue
+            if _is_arr(t.data):
+                t.grad = t.grad * scale
+            else:
+                for i in range(len(t.grad)):
+                    t.grad[i] *= scale
     return None
 
 
@@ -1335,6 +1583,8 @@ def _zip_with(a, b, fn):
     a = _need_list(a, "zip_with")
     b = _need_list(b, "zip_with")
     _need_fn(fn, "zip_with")
+    if len(a) != len(b):
+        raise VMError(f"zip_with: length mismatch {len(a)} vs {len(b)}")
     return [fn(x, y) for x, y in zip(a, b)]
 
 
@@ -1411,7 +1661,7 @@ def build_globals(argv=None):
         "ceil": lambda v: math.ceil(v),
         "round": lambda v, d=0: round(v, d) if d else round(v),
         "sqrt": _sqrt,
-        "pow": lambda a, b: float(a) ** float(b),
+        "pow": _pow,
         "min": lambda *a: min(a[0], key=_sort_key) if len(a) == 1 and isinstance(a[0], list) else min(a, key=_sort_key),
         "max": lambda *a: max(a[0], key=_sort_key) if len(a) == 1 and isinstance(a[0], list) else max(a, key=_sort_key),
         "sum": _sum,
@@ -1549,6 +1799,22 @@ def build_globals(argv=None):
         "t_matmul": lambda a, b: _ad().matmul(a, b),
         "t_transpose": lambda a: _ad().transpose(a),
         "t_reshape": lambda a, s: _ad().reshape(a, s),
+        "t_slice": lambda a, start, stop=None, axis=0: _ad().t_slice(a, start, stop, axis),
+        "t_gather": lambda a, idx: _ad().t_gather(a, idx),
+        "t_concat": lambda a, b, axis=0: _ad().t_concat(a, b, axis),
+        "t_clip": lambda a, lo, hi: _ad().t_clip(a, lo, hi),
+        "where_t": lambda cond, x, y: _ad().where(cond, x, y),
+        "l2_norm_t": lambda a: _ad().l2_norm(a),
+        "bce_logits_t": lambda logits, y: _ad().bce_logits_loss(logits, y),
+        "huber_t": lambda p, y, delta=1.0: _ad().huber_loss(p, y, delta),
+        "l2_penalty_t": lambda *params: _ad().l2_penalty(list(params)),
+        "ml_backend": lambda: _accel().info(),
+        "momentum": _momentum_state,
+        "momentum_step": _momentum_step,
+        "adamw": _adamw_state,
+        "adamw_step": _adamw_step,
+        "clip_grad": _clip_grad,
+        "seed": _seed,
         "sum_t": lambda a: _ad().t_sum(a),
         "mean_t": lambda a: _ad().t_mean(a),
         "mse_t": lambda p, y: _ad().mse_loss(p, y),

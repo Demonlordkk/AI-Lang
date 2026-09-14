@@ -207,9 +207,18 @@ def store_keys(db, prefix=""):
     """List keys, optionally restricted to a prefix."""
     _check(db, "store_keys")
     if prefix:
+        # a prefix is literal text, not a pattern: neutralise the LIKE
+        # wildcards so "a_b" or "50%" cannot widen the match
+        escaped = (
+            str(prefix)
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         rows = db_query(
-            db, "select key from documents where key like ? order by key",
-            [str(prefix) + "%"],
+            db,
+            "select key from documents where key like ? escape '\\' order by key",
+            [escaped + "%"],
         )
     else:
         rows = db_query(db, "select key from documents order by key")

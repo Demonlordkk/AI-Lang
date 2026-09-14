@@ -101,7 +101,7 @@ def test_sqrt_derivative():
 def test_relu_derivative_is_piecewise():
     a = Tensor.of([-1.0, 2.0], True)
     backward(t_sum(t_relu(a)))
-    assert a.grad == [0.0, 1.0]
+    assert a.grad_value() == [0.0, 1.0]
 
 
 def test_div_derivative():
@@ -212,7 +212,9 @@ def test_two_layer_network_matches_numeric():
         w2 = Tensor.of([[xs[2]], [xs[3]]], True)
         h = t_relu(matmul(one, w1))
         backward(mse_loss(t_sigmoid(matmul(h, w2)), [[0.7]]))
-        return w1.grad + w2.grad
+        # flat in every engine: a plain list on the reference engine, an
+        # ndarray under numpy, and list() flattens both identically
+        return list(w1.grad) + list(w2.grad)
 
     check_against_numeric("2-layer net", [0.8, 0.3, 0.5, -0.6], plain, grad)
 
