@@ -1,0 +1,7 @@
+{
+  "name": "ai-lang-core",
+  "version": "1.0.0",
+  "entry": "examples/basic.al",
+  "language": "AI-Lang",
+  "bytecode": "AILBC-2"
+}

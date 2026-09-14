@@ -1,0 +1,6 @@
+{
+  "format": "AILANG-IR-BUNDLE-0.1",
+  "entry": "main.al",
+  "sha256": "f5039a5ba87bd09101affccc25cfb004b8020484b5df439fde99ffa6c4bd1bd7",
+  "source": "let x := 16.\nemit sqrt(x).\nemit len([1, 2, 3]).\n"
+}

@@ -1,0 +1,178 @@
+{
+  "language": "AI-Lang",
+  "version": "0.2.0",
+  "files": [
+    {
+      "file": "06_lexer.py",
+      "sha256": "05ed019ee5f44da114090845914ce36ea1a5a82bd8a69aed0b8186928e6954cb"
+    },
+    {
+      "file": "07_parser.py",
+      "sha256": "cccff8e46b79391e50caedaaabdef9f0191105a057aaa891e16a9042551eea54"
+    },
+    {
+      "file": "08_runtime.py",
+      "sha256": "4d6291ec168c786b0b88f6e94d80f282bb4ebf274f0022482a4cce28fe5ff8d4"
+    },
+    {
+      "file": "09_ir.py",
+      "sha256": "94de368659361b847b71b9f69f1bf97565b7051ac415702013f1f29dad951655"
+    },
+    {
+      "file": "11_stdlib.py",
+      "sha256": "39c222f66c11039c381541810d811a8a8bf86fe8f6dd39c0af5e65c4f84967be"
+    },
+    {
+      "file": "12_packages.py",
+      "sha256": "4603adc86a8d7b12829c2057175d42ef067db32976bf945d0dbb66b7833ef4d9"
+    },
+    {
+      "file": "13_ffi.py",
+      "sha256": "79d17929ed9dc9830d76475e42eda5fccdde4a6a0ecd98ef26cf962f142086d5"
+    },
+    {
+      "file": "14_build.py",
+      "sha256": "43fb20548018f5976531d455f47332ae3517c4d6b3731190de6b30bfda70d68f"
+    },
+    {
+      "file": "15_distribution.py",
+      "sha256": "7ab09decdb1f1c836ae71ee802075e02dc2fbeb7a5f41c65c3e95969c888ce82"
+    },
+    {
+      "file": "16_errors.py",
+      "sha256": "1e501394697d18c905b8fae1c892df62be3de6a781d672de2e3472515c42e4dc"
+    },
+    {
+      "file": "17_collections.py",
+      "sha256": "491c171f41791b7c0d91aaadcda6cc0b3ef92adb3e8d72ec204f1bb372e399e6"
+    },
+    {
+      "file": "18_modules.py",
+      "sha256": "bab0bb1d70a431ddbb7e2c11c134053dc33ba547d65795efbf875100ae3c8b9b"
+    },
+    {
+      "file": "19_concurrency.py",
+      "sha256": "32ba9624de9a0168c9844ed83cf22167712157d051d93cee96ebaba2d9be95c5"
+    },
+    {
+      "file": "20_bytecode.py",
+      "sha256": "f6c0989681d81ac089ee4136f1b77d9cf54df782a20663b8e0380ff76f977377"
+    },
+    {
+      "file": "21_optimizer.py",
+      "sha256": "5bcc2e1a20288172c86b16959e764184b8a89c26f72209060f198efc5379d176"
+    },
+    {
+      "file": "22_cli.py",
+      "sha256": "9da933513341abc7ed4140668123e46a57ebea889375c29728f03aeb3cc14164"
+    },
+    {
+      "file": "23_portability.py",
+      "sha256": "37f38da2903c6148874d63149146669b7bc8923e9cf65e69c965e179c1c5ef25"
+    },
+    {
+      "file": "24_security.py",
+      "sha256": "e01b25a5e023bf43225fb4e46bfe437d226dd552b31bad87848e813a097fac01"
+    },
+    {
+      "file": "25_conformance.py",
+      "sha256": "fe59476dfd7253fa6719b0cec0633fd1ffec0e15222d3513c31cae4b9df39bf0"
+    },
+    {
+      "file": "26_generics.py",
+      "sha256": "7cddd3cf3c7105d16c343b42f6d1b3bfc8df76de6312f892e42bcec72746fef1"
+    },
+    {
+      "file": "27_traits.py",
+      "sha256": "ad67caea424945c86ff78a755c2acca05bb98fc7c0901b56fa750271951d8d87"
+    },
+    {
+      "file": "28_patterns.py",
+      "sha256": "2dacf68351b836c1dfcbf684a7767a9cbaafc3c02809c7d83c4bf19dab37bf1e"
+    },
+    {
+      "file": "30_async_runtime.py",
+      "sha256": "9b61d7c5f6b8c76010a0579f103c1494db2f07f9febae0bec46f5064f8adbf38"
+    },
+    {
+      "file": "34_errors.py",
+      "sha256": "5a818afae30c04c59ef101b8300177362a5934e17f9660d86ee206146584d68f"
+    },
+    {
+      "file": "38_abi.py",
+      "sha256": "437cc12900965a80aee15572c4e32949110dc1283371dccace3eb770802656a2"
+    },
+    {
+      "file": "41_system.py",
+      "sha256": "51de55167ec9d5d7c9bfd1215e75d1d14bee2b08719d5ef2a8f80b23483e9498"
+    },
+    {
+      "file": "42_network.py",
+      "sha256": "e42053171d042850ded6ac6a6898d47b79e08a1a16d931c5e2be4672c9b0bb42"
+    },
+    {
+      "file": "46_http.py",
+      "sha256": "7404553c4e28f824ae96fda4403b6235fbd7ea2987b5558420ed7e57d734dae6"
+    },
+    {
+      "file": "48_serialization.py",
+      "sha256": "2b6541bdbabc1882e109dacd76d1a64c63ab77d99136b306eeabca22be833666"
+    },
+    {
+      "file": "49_database.py",
+      "sha256": "68f92e0ffde559cef761eecca4f90dc9dd408b6a64c2b22ec1771566a6e21eba"
+    },
+    {
+      "file": "55_testing.py",
+      "sha256": "bd128b90e10405d9237e90c7b039577db6e3f74abb377af80cbb7891e89604e5"
+    },
+    {
+      "file": "56_formatter.py",
+      "sha256": "b9e5ce62507e6f503fc5ca7bdc11b2a1b259021916150fb3e8d00f1956cfe6a7"
+    },
+    {
+      "file": "57_linter.py",
+      "sha256": "553ac8b1f69a6ff0881d568e04df4bf485b31f9156a43ae121644733421829da"
+    },
+    {
+      "file": "62_docs.py",
+      "sha256": "6174baceb24e08693a1948183cc694df34c9ee6f2d6bd4f1810ce40c7cb757f1"
+    },
+    {
+      "file": "63_profiler.py",
+      "sha256": "3ddbf3c40a25c1a70a76b623ccb4d1e021d2cf383a57e1bebbbea5ffeacebabe"
+    },
+    {
+      "file": "65_reproducible.py",
+      "sha256": "7c4fc9f1ff0c4e74e8529c9768678a1d85472b6c03c6f3c8932f03e8ef509862"
+    },
+    {
+      "file": "70_wasm.py",
+      "sha256": "f1b9974e52f383a20ebd12e092e0f19d6ab03fe10c59eb748c749d509c0a0478"
+    },
+    {
+      "file": "72_gpu.py",
+      "sha256": "8f592b2a9dc4c8c44d377c55d0c08558dc1b71de47309e22066017ee8dcb0a46"
+    },
+    {
+      "file": "79_ai_interop.py",
+      "sha256": "8a7d81e8c24b05ce607d491a6fa080893d309227a076301f96cc7a54975d879f"
+    },
+    {
+      "file": "95_supply_chain.py",
+      "sha256": "2c32db4b9588aea4c77466b11be54e32057b647d67d9481235e57ac415424d99"
+    },
+    {
+      "file": "ailang.py",
+      "sha256": "a1fddc83b1545bfd17131fdc568f2cf57f35ebd76492bbeda2d159174c21a02a"
+    },
+    {
+      "file": "test_all.py",
+      "sha256": "22ec0c894d35a0df80e30a5adfd7a41edbe1b15bce268ed42e1275cf6b378b81"
+    },
+    {
+      "file": "test_mature_ecosystem.py",
+      "sha256": "a98f775748827f562c0f118883ef7c196e8ba7a3daf1e10384160d3b8ed83015"
+    }
+  ]
+}
