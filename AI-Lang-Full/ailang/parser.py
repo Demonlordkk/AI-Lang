@@ -16,6 +16,14 @@ _FACTOR = {"STAR": "*", "SLASH": "/", "PERCENT": "%"}
 
 _BLOCK_ENDERS = {"DONE", "ELSE", "ELIF", "RESCUE", "EOF"}
 
+# `x +<- 1` desugars to `x <- x + 1`
+_COMPOUND = {
+    "PLUS_ASSIGN": "+",
+    "MINUS_ASSIGN": "-",
+    "STAR_ASSIGN": "*",
+    "SLASH_ASSIGN": "/",
+}
+
 
 class Parser:
     def __init__(self, source: str):
@@ -232,6 +240,16 @@ class Parser:
 
         # assignment or bare expression
         expr = self.expr()
+        compound = _COMPOUND.get(self.cur().kind)
+        if compound:
+            self.i += 1
+            if not isinstance(expr, (A.Name, A.Index, A.Field)):
+                raise ParseError("invalid assignment target", t.line, t.col)
+            value = self.expr()
+            self.dot()
+            return A.Assign(
+                expr, A.Binary(expr, compound, value, t.line, t.col), t.line, t.col
+            )
         if self.at("ASSIGN"):
             self.i += 1
             if not isinstance(expr, (A.Name, A.Index, A.Field)):
@@ -241,6 +259,36 @@ class Parser:
             return A.Assign(expr, value, t.line, t.col)
         self.dot()
         return A.ExprStmt(expr, t.line, t.col)
+
+    def _interpolate(self, tok):
+        """Turn "a={x}b" into ("a" + to Text(x)) + "b" at parse time.
+
+        Interpolation is pure syntax: it lowers to ordinary Text conversion
+        and concatenation, so it costs nothing extra at runtime and reports
+        errors inside {...} with the enclosing line/column.
+        """
+        node = None
+        for kind, value in tok.value:
+            if kind == "lit":
+                piece = A.Literal(value, tok.line, tok.col)
+            else:
+                try:
+                    sub = Parser(value)
+                    piece = sub.expr()
+                    if not sub.at("EOF"):
+                        bad = sub.cur()
+                        raise ParseError(
+                            f"unexpected {_friendly(bad.kind)} inside text interpolation",
+                            tok.line,
+                            tok.col,
+                        )
+                except ParseError as e:
+                    raise ParseError(
+                        f"in text interpolation {{{value}}}: {e.message}", tok.line, tok.col
+                    ) from e
+                piece = A.Convert("Text", piece, tok.line, tok.col)
+            node = piece if node is None else A.Binary(node, "+", piece, tok.line, tok.col)
+        return node if node is not None else A.Literal("", tok.line, tok.col)
 
     def param_list(self):
         self.take("LPAREN", "parameter list")
@@ -385,6 +433,10 @@ class Parser:
         if k in ("INT", "REAL", "TEXT", "BOOL"):
             self.i += 1
             return A.Literal(t.value, t.line, t.col)
+
+        if k == "TEXT_PARTS":
+            self.i += 1
+            return self._interpolate(t)
         if k == "NOTHING":
             self.i += 1
             return A.Literal(None, t.line, t.col)

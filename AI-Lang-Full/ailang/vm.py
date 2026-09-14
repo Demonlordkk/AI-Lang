@@ -34,7 +34,7 @@ class Environment:
     __slots__ = ("vars", "immutable", "parent")
 
     def __init__(self, parent: Optional["Environment"] = None, initial: Dict[str, Any] = None):
-        self.vars: Dict[str, Any] = dict(initial or {})
+        self.vars: Dict[str, Any] = initial if initial is not None else {}
         self.immutable = set()
         self.parent = parent
 
@@ -61,6 +61,8 @@ class Environment:
                 f"'{name}' is already defined in this scope; use '<-' to reassign a var"
             )
         self.vars[name] = value
+        if self.immutable.__class__ is frozenset:
+            self.immutable = set(self.immutable)   # copy-on-write
         if mutable:
             self.immutable.discard(name)
         else:
@@ -133,26 +135,34 @@ class VM:
             self.globals.vars[name] = RecordType(name, fields)
         return self.execute(program.main, self.globals)
 
-    def invoke(self, closure, args: List[Any], kwargs: Dict[str, Any] = None):
-        kwargs = kwargs or {}
+    def invoke(self, closure, args, kwargs=None):
         code = closure.code
         params = code.params
-        if len(args) + len(kwargs) != len(params):
-            raise VMError(
-                f"'{code.name}' expects {len(params)} argument(s) "
-                f"but got {len(args) + len(kwargs)}"
-            )
-        env = Environment(closure.env)
-        for pname, value in zip(params, args):
-            env.vars[pname] = value
-            env.immutable.add(pname)
-        for key, value in kwargs.items():
-            if key not in params:
-                raise VMError(f"'{code.name}' has no parameter named '{key}'")
-            if key in env.vars:
-                raise VMError(f"duplicate value for parameter '{key}'")
-            env.vars[key] = value
-            env.immutable.add(key)
+        nparams = len(params)
+
+        if not kwargs:
+            if len(args) != nparams:
+                raise VMError(
+                    f"'{code.name}' expects {nparams} argument(s) but got {len(args)}"
+                )
+            # zip into a dict in one step; parameters share a precomputed
+            # immutable set instead of rebuilding it on every call
+            env = Environment(closure.env, dict(zip(params, args)))
+            env.immutable = code.param_set
+        else:
+            if len(args) + len(kwargs) != nparams:
+                raise VMError(
+                    f"'{code.name}' expects {nparams} argument(s) "
+                    f"but got {len(args) + len(kwargs)}"
+                )
+            env = Environment(closure.env, dict(zip(params, args)))
+            for key, value in kwargs.items():
+                if key not in params:
+                    raise VMError(f"'{code.name}' has no parameter named '{key}'")
+                if key in env.vars:
+                    raise VMError(f"duplicate value for parameter '{key}'")
+                env.vars[key] = value
+            env.immutable = set(params)
         self.depth += 1
         if self.depth > self.MAX_DEPTH:
             self.depth -= 1
@@ -285,7 +295,10 @@ class VM:
                         index, value = nxt
                         ev = env.vars
                         ev[ins[2]] = value
-                        env.immutable.discard(ins[2])
+                        if env.immutable:
+                            if env.immutable.__class__ is frozenset:
+                                env.immutable = set(env.immutable)
+                            env.immutable.discard(ins[2])
                         if ins[3]:
                             ev[ins[3]] = index
 
@@ -602,7 +615,10 @@ class VM:
                 while len(scopes) > scdepth:
                     env = scopes.pop()
                 env.vars[err_name] = _error_value(exc)
-                env.immutable.discard(err_name)
+                if env.immutable:
+                    if env.immutable.__class__ is frozenset:
+                        env.immutable = set(env.immutable)
+                    env.immutable.discard(err_name)
                 ip = target
 
         self.fuel = fuel

@@ -7,3 +7,5 @@ dist/
 venv/
 *.albc.json
 .pytest_cache/
+*.pyz
+build/

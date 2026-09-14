@@ -25,13 +25,13 @@ while epoch < 600:
     epoch <- epoch + 1.
 done.
 
-emit "weights: " + to Text(map(flatten(value_of(w)), \v -> round(v, 3))).
-emit "bias:    " + to Text(round(first(value_of(b)), 3)).
-emit "loss:    " + to Text(round(value_of(bce_t(predict(rows), labels)), 6)).
+emit "weights: {map(flatten(value_of(w)), \v -> round(v, 3))}".
+emit "bias:    {round(first(value_of(b)), 3)}".
+emit "loss:    {round(value_of(bce_t(predict(rows), labels)), 6)}".
 
 let probs := map(value_of(predict(rows)), \r -> first(r)).
 let classes := map(probs, \p -> to Real(to Int(p >= 0.5))).
-emit "accuracy: " + to Text(accuracy(classes, flatten(labels))).
+emit "accuracy: {accuracy(classes, flatten(labels))}".
 
 emit "".
 emit "new points:".
@@ -41,5 +41,5 @@ repeat p in [[1.0, 1.2], [6.8, 6.9], [4.0, 4.0]]:
     when prob >= 0.5:
         verdict <- "cluster B".
     done.
-    emit "  " + to Text(p) + " -> " + verdict + " (" + to Text(round(prob, 3)) + ")".
+    emit "  {p} -> {verdict} ({round(prob, 3)})".
 done.

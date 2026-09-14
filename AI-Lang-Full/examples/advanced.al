@@ -25,7 +25,7 @@ let result := range_from(1, 21, 1)
     |> filter(is_even)
     |> map(\x -> x * x)
     |> sum().
-emit "sum of squares of evens 1..20: " + to Text(result).
+emit "sum of squares of evens 1..20: {result}".
 
 # Higher-order functions over records.
 record Employee:
@@ -60,17 +60,17 @@ let by_team := group_by(staff, \e -> e.team).
 repeat team in sort(keys(by_team)):
     let members := by_team[team].
     let total := members |> map(\e -> e.salary) |> sum().
-    emit team + ": " + to Text(len(members)) + " people, budget " + to Text(total).
+    emit "{team}: {len(members)} people, budget {total}".
 done.
 
 # Sorting by a computed key.
 let ranked := sort_by(staff, \e -> 0 - e.salary).
-emit "highest paid: " + first(ranked).name.
+emit "highest paid: {first(ranked).name}".
 
 # Maps as lightweight structs, with safe lookup and defaulting.
 let config := {"retries": 3, "verbose": true}.
 let timeout := get(config, "timeout", nothing) ?? 30.
-emit "timeout falls back to " + to Text(timeout).
+emit "timeout falls back to {timeout}".
 
 # JSON round-trips for real interchange.
 let encoded := json_encode({"ok": true, "items": [1, 2, 3]}).

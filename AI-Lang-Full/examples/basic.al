@@ -4,7 +4,7 @@
 let name := "AI-Lang".
 var count := 0.
 count <- count + 12.
-emit "Hello from " + name + "!".
+emit "Hello from {name}!".
 emit count.
 
 # Functions with typed parameters and return types.
@@ -38,7 +38,7 @@ emit classify(17).
 
 # Loops: repeat over a collection, optionally with an index.
 repeat item at i in ["red", "green", "blue"]:
-    emit to Text(i) + ". " + item.
+    emit "{i}. {item}".
 done.
 
 # while with stop (break) and next (continue).
@@ -51,7 +51,7 @@ while true:
     when n > 7:
         stop.
     done.
-    emit "odd: " + to Text(n).
+    emit "odd: {n}".
 done.
 
 # Collections.
@@ -71,12 +71,12 @@ record Point:
 done.
 
 let p := Point(3.0, 4.0).
-emit "distance: " + to Text(sqrt(p.x * p.x + p.y * p.y)).
+emit "distance: {sqrt(p.x * p.x + p.y * p.y)}".
 
 # Errors are values you can recover from.
 attempt:
     let bad := 1 / 0.
     emit bad.
 rescue e:
-    emit "recovered from: " + e.message.
+    emit "recovered from: {e.message}".
 done.

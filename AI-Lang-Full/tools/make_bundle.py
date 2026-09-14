@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Build a single-file, zero-install AI-Lang interpreter.
+
+Produces `ailang-bundle.pyz`, a zipapp runnable anywhere Python 3.8+ exists:
+
+    python3 ailang-bundle.pyz run program.al
+
+No pip, no site-packages, no network. Copy the one file to the target device.
+"""
+import shutil
+import sys
+import zipapp
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BUILD = ROOT / "build" / "bundle"
+OUT = ROOT / "ailang-bundle.pyz"
+
+
+def main():
+    if BUILD.exists():
+        shutil.rmtree(BUILD)
+    BUILD.mkdir(parents=True)
+    shutil.copytree(ROOT / "ailang", BUILD / "ailang")
+    (BUILD / "__main__.py").write_text(
+        "import sys\n"
+        "from ailang.cli import main\n"
+        "sys.exit(main())\n",
+        encoding="utf-8",
+    )
+    for pycache in BUILD.rglob("__pycache__"):
+        shutil.rmtree(pycache, ignore_errors=True)
+    zipapp.create_archive(BUILD, OUT, interpreter="/usr/bin/env python3")
+    OUT.chmod(0o755)
+    size = OUT.stat().st_size
+    print(f"{OUT}  ({size / 1024:.0f} KB)")
+    print("run with:  python3 ailang-bundle.pyz run program.al")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

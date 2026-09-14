@@ -31,6 +31,10 @@ class FunctionCode:
     defaults: Dict[str, Any] = field(default_factory=dict)
     line: int = 0
 
+    def __post_init__(self):
+        # shared by every invocation; parameters are always immutable bindings
+        self.param_set = frozenset(self.params)
+
 
 @dataclass
 class ProgramCode:

@@ -54,8 +54,8 @@ let labels := [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0].
 
 let model := train(rows, labels, 400, 0.5).
 
-emit "weights: " + to Text(map(model.weights, \v -> round(v, 3))).
-emit "bias:    " + to Text(round(model.bias, 3)).
+emit "weights: {map(model.weights, \v -> round(v, 3))}".
+emit "bias:    {round(model.bias, 3)}".
 
 let probs := predict(model, rows).
 let classes := map(probs, \p -> when_gt(p)).
@@ -67,8 +67,8 @@ fn when_gt(p: Real) -> Real:
     give 0.0.
 done.
 
-emit "accuracy: " + to Text(accuracy(classes, labels)).
-emit "loss:     " + to Text(round(mse(probs, labels), 5)).
+emit "accuracy: {accuracy(classes, labels)}".
+emit "loss:     {round(mse(probs, labels), 5)}".
 
 emit "".
 emit "predictions on new points:".
@@ -78,5 +78,5 @@ repeat p in [[1.0, 1.2], [6.8, 6.9], [4.0, 4.0]]:
     when prob >= 0.5:
         verdict <- "cluster B".
     done.
-    emit "  " + to Text(p) + " -> " + verdict + " (" + to Text(round(prob, 3)) + ")".
+    emit "  {p} -> {verdict} ({round(prob, 3)})".
 done.

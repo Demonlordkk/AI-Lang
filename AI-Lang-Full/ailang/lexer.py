@@ -59,7 +59,13 @@ KEYWORDS = {
 
 TYPE_NAMES = {"Int", "Real", "Bool", "Text", "Byte", "List", "Map", "Any", "Void", "Function"}
 
-THREE = {"...": "ELLIPSIS"}
+THREE = {
+    "...": "ELLIPSIS",
+    "+<-": "PLUS_ASSIGN",
+    "-<-": "MINUS_ASSIGN",
+    "*<-": "STAR_ASSIGN",
+    "/<-": "SLASH_ASSIGN",
+}
 TWO = {
     ":=": "DEFINE",
     "<-": "ASSIGN",
@@ -124,13 +130,61 @@ def lex(source: str) -> List[Token]:
 
         start_line, start_col = line, col
 
-        # string literal (supports escapes and interpolation-free text)
+        # string literal, with {expression} interpolation
         if c == '"':
             i += 1
             col += 1
             chars: List[str] = []
+            parts: List = []          # [(kind, value)] kind in {"lit","expr"}
             while i < n and source[i] != '"':
                 ch = source[i]
+                if ch == "{":
+                    if source[i + 1 : i + 2] == "{":      # {{ escapes a brace
+                        chars.append("{")
+                        i += 2
+                        col += 2
+                        continue
+                    depth = 1
+                    j = i + 1
+                    in_s = False
+                    while j < n and depth:
+                        cj = source[j]
+                        if in_s:
+                            if cj == "\\":
+                                j += 2
+                                continue
+                            if cj == '"':
+                                in_s = False
+                        elif cj == '"':
+                            in_s = True
+                        elif cj == "{":
+                            depth += 1
+                        elif cj == "}":
+                            depth -= 1
+                            if not depth:
+                                break
+                        j += 1
+                    if j >= n or depth:
+                        raise LexError("unterminated { } in text", start_line, start_col)
+                    expr_src = source[i + 1 : j].strip()
+                    if not expr_src:
+                        # bare "{}" stays literal: it is the format() placeholder
+                        chars.append("{}")
+                        i = j + 1
+                        col += 2
+                        continue
+                    if chars:
+                        parts.append(("lit", "".join(chars)))
+                        chars = []
+                    parts.append(("expr", expr_src))
+                    col += (j - i) + 1
+                    i = j + 1
+                    continue
+                if ch == "}" and source[i + 1 : i + 2] == "}":
+                    chars.append("}")
+                    i += 2
+                    col += 2
+                    continue
                 if ch == "\\":
                     if i + 1 >= n:
                         raise LexError("unterminated string escape", start_line, start_col)
@@ -161,7 +215,12 @@ def lex(source: str) -> List[Token]:
                 raise LexError("unterminated string", start_line, start_col)
             i += 1
             col += 1
-            out.append(Token("TEXT", "".join(chars), start_line, start_col))
+            if parts:
+                if chars:
+                    parts.append(("lit", "".join(chars)))
+                out.append(Token("TEXT_PARTS", parts, start_line, start_col))
+            else:
+                out.append(Token("TEXT", "".join(chars), start_line, start_col))
             continue
 
         # numbers, before operators so `.` handling is unambiguous

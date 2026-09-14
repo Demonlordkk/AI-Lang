@@ -8,6 +8,15 @@ unambiguous**. Common operations that take a loop and a temporary variable in
 most languages are single expressions here, and the static checker catches
 mistakes before anything runs.
 
+Use it for anything you would use a general-purpose language for — services,
+scripts, data work, automation, simulations, tools, and the models and AI
+systems you build with them. Nothing in the language is specialised to one
+domain: machine learning is a library, not the language.
+
+It runs anywhere. AI-Lang depends on **no third-party packages at all** — only
+a host Python runtime — and ships as a single 191 KB file you can copy to a
+device and run with no install step.
+
 ```text
 let users := [
     {"name": "Ada",   "team": "platform", "salary": 165000},
@@ -229,6 +238,44 @@ are cached, and circular imports are detected and reported.
 
 ---
 
+### Text interpolation
+
+Any `{...}` inside text is an expression, converted and spliced in place. This
+is resolved at parse time into ordinary concatenation, so it costs nothing at
+runtime.
+
+```text
+let name := "Ada".
+let scores := [90, 84, 77].
+
+emit "{name} averaged {round(mean(scores), 1)} across {len(scores)} runs".
+```
+
+```
+Ada averaged 83.7 across 3 runs
+```
+
+Write `{{` and `}}` for literal braces. A bare `{}` is left alone, so the
+`format("{} and {}", [...])` helper still works.
+
+### Compound assignment
+
+`+<-`, `-<-`, `*<-` and `/<-` update a binding in place, including fields and
+elements:
+
+```text
+var total := 0.
+repeat i in range(5):
+    total +<- i.
+done.
+
+var counts := [0, 0].
+counts[0] +<- 10.
+```
+
+Each form means exactly its longhand (`total <- total + i`) and is typed
+identically — `/<-` yields `Real`, matching AI-Lang's division rule.
+
 ## Standard library
 
 Available everywhere without imports.
@@ -408,6 +455,29 @@ let results := parallel_map(urls, \u -> http_get(u).status).
 let output := retry(\ -> run("deploy.sh"), 3, 1.0).
 ```
 
+## Running anywhere
+
+AI-Lang imports only the host runtime's standard library. There is no numpy,
+no build step, and no native extension anywhere in the implementation —
+including the automatic-differentiation engine, which is written from scratch.
+A test in the suite walks every import in the source and fails if a
+third-party package ever appears.
+
+Build the standalone interpreter:
+
+```bash
+python3 tools/make_bundle.py
+```
+
+That writes `ailang-bundle.pyz`, a single 191 KB file:
+
+```bash
+python3 ailang-bundle.pyz run program.al
+```
+
+Copy it to a server, a container, a Raspberry Pi, or a locked-down machine with
+no package manager, and it runs as-is.
+
 ## Performance
 
 The VM dispatches on integer opcodes through a frequency-ordered chain, and
@@ -418,6 +488,7 @@ Measured on this machine:
 | --- | --- | --- | --- |
 | Mixed benchmark (fib 22, 200k loop, 20k list) | 1.485s | 1.037s | 1.43x |
 | 50k element accumulation (`append`) | 3.395s | 0.243s | 14.0x |
+| Call-heavy recursion (fib 24) | 0.543s | 0.506s | 1.07x |
 
 Key optimisations:
 
@@ -426,6 +497,8 @@ Key optimisations:
 * `INC_FAST` — `i <- i + 1` compiles to one instruction with no stack traffic
 * `repeat i in range(n)` iterates lazily instead of building a list
 * In-place `append` removes the O(n²) copy from accumulation loops
+* Calls bind parameters in one `dict(zip(...))` and share a precomputed
+  immutable-parameter set instead of rebuilding it per invocation
 
 ## Testing
 

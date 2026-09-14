@@ -14,9 +14,9 @@ repeat t in store.by_priority(db):
     when t.done:
         mark <- "[x]".
     done.
-    emit mark + " P" + to Text(t.priority) + "  " + t.title.
+    emit "{mark} P{t.priority}  {t.title}".
 done.
 
 emit "".
 emit "Pending: " + to Text(len(store.pending(db))) + " of " + to Text(len(db["tasks"])).
-emit "JSON: " + store.to_json(db).
+emit "JSON: {store.to_json(db)}".

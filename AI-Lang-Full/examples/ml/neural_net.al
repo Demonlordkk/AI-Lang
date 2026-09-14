@@ -30,13 +30,13 @@ while epoch < 2000:
     adam_step(opt, 0.05).
 
     when epoch % 500 == 0:
-        emit "  epoch " + pad_left(to Text(epoch), 4) + "   loss " + to Text(round(value_of(loss), 5)).
+        emit "  epoch {pad_left(to Text(epoch), 4)}   loss {round(value_of(loss), 5)}".
     done.
     epoch <- epoch + 1.
 done.
 
 let final_loss := bce_t(forward(inputs), targets).
-emit "  final      loss " + to Text(round(value_of(final_loss), 5)).
+emit "  final      loss {round(value_of(final_loss), 5)}".
 emit "".
 
 emit "predictions:".
@@ -52,8 +52,8 @@ repeat row at i in preds:
     when label == want:
         correct <- correct + 1.
     done.
-    emit "  " + to Text(inputs[i]) + " -> " + to Text(round(p, 4)) + "   expected " + to Text(want).
+    emit "  {inputs[i]} -> {round(p, 4)}   expected {want}".
 done.
 
 emit "".
-emit "accuracy: " + to Text(correct) + "/4".
+emit "accuracy: {correct}/4".
