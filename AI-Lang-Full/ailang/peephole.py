@@ -67,10 +67,15 @@ def _jump_targets(code):
     return targets
 
 
-def fuse(code):
-    """Return a peephole-optimised copy of one instruction list."""
+def fuse(code, lines=None):
+    """Return a peephole-optimised copy of one instruction list.
+
+    When `lines` (instruction index -> source line) is supplied it is remapped
+    alongside the code and returned as well, so runtime errors keep pointing
+    at the right statement after fusion.
+    """
     if len(code) < 2:
-        return list(code)
+        return (list(code), dict(lines or {})) if lines is not None else list(code)
 
     targets = _jump_targets(code)
 
@@ -105,12 +110,16 @@ def fuse(code):
                 lst = list(ins)
                 lst[slot] = remap[t]
                 out[idx] = tuple(lst)
+    if lines is not None:
+        return out, {remap[i]: ln for i, ln in lines.items() if i in remap}
     return out
 
 
 def optimise_program(program):
     """Fuse `<main>` and every function body in place."""
-    program.main.code = fuse(program.main.code)
+    program.main.code, program.main.lines = fuse(
+        program.main.code, program.main.lines
+    )
     for fn in program.functions.values():
-        fn.code = fuse(fn.code)
+        fn.code, fn.lines = fuse(fn.code, fn.lines)
     return program

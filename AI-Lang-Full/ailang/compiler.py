@@ -30,6 +30,14 @@ class FunctionCode:
     captures: List[str] = field(default_factory=list)
     defaults: Dict[str, Any] = field(default_factory=dict)
     line: int = 0
+    # the source structure, kept so the native backend can compile from it
+    body: Any = None
+    native: Any = None
+    native_tried: bool = False
+    lines: Dict[int, int] = field(default_factory=dict)
+    # the file this function was written in, so an error raised inside an
+    # imported module is reported against the module, not the importer
+    origin: str = ""
 
     def __post_init__(self):
         # shared by every invocation; parameters are always immutable bindings
@@ -42,6 +50,7 @@ class ProgramCode:
     functions: Dict[str, FunctionCode]
     records: Dict[str, List[tuple]] = field(default_factory=dict)
     imports: List[tuple] = field(default_factory=list)
+    native_loops: List[tuple] = field(default_factory=list)
 
 
 class _FnScope:
@@ -62,19 +71,26 @@ class _FnScope:
 class Compiler:
     def __init__(self):
         self.functions: Dict[str, FunctionCode] = {}
+        self.native_loops: List[tuple] = []
         self.records: Dict[str, List[tuple]] = {}
         self.imports: List[tuple] = []
         self._anon = 0
+        self.filename = ""
 
     # ------------------------------------------------------------------ entry
-    def compile(self, program: A.Program) -> ProgramCode:
+    def compile(self, program: A.Program, filename: str = "") -> ProgramCode:
+        self.filename = filename
         ctx = _Ctx(self, None)
         ctx.hoist(program.statements)
         for s in program.statements:
             ctx.stmt(s)
         ctx.emit("HALT")
-        main = FunctionCode("<main>", [], ctx.code, ctx.consts)
-        program = ProgramCode(main, self.functions, self.records, self.imports)
+        main = FunctionCode(
+            "<main>", [], ctx.code, ctx.consts, lines=ctx.lines, origin=filename
+        )
+        program = ProgramCode(
+            main, self.functions, self.records, self.imports, self.native_loops
+        )
         from .peephole import optimise_program
 
         return optimise_program(program)
@@ -119,16 +135,25 @@ class _Ctx:
         self.owner = owner
         self.code: List[tuple] = []
         self.consts: List[Any] = []
+        self.lines: Dict[int, int] = {}
         self.scope = scope if scope is not None else _FnScope(None, params)
         self.loops: List[dict] = []
         self._hoisted: Dict[int, bool] = {}
+        # 0 for the top-level context; sub-contexts (function bodies) set 1
+        self._fn_depth = 0
 
     # ------------------------------------------------------------- emit utils
     def emit(self, op, *args, line=0):
         if op.__class__ is str:
             op = OPS[op]
         self.code.append((op, *args))
-        return len(self.code) - 1
+        idx = len(self.code) - 1
+        # Keep line numbers beside the code rather than inside instructions:
+        # the hot dispatch loop stays untouched, and a runtime error can still
+        # be reported at the statement that caused it.
+        if line:
+            self.lines[idx] = line
+        return idx
 
     def patch(self, pos, target):
         ins = self.code[pos]
@@ -249,6 +274,8 @@ class _Ctx:
             self.patch(j, self.here())
 
     def _s_While(self, s):
+        if self._try_native_loop(s):
+            return
         start = self.here()
         self.expr(s.cond)
         exit_jump = self.emit("JUMP_IF_FALSE", None, line=s.line)
@@ -267,6 +294,8 @@ class _Ctx:
             self.patch(b, self.here())
 
     def _s_Repeat(self, s):
+        if self._try_native_loop(s):
+            return
         it = s.iterable
         # `repeat i in range(n):` iterates lazily instead of materialising a list
         if (
@@ -319,6 +348,34 @@ class _Ctx:
             self.patch(b, self.here())
         self.emit("ITER_END")
 
+    @property
+    def fn_depth(self):
+        """0 while compiling top-level code, >0 inside a function body."""
+        return getattr(self, "_fn_depth", 0)
+
+    def _try_native_loop(self, s):
+        """Emit NATIVE_LOOP when this loop can run as host bytecode.
+
+        Only top-level loops qualify: inside a function the whole function is
+        already a native-backend candidate. The loop must not contain `stop`
+        or `next` targeting an outer construct, and the VM re-checks
+        eligibility before using the compiled form.
+        """
+        if self.fn_depth > 0:
+            return False
+        from .native import try_compile_loop, enabled
+
+        if not enabled():
+            return False
+        result = try_compile_loop(s, lambda n: True)
+        if result is None:
+            return False
+        src, carried, free = result
+        idx = len(self.owner.native_loops)
+        self.owner.native_loops.append((src, carried, sorted(free)))
+        self.emit("NATIVE_LOOP", idx, line=getattr(s, "line", 0))
+        return True
+
     def _s_Stop(self, s):
         if not self.loops:
             raise CompileError("'stop' outside of a loop", s.line, s.col)
@@ -351,6 +408,7 @@ class _Ctx:
         pnames = [p for p, _ in params]
         inner_scope = _FnScope(self.scope, pnames)
         sub = _Ctx(self.owner, inner_scope)
+        sub._fn_depth = 1
         sub.hoist(body)
         for x in body:
             sub.stmt(x)
@@ -360,7 +418,9 @@ class _Ctx:
         if unique in self.owner.functions:
             unique = self.owner.anon_name(name.strip("<>#") or "fn")
         return FunctionCode(
-            unique, pnames, sub.code, sub.consts, captures=inner_scope.captures, line=line
+            unique, pnames, sub.code, sub.consts,
+            captures=inner_scope.captures, line=line, body=body, lines=sub.lines,
+            origin=self.owner.filename,
         )
 
     # ------------------------------------------------------------ expressions
@@ -460,8 +520,8 @@ class _Ctx:
             self.emit("CALL", len(names), line=n.line)
 
 
-def compile_program(program: A.Program) -> ProgramCode:
-    return Compiler().compile(program)
+def compile_program(program: A.Program, filename: str = "") -> ProgramCode:
+    return Compiler().compile(program, filename)
 
 
 # operator -> specialised opcode name

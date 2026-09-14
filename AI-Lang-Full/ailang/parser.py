@@ -61,6 +61,31 @@ class Parser:
     def dot(self):
         self.take("DOT", "end of statement")
 
+    def span_text(self, start, end):
+        """Reconstruct the source text of tokens [start, end).
+
+        Contract failures quote the condition as written, so the message says
+        what the programmer actually asked for.
+        """
+        out = []
+        for tok in self.tokens[start:end]:
+            v = tok.value
+            if tok.kind == "TEXT":
+                out.append('"' + str(v) + '"')
+            elif tok.kind == "BOOL":
+                out.append("true" if v else "false")
+            elif tok.kind == "NOTHING":
+                out.append("nothing")
+            elif v is None:
+                out.append(tok.kind)
+            else:
+                out.append(str(v))
+        joined = " ".join(out)
+        for a, b in (("( ", "("), (" )", ")"), ("[ ", "["), (" ]", "]"),
+                     (" ,", ","), (" .", ".")):
+            joined = joined.replace(a, b)
+        return joined
+
     # ----------------------------------------------------------------- program
     def program(self) -> A.Program:
         stmts = []
@@ -149,6 +174,15 @@ class Parser:
             expr = self.expr()
             self.dot()
             return A.Raise(expr, t.line, t.col)
+
+        if k in ("NEEDS", "ENSURES"):
+            self.i += 1
+            start = self.i
+            expr = self.expr()
+            text = self.span_text(start, self.i)
+            self.dot()
+            node = A.Needs if k == "NEEDS" else A.Ensures
+            return node(expr, text, t.line, t.col)
 
         if k == "STOP":
             self.i += 1
@@ -681,6 +715,7 @@ _KEYWORD_FIELDS = {
     "DONE", "IN", "AT", "TO", "AS", "USE", "EMIT", "GIVE", "LET", "VAR",
     "WHEN", "ELSE", "ELIF", "REPEAT", "WHILE", "RECORD", "FN", "AND", "OR",
     "NOT", "STOP", "NEXT", "RAISE", "ATTEMPT", "RESCUE", "BOOL", "NOTHING",
+    "NEEDS", "ENSURES",
 }
 
 

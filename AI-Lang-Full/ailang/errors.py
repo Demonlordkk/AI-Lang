@@ -17,6 +17,9 @@ class AILangError(Exception):
         self.message = message
         self.line = line
         self.col = col
+        # set when the error came from an imported module, so the diagnostic
+        # names the file that actually contains the faulty line
+        self.origin = ""
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         if self.line:
@@ -25,6 +28,14 @@ class AILangError(Exception):
 
     def render(self, source: str | None = None, filename: str = "<source>") -> str:
         """Return a human readable diagnostic, with a source excerpt if possible."""
+        if self.origin and self.origin != filename:
+            filename = self.origin
+            try:
+                import pathlib as _p
+
+                source = _p.Path(self.origin).read_text(encoding="utf-8")
+            except OSError:
+                source = None
         where = f"{filename}:{self.line}:{self.col}" if self.line else filename
         out = [f"{where}: {self.stage}: {self.message}"]
         if source and self.line:

@@ -282,6 +282,65 @@ class Scope:
     def local(self, name):
         return name in self.vars
 
+    def all_names(self):
+        """Every name visible from here, innermost first."""
+        out = []
+        s = self
+        while s:
+            out.extend(s.vars)
+            s = s.parent
+        return out
+
+
+def _closest(name, candidates, limit=3):
+    """Names within a small edit distance of `name`, best first.
+
+    Uses a bounded Levenshtein distance rather than a similarity ratio so the
+    threshold scales sensibly with word length: one typo in a short name is a
+    strong signal, one typo in a long name even more so.
+    """
+    name_l = name.lower()
+    scored = []
+    # candidates are passed innermost-scope-first; earlier entries win ties so
+    # a local name is suggested ahead of a builtin with the same distance
+    rank = {}
+    for i, c in enumerate(candidates):
+        rank.setdefault(c, i)
+    for cand in rank:
+        if cand == name:
+            continue
+        cand_l = cand.lower()
+        d = _edit_distance(name_l, cand_l)
+        threshold = 1 if len(name) <= 4 else 2 if len(name) <= 8 else 3
+        # a transposition or a shared prefix is a strong signal even when the
+        # raw distance is larger, e.g. `lenght` for `length`
+        if d > threshold and (
+            sorted(name_l) == sorted(cand_l)
+            or (len(name_l) > 4 and cand_l.startswith(name_l[:3]) and d <= 3)
+        ):
+            d = threshold
+        if d <= threshold:
+            scored.append((d, rank[cand], cand))
+    scored.sort()
+    return [c for _, _, c in scored[:limit]]
+
+
+def _edit_distance(a, b):
+    """Levenshtein distance, iterative and allocation-light."""
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    if len(a) - len(b) > 3:
+        return 99
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
 
 class TypeChecker:
     def __init__(self, module_resolver=None):
@@ -322,6 +381,24 @@ class TypeChecker:
         return False
 
     # ----------------------------------------------------------------- driver
+    def _did_you_mean(self, name):
+        """Suffix suggesting near-miss names, or an empty string."""
+        # names the user wrote come first so they outrank a builtin at the
+        # same edit distance -- a mistyped local is the likelier mistake
+        builtins = set(BUILTIN_SIGS)
+        visible = list(self.scope.all_names())
+        pool = [n for n in visible if n not in builtins]
+        pool.extend(n for n in self.functions if n not in builtins)
+        pool.extend(n for n in visible if n in builtins)
+        pool.extend(BUILTIN_SIGS)
+        near = _closest(name, pool)
+        if not near:
+            return ""
+        if len(near) == 1:
+            return f"; did you mean '{near[0]}'?"
+        quoted = ", ".join(f"'{n}'" for n in near)
+        return f"; did you mean one of {quoted}?"
+
     def check(self, program: A.Program):
         self.hoist(program.statements, self.global_scope)
         for s in program.statements:
@@ -397,7 +474,11 @@ class TypeChecker:
             if isinstance(target, A.Name):
                 found = self.scope.lookup(target.value)
                 if not found:
-                    self.error(f"undefined name '{target.value}'", s)
+                    self.error(
+                        f"undefined name '{target.value}'"
+                        + self._did_you_mean(target.value),
+                        s,
+                    )
                     return
                 t, mutable = found
                 if not mutable:
@@ -563,7 +644,9 @@ class TypeChecker:
                 return found[0]
             if n.value in self.functions:
                 return FUNCTION
-            self.error(f"undefined name '{n.value}'", n)
+            self.error(
+                f"undefined name '{n.value}'" + self._did_you_mean(n.value), n
+            )
             return ANY
 
         if isinstance(n, A.ListExpr):

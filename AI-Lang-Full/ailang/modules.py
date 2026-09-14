@@ -27,6 +27,9 @@ class ModuleLoader:
         for base in self.search_paths:
             candidates.append(base / rel.with_suffix(".al"))
             candidates.append(base / rel / "main.al")
+            # installed packages live in ai_modules/<name>/...
+            candidates.append(base / "ai_modules" / rel.with_suffix(".al"))
+            candidates.append(base / "ai_modules" / rel / "main.al")
         for c in candidates:
             if c.is_file():
                 return c.resolve()
@@ -52,13 +55,24 @@ class ModuleLoader:
             child = ModuleLoader([file.parent] + self.search_paths, self.globals_factory, self.fuel)
             child.cache = self.cache
             child.loading = self.loading
-            vm = VM(self.globals_factory(), fuel=self.fuel, module_loader=child.load)
+            base = self.globals_factory()
+            # VM adopts this dict by reference and the module's own
+            # definitions land in it, so snapshot the builtins beforehand.
+            baseline = dict(base)
+            vm = VM(base, fuel=self.fuel, module_loader=child.load)
             vm.run(program)
-            exported = {
-                k: v
-                for k, v in vm.globals.vars.items()
-                if not k.startswith("_") and k not in self.globals_factory()
-            }
+            # Export what the module actually defines. Comparing against the
+            # builtin *names* would hide any function that shadows a builtin
+            # (a module defining `mean` is entirely legitimate), so compare
+            # identity instead: a name still bound to the builtin object was
+            # not redefined, anything else was.
+            exported = {}
+            for k, v in vm.globals.vars.items():
+                if k.startswith("_"):
+                    continue
+                if k in baseline and baseline[k] is v:
+                    continue
+                exported[k] = v
             module = Module(path, exported)
             self.cache[path] = module
             return module

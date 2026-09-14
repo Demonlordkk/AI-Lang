@@ -53,6 +53,8 @@ KEYWORDS = {
     "given": "GIVEN",
     "is": "IS",
     "attempt": "ATTEMPT",
+    "needs": "NEEDS",
+    "ensures": "ENSURES",
     "rescue": "RESCUE",
     "true": "BOOL",
     "false": "BOOL",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -63,6 +64,95 @@ def cmd_build(args):
     obj = write(program, out, source)
     print(f"{out}  ({obj['artifact_sha256'][:16]})")
     return 0
+
+
+
+def _project_root(start=None):
+    """Nearest ancestor directory containing the project manifest."""
+    from .packages import PROJECT
+
+    d = Path(start or Path.cwd()).resolve()
+    for cand in [d, *d.parents]:
+        if (cand / PROJECT).is_file():
+            return cand
+    return None
+
+
+def _registry(args):
+    from .packages import Registry
+
+    if getattr(args, "registry", None):
+        return Registry(Path(args.registry))
+    env = os.environ.get("AILANG_REGISTRY")
+    if env:
+        return Registry(Path(env))
+    return Registry(Path.home() / ".ailang" / "registry")
+
+
+def cmd_install(args):
+    from .packages import PackageError, install
+
+    root = _project_root()
+    if root is None:
+        print("ailang: no ailang.project.json found", file=sys.stderr)
+        return 1
+    try:
+        resolved = install(root, _registry(args))
+    except PackageError as e:
+        print(f"ailang: {e}", file=sys.stderr)
+        return 1
+    if not resolved:
+        print("no dependencies to install")
+        return 0
+    for name, info in sorted(resolved.items()):
+        print(f"  installed {name} {info['version']}")
+    print(f"{len(resolved)} package(s) installed into ai_modules/")
+    return 0
+
+
+def cmd_verify(args):
+    from .packages import verify
+
+    root = _project_root()
+    if root is None:
+        print("ailang: no ailang.project.json found", file=sys.stderr)
+        return 1
+    problems = verify(root)
+    if problems:
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        print(f"{len(problems)} problem(s)", file=sys.stderr)
+        return 1
+    print("all packages verified")
+    return 0
+
+
+def cmd_publish(args):
+    from .packages import PackageError
+
+    try:
+        name, version = _registry(args).publish(Path(args.dir))
+    except PackageError as e:
+        print(f"ailang: {e}", file=sys.stderr)
+        return 1
+    print(f"published {name} {version}")
+    return 0
+
+
+def cmd_add(args):
+    """Record a dependency in the project manifest, then install."""
+    from .packages import PROJECT, PackageError, read_json, write_json
+
+    root = _project_root()
+    if root is None:
+        print("ailang: no ailang.project.json found", file=sys.stderr)
+        return 1
+    manifest = read_json(root / PROJECT)
+    deps = manifest.setdefault("dependencies", {})
+    deps[args.name] = args.constraint
+    write_json(root / PROJECT, manifest)
+    print(f"added {args.name} {args.constraint}")
+    return cmd_install(args)
 
 
 def cmd_fmt(args):
@@ -297,6 +387,24 @@ def build_parser():
     p = sub.add_parser("test", help="run test_* functions")
     p.add_argument("file")
     p.set_defaults(fn=cmd_test)
+
+    p = sub.add_parser("install", help="install dependencies into ai_modules/")
+    p.add_argument("--registry")
+    p.set_defaults(fn=cmd_install)
+
+    p = sub.add_parser("add", help="add a dependency and install it")
+    p.add_argument("name")
+    p.add_argument("constraint", nargs="?", default="*")
+    p.add_argument("--registry")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("verify", help="check installed packages against the lockfile")
+    p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("publish", help="publish a package directory to the registry")
+    p.add_argument("dir")
+    p.add_argument("--registry")
+    p.set_defaults(fn=cmd_publish)
 
     p = sub.add_parser("repl", help="start an interactive session")
     p.set_defaults(fn=cmd_repl)

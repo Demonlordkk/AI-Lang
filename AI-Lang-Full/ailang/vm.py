@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from .errors import AILangRaise, VMError
+from .errors import AILangError, AILangRaise, VMError
 from .opcodes import NAMES, OPS
 from .values import Module, RecordType, RecordValue, display, is_truthy, type_name
 
@@ -126,6 +126,7 @@ class VM:
         self.depth = 0
         self.program = None
         self.module_loader = module_loader
+        self._loop_cache = {}
         _init_builtin_names()
 
     # ----------------------------------------------------------------- driver
@@ -139,6 +140,59 @@ class VM:
         code = closure.code
         params = code.params
         nparams = len(params)
+
+        # First call: try to compile this function to host bytecode. If the
+        # backend declines, `native` stays None and we use the interpreter --
+        # the two are behaviourally identical, so either is correct.
+        if not code.native_tried:
+            code.native_tried = True
+            # The compiled function is cached on FunctionCode, which every
+            # closure built from this source shares. Resolving free names
+            # against one closure's environment would leak that environment
+            # into all the others, so free names are resolved against the
+            # globals only -- and `captures` (names taken from an enclosing
+            # scope) disqualify the function entirely.
+            if code.body is not None and not code.captures:
+                from .native import try_compile
+
+                globals_env = self.globals
+
+                def _lookup(name, _g=globals_env):
+                    if name in _g.vars:
+                        return _g.vars[name]
+                    raise VMError(f"undefined name '{name}'")
+
+                code.native = try_compile(
+                    code, _lookup, code.name,
+                    is_global=lambda nm, _g=globals_env: nm in _g.vars,
+                )
+
+        if code.native is not None and not kwargs and len(args) == nparams:
+            self.depth += 1
+            if self.depth > self.MAX_DEPTH:
+                self.depth -= 1
+                raise VMError("recursion limit exceeded (possible infinite recursion)")
+            try:
+                return code.native(*args)
+            except AILangError as exc:
+                # relabel with the AI-Lang line, using the map the backend
+                # attached; done here so the hot path stays wrapper-free
+                if not getattr(exc, "line", 0):
+                    lm = getattr(code.native, "_ailang_lines", None)
+                    if lm:
+                        tb = exc.__traceback__
+                        target = code.native.__code__
+                        while tb is not None:
+                            if tb.tb_frame.f_code is target:
+                                exc.line = lm.get(tb.tb_lineno, 0)
+                                # the line belongs to the compiled function's
+                                # own file, which may be an imported module
+                                if not getattr(exc, "origin", ""):
+                                    exc.origin = getattr(code, "origin", "")
+                            tb = tb.tb_next
+                raise
+            finally:
+                self.depth -= 1
 
         if not kwargs:
             if len(args) != nparams:
@@ -172,6 +226,32 @@ class VM:
         finally:
             self.depth -= 1
 
+    def _native_loop(self, idx, src, free, env):
+        """Compile and cache a lifted top-level loop."""
+        cache = self._loop_cache
+        fn = cache.get(idx)
+        if fn is not None:
+            return fn
+        from .native import _make_runtime
+
+        # every free name must resolve now, through the live scope chain
+        def _lookup(name, _e=env):
+            e = _e
+            while e is not None:
+                if name in e.vars:
+                    return e.vars[name]
+                e = e.parent
+            raise VMError(f"undefined name '{name}'")
+
+        runtime = _make_runtime(_lookup)
+        try:
+            exec(compile(src, f"<ailang:loop{idx}>", "exec"), runtime)
+        except Exception:
+            return None
+        fn = runtime["_fn"]
+        cache[idx] = fn
+        return fn
+
     # -------------------------------------------------------------- execution
     def execute(self, fn, env, program=None):
         """Interpreter loop.
@@ -182,6 +262,7 @@ class VM:
         """
         program = program if program is not None else self.program
         code = fn.code
+        line_table = fn.lines
         stack = []
         push = stack.append
         pop = stack.pop
@@ -590,6 +671,36 @@ class VM:
                 elif op == ITER_END:
                     pass
 
+                elif op == NATIVE_LOOP:
+                    src, carried, free = program.native_loops[ins[1]]
+                    fn = self._native_loop(ins[1], src, free, env)
+                    if fn is None:
+                        raise VMError("native loop unavailable")
+                    vals = []
+                    for nm in carried:
+                        e = env
+                        while e is not None:
+                            if nm in e.vars:
+                                vals.append(e.vars[nm])
+                                break
+                            e = e.parent
+                        else:
+                            raise VMError(f"undefined name '{nm}'")
+                    out = fn(*vals)
+                    for nm, val in zip(carried, out):
+                        e = env
+                        while e is not None:
+                            if nm in e.vars:
+                                if nm in e.immutable:
+                                    raise VMError(
+                                        f"cannot assign to '{nm}': it is a let "
+                                        f"binding (declare it with 'var' to "
+                                        f"allow mutation)"
+                                    )
+                                e.vars[nm] = val
+                                break
+                            e = e.parent
+
                 elif op == SCOPE_PUSH:
                     scopes.append(env)
                     env = Environment(env)
@@ -720,7 +831,9 @@ class VM:
                     raise
                 if not traps:
                     self.fuel = fuel
-                    raise _promote(exc)
+                    # attach the source line of the failing instruction so a
+                    # runtime error points at the statement that caused it
+                    raise _promote(exc, line_table.get(ip - 1, 0), getattr(fn, "origin", ""))
                 target, err_name, sdepth, idepth, scdepth = traps.pop()
                 del stack[sdepth:]
                 del iters[idepth:]
@@ -939,11 +1052,21 @@ def _error_value(exc):
     return {"kind": "runtime error", "message": str(exc), "value": str(exc)}
 
 
-def _promote(exc):
+def _promote(exc, line=0, origin=""):
     from .errors import AILangError
 
     if isinstance(exc, AILangError):
+        if line and not getattr(exc, "line", 0):
+            exc.line = line
+        # the innermost frame to see the error owns the line, so it also owns
+        # the file; outer frames must not overwrite it
+        if origin and not getattr(exc, "origin", ""):
+            exc.origin = origin
         return exc
     if isinstance(exc, RecursionError):
-        return VMError("recursion limit exceeded (possible infinite recursion)")
-    return VMError(str(exc))
+        out = VMError("recursion limit exceeded (possible infinite recursion)", line)
+    else:
+        out = VMError(str(exc), line)
+    if origin:
+        out.origin = origin
+    return out

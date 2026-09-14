@@ -221,6 +221,24 @@ class Use(Node):
 
 
 @dataclass
+class Needs(Node):
+    """A precondition: `needs amount > 0.` at the top of a function body."""
+    expr: Any
+    text: str = ""
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class Ensures(Node):
+    """A postcondition checked against `result` on every path out."""
+    expr: Any
+    text: str = ""
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
 class Raise(Node):
     expr: Any
     line: int = 0

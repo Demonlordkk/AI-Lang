@@ -312,6 +312,36 @@ when user not in banned and "admin" in user.roles:
 done.
 ```
 
+### Contracts
+
+A function can state what it requires and what it guarantees. The conditions
+are part of the function, not a separate test file:
+
+```text
+fn withdraw(balance: Real, amount: Real) -> Real:
+    needs amount > 0.
+    needs amount <= balance.
+    ensures result >= 0.
+    give balance - amount.
+done.
+```
+
+`needs` is checked on entry, `ensures` on every path out with `result` bound
+to the value being returned -- including a `give` nested inside a `when`, so
+a branch added later cannot quietly escape the guarantee. A violation names
+the function, which half of the contract broke, and the condition as written:
+
+```
+program.al:2:0: raised: withdraw: precondition failed: amount > 0
+     2 |     needs amount > 0.
+       | ^
+```
+
+Failures are ordinary errors, so `attempt`/`rescue` can catch them. Contracts
+are compiled away entirely -- not merely skipped -- under
+`AILANG_CONTRACTS=0`, so a released build pays nothing for the checks it
+developed against.
+
 ## Standard library
 
 Available everywhere without imports.
@@ -518,6 +548,34 @@ let results := parallel_map(urls, \u -> http_get(u).status).
 let output := retry(\ -> run("deploy.sh"), 3, 1.0).
 ```
 
+## Packages
+
+A package is a directory with `ailang.package.json` and `.al` sources.
+
+```bash
+ailang publish ./my-package      # add it to the registry
+ailang add stats ^1.0.0          # record a dependency and install
+ailang install                   # resolve, install, write the lockfile
+ailang verify                    # recheck every digest
+```
+
+Dependencies install into `ai_modules/`, where the module loader already
+looks, so `use stats as stats.` just works. Resolution handles transitive
+dependencies, picks the highest version satisfying every constraint, and
+reports a conflict with both requesters named rather than guessing. Versions
+support `1.2.3`, `^1.2.3`, `~1.2.3`, `>=1.2.3` and `*`.
+
+`ailang.lock.json` pins an exact version and SHA-256 digest for every package,
+so an install is reproducible and tampering is detected:
+
+```
+  stats: digest mismatch (expected sha256:521cfc2dc981..., got sha256:a96c18a8b34a...)
+```
+
+Three packages ship in `packages/`: `text` (casing, padding, word counts),
+`collections` (set operations, rotation, frequency tables) and `testing`
+(assertions that report what actually differed).
+
 ## Running anywhere
 
 AI-Lang imports only the host runtime's standard library. There is no numpy,
@@ -541,6 +599,25 @@ python3 ailang-bundle.pyz run program.al
 Copy it to a server, a container, a Raspberry Pi, or a locked-down machine with
 no package manager, and it runs as-is.
 
+## Diagnostics
+
+Mistyped names are matched against everything in scope, with your own names
+ranked ahead of builtins:
+
+```
+error: undefined name 'grup_by'; did you mean 'group_by'?
+error: undefined name 'countr'; did you mean one of 'counter', 'counts', 'count'?
+```
+
+Runtime errors carry the source line and an excerpt, and point inside the
+function that actually failed rather than at the call site:
+
+```
+program.al:2:0: runtime error: index 99 is out of range for a list of 1
+     2 |     give xs[99].
+       | ^
+```
+
 ## Performance
 
 The VM dispatches on integer opcodes through a frequency-ordered chain, and
@@ -549,10 +626,9 @@ Measured on this machine:
 
 | Workload | Before | After | Gain |
 | --- | --- | --- | --- |
-| Mixed benchmark (fib 22, 200k loop, 20k list) | 1.485s | 0.886s | 1.68x |
+| fib 21 + 300k arithmetic loop | 1.118s | 0.159s | 7.0x |
+| Call-heavy recursion (fib 24) | 0.543s | 0.200s | 2.7x |
 | 50k element accumulation (`append`) | 3.395s | 0.243s | 14.0x |
-| fib 21 + 300k arithmetic loop | 1.118s | 0.778s | 1.44x |
-| Call-heavy recursion (fib 24) | 0.543s | 0.468s | 1.16x |
 
 Key optimisations:
 
@@ -569,6 +645,20 @@ Key optimisations:
 * A bytecode peephole pass fuses adjacent instruction pairs (`LOAD;LOAD`,
   `LOAD;PUSH`, `LOAD;ADD_NN`, `LOAD;FIELD`, ...) so the hot path makes one
   dispatch instead of two. Fusion never crosses a jump target
+
+### The native backend
+
+Functions and top-level loops are compiled to host bytecode on first use, so
+their locals become real slots instead of scope-chain lookups. Operations
+whose AI-Lang meaning differs from the host's are emitted as a guarded fast
+path with the interpreter's own operator as the fallback, so `true == 1` is
+still `false` and `6 / 3` is still `2.0`.
+
+The backend refuses anything it cannot model exactly -- closures that capture
+or mutate an enclosing scope, named arguments, records -- and those functions
+keep running on the VM. Set `AILANG_NATIVE=0` to disable it entirely; the test
+suite runs both ways and 45 differential tests assert the two backends produce
+identical output, exit codes and error text.
 
 ## Testing
 

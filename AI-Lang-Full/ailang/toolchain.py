@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .compiler import Compiler, ProgramCode
+from .contracts import desugar
 from .errors import AILangError
 from .optimizer import optimize
 from .parser import parse
@@ -33,12 +34,14 @@ def compile_source(
     opt: bool = True,
 ) -> ProgramCode:
     program = parse(source)
+    # contracts become ordinary checks before anything else looks at the tree
+    desugar(program)
     if check:
         resolver = _resolver_for(search_paths or [Path.cwd()])
         TypeChecker(module_resolver=resolver).check(program)
     if opt:
         optimize(program)
-    return Compiler().compile(program)
+    return Compiler().compile(program, filename)
 
 
 def run_source(

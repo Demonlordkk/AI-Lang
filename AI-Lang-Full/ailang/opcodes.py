@@ -46,6 +46,7 @@ _NAMES = [
     "LOAD_LT_NN",     # stack value < local
     "LOAD_FIELD",     # local.field in one step
     "LOAD_INDEX",     # index a stacked object by a local
+    "NATIVE_LOOP",    # run a loop compiled to host bytecode
 ]
 
 # name -> int, and the reverse for disassembly / serialisation
