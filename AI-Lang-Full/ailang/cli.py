@@ -192,11 +192,25 @@ def cmd_build(args):
     source = None
     try:
         source = _read_source(path)
-        program = compile_source(source, str(path), [path.parent.resolve(), Path.cwd()])
+        # Artifacts are portable data and must not carry the native backend's
+        # generated Python source.  Source runs may still use native lowering;
+        # shipped artifacts deliberately use the safe VM instruction stream.
+        program = compile_source(
+            source, str(path), [path.parent.resolve(), Path.cwd()], lift_loops=False
+        )
+        out = Path(args.output) if args.output else path.with_suffix(".albc.json")
+        if out.resolve(strict=False) == path.resolve(strict=False):
+            raise ValueError("output path must not overwrite the source file")
+        # A build command is allowed to create its requested output directory,
+        # but refuses to replace a directory with an artifact (bytecode.write
+        # performs the final atomic replacement).
+        out.parent.mkdir(parents=True, exist_ok=True)
+        obj = write(program, out, source)
     except AILangError as e:
         return _fail(e, source, str(path))
-    out = Path(args.output) if args.output else path.with_suffix(".albc.json")
-    obj = write(program, out, source)
+    except (OSError, ValueError, UnicodeError, RecursionError) as e:
+        print(f"ailang: build: {e}", file=sys.stderr)
+        return 1
     print(f"{out}  ({obj['artifact_sha256'][:16]})")
     return 0
 
@@ -290,10 +304,16 @@ def cmd_add(args):
     if root is None:
         print("ailang: no ailang.project.json found", file=sys.stderr)
         return 1
-    manifest = read_json(root / PROJECT)
-    deps = manifest.setdefault("dependencies", {})
-    deps[args.name] = args.constraint
-    write_json(root / PROJECT, manifest)
+    try:
+        manifest = read_json(root / PROJECT)
+        deps = manifest.setdefault("dependencies", {})
+        if not isinstance(deps, dict):
+            raise PackageError("project 'dependencies' must be a map")
+        deps[args.name] = args.constraint
+        write_json(root / PROJECT, manifest)
+    except PackageError as e:
+        print(f"ailang: {e}", file=sys.stderr)
+        return 1
     print(f"added {args.name} {args.constraint}")
     return cmd_install(args)
 
@@ -314,7 +334,11 @@ def cmd_fmt(args):
         print(f"{path}: already formatted")
         return 0
     if formatted != source:
-        path.write_text(formatted, encoding="utf-8")
+        try:
+            path.write_text(formatted, encoding="utf-8")
+        except OSError as e:
+            print(f"ailang: fmt: cannot write {path}: {e}", file=sys.stderr)
+            return 1
         print(f"{path}: formatted")
     else:
         print(f"{path}: unchanged")
@@ -603,10 +627,18 @@ def main(argv=None):
         return 0
     try:
         return args.fn(args)
+    except ProcessExit as e:
+        return e.code
+    except Panic as e:
+        print(f"ailang: panic: {e.message}", file=sys.stderr)
+        return 1
     except AILangError as e:
         print(f"ailang: {e}", file=sys.stderr)
         return 1
-    except FileNotFoundError as e:
+    except (OSError, ValueError, TypeError, RecursionError) as e:
+        # Command handlers should already translate expected failures, but
+        # this last boundary keeps malformed manifests/output paths and host
+        # library argument errors from leaking a Python traceback.
         print(f"ailang: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

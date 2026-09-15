@@ -47,20 +47,31 @@ def _flat1d(t: "Tensor") -> List[float]:
     return [float(v) for v in d.reshape(-1)]
 
 
-def _flatten(value, out: List[float], shape: Optional[List[int]], depth: int):
-    """Flatten nested lists while verifying the structure is rectangular."""
+def _shape_of(value):
+    """Infer a rectangular shape, rejecting mixed scalar/list nesting."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return
+        return ()
     if not isinstance(value, list):
         raise VMError(f"tensor: expected numbers or lists, found {type(value).__name__}")
-    if len(shape) <= depth:
-        shape.append(len(value))
-    elif shape[depth] != len(value):
-        raise VMError(
-            f"tensor: ragged input — expected {shape[depth]} elements, found {len(value)}"
-        )
-    for item in value:
-        _flatten(item, out, shape, depth + 1)
+    if not value:
+        return (0,)
+    child = _shape_of(value[0])
+    for item in value[1:]:
+        got = _shape_of(item)
+        if got != child:
+            raise VMError(
+                "tensor: ragged or heterogeneous input — all nested rows must "
+                "have the same shape"
+            )
+    return (len(value),) + child
+
+
+def _flatten(value, out: List[float], shape: Optional[List[int]], depth: int):
+    """Flatten nested lists while verifying the structure is rectangular."""
+    inferred = _shape_of(value)
+    if shape is not None:
+        shape.extend(inferred)
+    _collect(value, out)
 
 
 def _collect(value, out: List[float]):
@@ -70,7 +81,13 @@ def _collect(value, out: List[float]):
         return
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise VMError(f"tensor: values must be numbers, found {type(value).__name__}")
-    out.append(float(value))
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        raise VMError("tensor: values must be finite real numbers") from None
+    if not math.isfinite(number):
+        raise VMError("tensor: values must be finite real numbers")
+    out.append(number)
 
 
 def _unflatten(data, shape, offset=0):
@@ -121,9 +138,8 @@ class Tensor:
                 return Tensor(value.data, value.shape, True)
             return value
         shape: List[int] = []
-        _flatten(value, [], shape, 0)
         data: List[float] = []
-        _collect(value, data)
+        _flatten(value, data, shape, 0)
         if _prod(shape) != len(data):
             raise VMError("tensor: inconsistent shape")
         return Tensor(_buf(data), tuple(shape), requires_grad)
@@ -215,8 +231,12 @@ def _broadcast_shapes(a: Tuple[int, ...], b: Tuple[int, ...]):
     for i in range(max(len(ra), len(rb))):
         da = ra[i] if i < len(ra) else 1
         db = rb[i] if i < len(rb) else 1
-        if da == db or da == 1 or db == 1:
-            out.append(max(da, db))
+        if da == db:
+            out.append(da)
+        elif da == 1:
+            out.append(db)
+        elif db == 1:
+            out.append(da)
         else:
             raise VMError(
                 f"shapes {list(a)} and {list(b)} cannot be combined "
@@ -477,12 +497,38 @@ def np_div(x, y):
     return x / y
 
 
+def _pow_scalar(x, p):
+    if x == 0 and p < 0:
+        raise VMError("pow: zero cannot be raised to a negative power")
+    if x < 0 and not float(p).is_integer():
+        raise VMError("pow: negative base with a fractional exponent")
+    try:
+        return math.pow(x, p)
+    except (OverflowError, ValueError) as e:
+        raise VMError(f"pow: invalid real result for {x} ^ {p}") from None
+
+
+def _pow_derivative(x, p):
+    if p == 0 or (x == 0 and p > 1):
+        return 0.0
+    if x == 0 and p == 1:
+        return 1.0
+    if x == 0:
+        raise VMError("pow: derivative is undefined at zero for this exponent")
+    return p * _pow_scalar(x, p - 1.0)
+
+
 def power(a, p):
-    p = float(p)
+    try:
+        p = float(p)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError("pow: exponent must be a finite number") from None
+    if not math.isfinite(p):
+        raise VMError("pow: exponent must be finite")
     return _unary_op(
-        T(a), lambda x: x ** p, lambda x, o: p * (x ** (p - 1.0)), "pow",
+        T(a), lambda x: _pow_scalar(x, p), lambda x, o: _pow_derivative(x, p), "pow",
         np_fwd=lambda x: _np_pow(x, p),
-        np_back=lambda x, o, g: g * p * _np_pow(x, p - 1.0),
+        np_back=lambda x, o, g: _np_pow_derivative(x, p, g),
     )
 
 
@@ -490,11 +536,24 @@ def _np_pow(x, p):
     m = accel.np()
     if not float(p).is_integer() and (x < 0).any():
         raise VMError("pow: negative base with a fractional exponent")
-    with m.errstate(over="ignore", invalid="ignore"):
+    if p < 0 and (x == 0).any():
+        raise VMError("pow: zero cannot be raised to a negative power")
+    with m.errstate(over="ignore", invalid="ignore", divide="ignore"):
         out = m.power(x, p)
-    if m.any(m.isnan(out)) and (x == 0).any() and p < 0:
-        raise VMError("tensor division by zero")
+    if not m.isfinite(out).all():
+        raise VMError("pow: invalid real result")
     return out
+
+
+def _np_pow_derivative(x, p, g):
+    m = accel.np()
+    if p == 0:
+        return m.zeros_like(x, dtype=m.float64)
+    if p < 0 and (x == 0).any():
+        raise VMError("pow: derivative is undefined at zero for this exponent")
+    if 0 < p < 1 and (x == 0).any():
+        raise VMError("pow: derivative is undefined at zero for this exponent")
+    return g * p * _np_pow(x, p - 1.0)
 
 
 def neg(a):
@@ -596,7 +655,12 @@ def t_abs(a):
 
 def t_clip(a, lo, hi):
     """Element-wise clamp to [lo, hi]; gradient is zero outside the band."""
-    lo, hi = float(lo), float(hi)
+    try:
+        lo, hi = float(lo), float(hi)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError("t_clip: bounds must be finite numbers") from None
+    if not math.isfinite(lo) or not math.isfinite(hi):
+        raise VMError("t_clip: bounds must be finite numbers")
     if lo > hi:
         raise VMError(f"t_clip: low ({lo}) is above high ({hi})")
 
@@ -783,7 +847,8 @@ def matmul_bias(a, b, c):
             if b.requires_grad:
                 b._accum((A.T @ g).reshape(-1))
             if c.requires_grad:
-                c._accum((g.sum(axis=0)).reshape(-1))
+                gc = g.sum(axis=0).reshape(-1)
+                c._accum(m.asarray([gc.sum()]) if not c.shape else gc)
 
         return a._child(out, (n, m), (a, b, c), backward, "matmul_bias")
 
@@ -829,7 +894,7 @@ def matmul_bias(a, b, c):
                 grow = g[i * m:(i + 1) * m]
                 for j in range(m):
                     gc[j] += grow[j]
-            c._accum(gc)
+            c._accum([math.fsum(gc)] if not c.shape else gc)
 
     return a._child(out, (n, m), (a, b, c), backward, "matmul_bias")
 
@@ -839,11 +904,14 @@ def dropout(a, rate, training=True):
     inference. `training=false` (or rate 0) returns `a` itself, so the same
     graph is correct for both training and evaluation."""
     a = T(a)
-    rate = float(rate)
-    if not training or rate <= 0.0:
-        return a
-    if rate >= 1.0:
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError("dropout: rate must be a finite number in [0, 1)") from None
+    if not math.isfinite(rate) or rate < 0.0 or rate >= 1.0:
         raise VMError("dropout: rate must be in [0, 1)")
+    if not training or rate == 0.0:
+        return a
     n = a.size
     keep = 1.0 - rate
 
@@ -886,6 +954,9 @@ def ce_softmax(logits, target):
             f"ce_softmax needs matching 2-D shapes, got {list(a.shape)} and {list(y.shape)}"
         )
     rows, cols = a.shape
+    if rows == 0 or cols == 0:
+        raise VMError("ce_softmax: cannot compute a loss for an empty tensor")
+    _check_unit_interval(y.data, "ce_softmax")
     ad = _flat1d(a)
     yd = _flat1d(y)
 
@@ -962,7 +1033,14 @@ def transpose(a):
 
 def reshape(a, shape):
     a = T(a)
-    shape = tuple(int(x) for x in shape)
+    if not isinstance(shape, (list, tuple)):
+        raise VMError("reshape: shape must be a List of non-negative Ints")
+    dims = []
+    for x in shape:
+        if isinstance(x, bool) or not isinstance(x, int) or x < 0:
+            raise VMError("reshape: shape must be a List of non-negative Ints")
+        dims.append(x)
+    shape = tuple(dims)
     if _prod(shape) != a.size:
         raise VMError(
             f"reshape: cannot fit {a.size} elements into shape {list(shape)}"
@@ -980,6 +1058,14 @@ def reshape(a, shape):
     return a._child(data, shape, (a,), backward, "reshape")
 
 
+def _axis_value(axis, rank, name):
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        raise VMError(f"{name}: axis must be an Int")
+    if axis < 0 or axis >= rank:
+        raise VMError(f"{name}: axis {axis} is out of range for rank {rank}")
+    return axis
+
+
 def t_slice(t, start, stop=None, axis=0):
     """Rows of a 2-D tensor (axis 0), columns (axis 1), or elements of a 1-D.
 
@@ -987,19 +1073,20 @@ def t_slice(t, start, stop=None, axis=0):
     zero-padded back to the full input shape.
     """
     t = T(t)
-    axis = int(axis)
-    if len(t.shape) == 1:
-        axis = 0
-        axis_len = t.shape[0]
-    elif len(t.shape) == 2:
-        if axis not in (0, 1):
-            raise VMError("t_slice: axis must be 0 or 1 for a 2-D tensor")
-        axis_len = t.shape[axis]
-    else:
+    rank = len(t.shape)
+    if rank not in (1, 2):
         raise VMError(f"t_slice: needs a 1-D or 2-D tensor, got shape {list(t.shape)}")
+    axis = _axis_value(axis, rank, "t_slice")
+    if rank == 1:
+        axis_len = t.shape[0]
+    else:
+        axis_len = t.shape[axis]
 
     def norm(v):
-        v = int(v)
+        try:
+            v = int(v)
+        except (TypeError, ValueError, OverflowError):
+            raise VMError("t_slice: start and stop must be integer-like values") from None
         if v < 0:
             v += axis_len
         return max(0, min(axis_len, v))
@@ -1123,7 +1210,7 @@ def _check_rect(rows, fname):
 def t_concat(a, b, axis=0):
     """Join two tensors along an axis. Gradient splits it back."""
     a, b = T(a), T(b)
-    axis = int(axis)
+    axis = _axis_value(axis, len(a.shape), "t_concat")
     if len(a.shape) == 1:
         if len(b.shape) != 1 or axis != 0:
             raise VMError("t_concat: 1-D tensors concatenate along axis 0 only")
@@ -1197,10 +1284,29 @@ def _split_cols(g, sa, sb):
 def where(mask, a, b):
     """Element-wise select: mask of Bools, `a` and `b` the same shape."""
     a, b = T(a), T(b)
-    if a.size != b.size:
-        raise VMError(f"where: size mismatch {a.size} vs {b.size}")
+    if a.shape != b.shape:
+        raise VMError(f"where: shape mismatch {list(a.shape)} vs {list(b.shape)}")
     if not isinstance(mask, list):
         raise VMError("where: the mask must be a List of Bools")
+
+    def mask_shape(value):
+        if isinstance(value, bool):
+            return ()
+        if not isinstance(value, list):
+            raise VMError("where: mask entries must be Bools")
+        if not value:
+            return (0,)
+        child = mask_shape(value[0])
+        for item in value[1:]:
+            if mask_shape(item) != child:
+                raise VMError("where: mask is ragged or heterogeneous")
+        return (len(value),) + child
+
+    if mask_shape(mask) != a.shape:
+        raise VMError(
+            f"where: mask shape {list(mask_shape(mask))} does not match "
+            f"tensor shape {list(a.shape)}"
+        )
 
     def check_mask(m, prefix):
         flat = []
@@ -1253,8 +1359,12 @@ def t_softmax(a):
     a = T(a)
     if len(a.shape) == 2:
         rows, cols = a.shape
-    else:
+    elif len(a.shape) in (0, 1):
         rows, cols = 1, a.size
+    else:
+        raise VMError(f"softmax needs a 1-D or 2-D tensor, got shape {list(a.shape)}")
+    if rows == 0 or cols == 0:
+        raise VMError("softmax: cannot operate on an empty tensor")
 
     if accel.have():
         m = accel.np()
@@ -1297,22 +1407,53 @@ def t_softmax(a):
 
 
 # --------------------------------------------------------------------- losses
+def _same_shape(a, b, name):
+    if a.shape != b.shape:
+        raise VMError(
+            f"{name}: shape mismatch {list(a.shape)} vs {list(b.shape)}; "
+            "reshape or broadcast explicitly before computing the loss"
+        )
+
+
+def _check_unit_interval(data, name):
+    for value in data:
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0 or value > 1.0:
+            raise VMError(f"{name}: targets/probabilities must be in [0, 1]")
+
+
+def _loss_eps(eps, name):
+    try:
+        eps = float(eps)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError(f"{name}: eps must be a finite number between 0 and 0.5") from None
+    if not math.isfinite(eps) or not 0.0 < eps < 0.5:
+        raise VMError(f"{name}: eps must be a finite number between 0 and 0.5")
+    return eps
+
+
 def mse_loss(pred, target):
     pred, target = T(pred), T(target)
+    _same_shape(pred, target, "mse")
     diff = sub(pred, target)
     return t_mean(mul(diff, diff))
 
 
 def mae_loss(pred, target):
     pred, target = T(pred), T(target)
+    _same_shape(pred, target, "mae")
     return t_mean(t_abs(sub(pred, target)))
 
 
 def bce_loss(pred, target, eps=1e-12):
-    """Binary cross-entropy. `pred` must already be in (0, 1)."""
+    """Binary cross-entropy. `pred` must already be in [0, 1]."""
+    eps = _loss_eps(eps, "bce")
     p, y = T(pred), T(target)
-    if p.size != y.size:
-        raise VMError(f"bce: size mismatch {p.size} vs {y.size}")
+    _same_shape(p, y, "bce")
+    if p.size == 0:
+        raise VMError("bce: cannot compute a loss for an empty tensor")
+    _check_unit_interval(p.data, "bce")
+    _check_unit_interval(y.data, "bce")
     n = p.size
     pd, yd = p.data, y.data
     if accel.have():
@@ -1358,9 +1499,12 @@ def bce_logits_loss(logits, target, eps=1e-12):
     loss = mean( max(z,0) - z*y + log(1 + exp(-|z|)) ),
     grad = (sigmoid(z) - y) / n.
     """
+    eps = _loss_eps(eps, "bce_logits")
     p, y = T(logits), T(target)
-    if p.size != y.size:
-        raise VMError(f"bce_logits: size mismatch {p.size} vs {y.size}")
+    _same_shape(p, y, "bce_logits")
+    if p.size == 0:
+        raise VMError("bce_logits: cannot compute a loss for an empty tensor")
+    _check_unit_interval(y.data, "bce_logits")
     n = p.size
     pd, yd = p.data, y.data
     if accel.have():
@@ -1405,12 +1549,16 @@ def _sigmoid_scalar(x):
 
 def huber_loss(pred, target, delta=1.0):
     """Mean Huber loss: quadratic close to the target, linear far from it."""
-    delta = float(delta)
-    if delta <= 0:
-        raise VMError("huber: delta must be positive")
+    try:
+        delta = float(delta)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError("huber: delta must be a finite positive number") from None
+    if not math.isfinite(delta) or delta <= 0:
+        raise VMError("huber: delta must be a finite positive number")
     p, y = T(pred), T(target)
-    if p.size != y.size:
-        raise VMError(f"huber: size mismatch {p.size} vs {y.size}")
+    _same_shape(p, y, "huber")
+    if p.size == 0:
+        raise VMError("huber: cannot compute a loss for an empty tensor")
     n = p.size
     pd, yd = p.data, y.data
     if accel.have():
@@ -1447,9 +1595,14 @@ def huber_loss(pred, target, delta=1.0):
 
 
 def ce_loss(logits, target, eps=1e-12):
-    """Softmax cross-entropy over logits; target is one-hot."""
+    """Softmax cross-entropy over logits; target is one-hot or soft labels."""
+    eps = _loss_eps(eps, "cross_entropy")
     probs = t_softmax(logits)
     y = T(target)
+    _same_shape(probs, y, "cross_entropy")
+    if probs.size == 0:
+        raise VMError("cross_entropy: cannot compute a loss for an empty tensor")
+    _check_unit_interval(y.data, "cross_entropy")
     pd, yd = probs.data, y.data
     n = probs.shape[0] if len(probs.shape) == 2 else 1
     if accel.have():
@@ -1479,6 +1632,8 @@ def l2_penalty(value):
     Add it to a loss for weight decay: `t_add(loss, t_mul(0.001, l2_penalty_t(w)))`.
     """
     if isinstance(value, list):
+        if not value:
+            raise VMError("l2_penalty: needs at least one tensor")
         ts = [T(x) for x in value]
     else:
         ts = [T(value)]

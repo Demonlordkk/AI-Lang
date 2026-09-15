@@ -14,7 +14,7 @@ systems you build with them. Nothing in the language is specialised to one
 domain: machine learning is a library, not the language.
 
 It runs anywhere. AI-Lang depends on **no third-party packages** — only a
-host Python runtime — and ships as a single 365 KB file you can copy to a
+host Python runtime — and ships as a compact single-file interpreter you can copy to a
 device and run with no install step. One exception, deliberately optional: if
 numpy is already installed (Colab, a scientific Python, a server), the tensor
 engine transparently accelerates on it; without numpy the reference engine
@@ -66,7 +66,12 @@ python3 ailang.py run examples/basic.al
 
 A built `.albc.json` artifact runs directly with `ailang run`, exactly like
 its source — same output, same `args`, no re-parse, no re-check — so a
-shipped program needs only the interpreter and one file.
+shipped program needs only the interpreter and one file. Artifacts use the
+AILBC-4 format: they contain validated VM data only, never generated Python
+source. Loading checks the schema, opcode operands, jump bounds, function
+references, resource limits, and a canonical SHA-256 integrity field. The
+hash detects accidental tampering or truncation; authenticate artifacts from
+untrusted publishers separately before executing them.
 | `ailang test FILE` | Run every `fn test_*()` and report results |
 | `ailang fmt FILE [--check]` | Canonical formatting |
 | `ailang lint FILE` | Style and correctness diagnostics |
@@ -1172,7 +1177,7 @@ Build the standalone interpreter:
 python3 tools/make_bundle.py
 ```
 
-That writes `ailang-bundle.pyz`, a single 365 KB file:
+That writes `ailang-bundle.pyz`, a compact single-file interpreter:
 
 ```bash
 python3 ailang-bundle.pyz run program.al
@@ -1204,21 +1209,11 @@ program.al:2:0: runtime error: index 99 is out of range for a list of 1
 
 The VM dispatches on integer opcodes through a frequency-ordered chain, and
 the compiler emits specialised instructions when it can prove operand types.
-Measured on this machine:
-
-| Workload | Before | After | Gain |
-| --- | --- | --- | --- |
-| fib 21 + 300k arithmetic loop | 1.118s | 0.159s | 7.0x |
-| Call-heavy recursion (fib 24) | 0.543s | 0.200s | 2.7x |
-| 50k element accumulation (`append`) | 3.395s | 0.243s | 14.0x |
-
-(Absolute times are from the machine where they were recorded; ratios are
-stable. On this machine fib 24 measures 0.681 s VM / 0.271 s native.)
-
-Training workloads scale differently: the same spiral-classification program
-measures **10.2 s on the reference engine vs 0.92 s on the numpy engine**
-(`tools/bench_ml.py`, 11× on this machine). See
-[Two engines, one language](#two-engines-one-language).
+Benchmark results are workload- and host-dependent. The reproducible local
+benchmark is `python3 tools/bench_ml.py`; the latest verification run completed
+the pure-Python two-layer spiral workload in 4.93 s with final accuracy 1.0.
+The optional numpy accelerator was unavailable in that environment, so no
+numpy speedup is claimed here. See [Two engines, one language](#two-engines-one-language).
 
 Key optimisations:
 
@@ -1248,8 +1243,8 @@ The backend refuses anything it cannot model exactly -- closures that capture
 or mutate an enclosing scope, named arguments, records -- and those functions
 keep running on the VM. Set `AILANG_NATIVE=0` to disable it entirely; the test
 suite runs both ways, and every differential scenario in the suite — plus
-each of the 22 shipped examples — is executed on both backends and asserted
-to produce identical output, exit codes and error text.
+the shipped examples covered by the conformance tests — is executed on both
+backends and asserted to produce identical output, exit codes and error text.
 
 ## Testing
 
@@ -1309,7 +1304,10 @@ suite runs through it unchanged.
 ## Status
 
 The reference implementation runs on Python. Semantics, diagnostics and the
-bytecode format are stable. Speed is handled in layers: the native backend
-roughly 2.5× for general code, and the optional numpy engine an order of
-magnitude more for tensor workloads — while the core stays pure Python with
-no required dependencies.
+AILBC-4 bytecode format are versioned and tested. Speed is handled in layers:
+specialized VM opcodes and peephole fusion are always available, the native
+backend is an opt-in optimization for eligible source programs, and the
+optional numpy engine accelerates tensor workloads. Measurements are
+workload- and host-dependent; use `ailang run --profile` or
+`tools/bench_ml.py` instead of treating a single benchmark as a guarantee.
+The core remains pure Python with no required dependencies.

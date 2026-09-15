@@ -118,26 +118,37 @@ def _ctype(tname, where):
 
 
 def ffi_fn(lib, symbol, argtypes=None, restype="void"):
-    """Bind a symbol in a loaded library to a typed callable."""
+    """Bind a symbol in a loaded library to a typed callable.
+
+    ``ctypes`` function objects are mutable: assigning ``argtypes`` or
+    ``restype`` on the object returned by ``getattr`` changes every binding to
+    that symbol in the process.  Build an independent CFUNCTYPE trampoline
+    instead, so two AI-Lang bindings cannot race or silently change each
+    other's ABI.
+    """
     if not isinstance(lib, _Lib):
         raise VMError("ffi_fn: first argument must be a library from ffi_open")
-    if not isinstance(symbol, str):
-        raise VMError("ffi_fn: symbol name must be Text")
+    if not isinstance(symbol, str) or not symbol or "\x00" in symbol:
+        raise VMError("ffi_fn: symbol name must be non-empty Text without NUL bytes")
     argtypes = argtypes if argtypes is not None else []
     if not isinstance(argtypes, list):
         raise VMError("ffi_fn: argument types must be a List of Text")
-    try:
-        cfn = getattr(lib.handle, symbol)
-    except AttributeError:
-        raise VMError(
-            f"ffi_fn: library '{lib.path}' has no symbol '{symbol}'"
-        ) from None
     ats = [_ctype(a, "ffi_fn") for a in argtypes]
     if any(a is None for a in ats):
         raise VMError("ffi_fn: 'void' is not valid as an argument type")
     rt = _ctype(restype, "ffi_fn")
-    cfn.argtypes = ats
-    cfn.restype = rt
+    try:
+        # Resolving the symbol first gives a useful language error rather than
+        # a platform-specific CFUNCTYPE failure.
+        getattr(lib.handle, symbol)
+        prototype = ctypes.CFUNCTYPE(rt, *ats)
+        cfn = prototype((symbol, lib.handle))
+    except AttributeError:
+        raise VMError(
+            f"ffi_fn: library '{lib.path}' has no symbol '{symbol}'"
+        ) from None
+    except (OSError, TypeError, ValueError) as e:
+        raise VMError(f"ffi_fn: cannot bind '{symbol}': {e}") from None
     return _Fn(cfn, [str(a).lower() for a in argtypes], str(restype).lower(), symbol, lib)
 
 
@@ -166,11 +177,9 @@ def _coerce(value, tname, fname, index):
             bad("text")
         return value.encode("utf-8")
     if tname == "ptr":
-        if value is None:
-            return None
-        if isinstance(value, int) and type(value) is not bool:
-            bad("ptr (pointers come from foreign calls, not integers)")
-        return value
+        if value is None or isinstance(value, ctypes.c_void_p):
+            return value
+        bad("ptr (pointers come from foreign calls, not integers)")
     raise VMError(f"ffi_call: unsupported argument type '{tname}'")
 
 
@@ -189,14 +198,19 @@ def ffi_call(fn, args=None):
     converted = [_coerce(v, t, fn.name, i) for i, (v, t) in enumerate(zip(args, fn.argtypes))]
     try:
         result = fn.cfn(*converted)
-    except Exception as e:  # noqa: BLE001 - foreign code, anything can happen
-        raise VMError(f"ffi_call: {fn.name} failed: {e}") from e
+    except Exception as e:  # noqa: BLE001 - ctypes exposes platform-specific faults
+        raise VMError(f"ffi_call: {fn.name} failed: {e}") from None
     if fn.restype == "void":
         return None
     if fn.restype == "text":
         return result.decode("utf-8", "replace") if result is not None else None
     if fn.restype == "bool":
         return bool(result)
+    if fn.restype == "ptr":
+        # Keep the provenance-bearing ctypes object.  A later ptr argument can
+        # accept this object, but an AI-Lang integer can never be reinterpreted
+        # as an address.
+        return result if result is None or isinstance(result, ctypes.c_void_p) else ctypes.c_void_p(result)
     return result
 
 

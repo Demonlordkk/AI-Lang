@@ -32,6 +32,7 @@ _JUMP_TARGET_SLOT = {
     OPS["ITER_NEXT"]: 1,
     OPS["ITER_BREAK"]: 1,
     OPS["RANGE_NEXT"]: 1,
+    OPS["BREAK"]: 1,
     OPS["TRY_PUSH"]: 1,
 }
 

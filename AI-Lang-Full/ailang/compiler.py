@@ -139,6 +139,11 @@ class _Ctx:
         self.lines: Dict[int, int] = {}
         self.scope = scope if scope is not None else _FnScope(None, params)
         self.loops: List[dict] = []
+        # Number of runtime Environment frames currently active on the normal
+        # path.  Control-flow exits use this to unwind branch/loop frames
+        # before jumping, without changing the compile-time state used for the
+        # fall-through path.
+        self.scope_depth = 0
         self._hoisted: Dict[int, bool] = {}
         # 0 for the top-level context; sub-contexts (function bodies) set 1
         self._fn_depth = 0
@@ -264,13 +269,27 @@ class _Ctx:
         for br in s.branches:
             self.expr(br.cond)
             skip = self.emit("JUMP_IF_FALSE", None, line=s.line)
+            # Branch declarations are block-local in the checker.  Give each
+            # selected branch its own runtime frame so a binding cannot leak
+            # into a later branch or the enclosing block, and closures keep the
+            # correct defining environment.
+            self.emit("SCOPE_PUSH")
+            self.scope_depth += 1
             for x in br.body:
                 self.stmt(x)
+            self.emit("SCOPE_POP")
+            self.scope_depth -= 1
             end_jumps.append(self.emit("JUMP", None))
+            # A false condition skips both the branch body and its frame
+            # teardown; no frame was pushed on that path.
             self.patch(skip, self.here())
         if s.else_body is not None:
+            self.emit("SCOPE_PUSH")
+            self.scope_depth += 1
             for x in s.else_body:
                 self.stmt(x)
+            self.emit("SCOPE_POP")
+            self.scope_depth -= 1
         for j in end_jumps:
             self.patch(j, self.here())
 
@@ -281,13 +300,17 @@ class _Ctx:
         self.expr(s.cond)
         exit_jump = self.emit("JUMP_IF_FALSE", None, line=s.line)
         scoped = _declares(s.body)
-        self.loops.append({"continue": start, "breaks": [], "scoped": scoped})
+        loop_scope = self.scope_depth
+        self.loops.append({"continue": start, "breaks": [], "scoped": scoped,
+                           "scope_depth": loop_scope, "iterated": False})
         if scoped:
             self.emit("SCOPE_PUSH")
+            self.scope_depth += 1
         for x in s.body:
             self.stmt(x)
         if scoped:
             self.emit("SCOPE_POP")
+            self.scope_depth -= 1
         self.emit("JUMP", start)
         self.patch(exit_jump, self.here())
         frame = self.loops.pop()
@@ -313,13 +336,17 @@ class _Ctx:
             nxt = self.emit("RANGE_NEXT", None, s.name)
             self.scope.declare(s.name)
             scoped = _declares(s.body)
-            self.loops.append({"continue": start, "breaks": [], "scoped": scoped})
+            loop_scope = self.scope_depth
+            self.loops.append({"continue": start, "breaks": [], "scoped": scoped,
+                               "scope_depth": loop_scope, "iterated": True})
             if scoped:
                 self.emit("SCOPE_PUSH")
+                self.scope_depth += 1
             for x in s.body:
                 self.stmt(x)
             if scoped:
                 self.emit("SCOPE_POP")
+                self.scope_depth -= 1
             self.emit("JUMP", start)
             self.patch(nxt, self.here())
             frame = self.loops.pop()
@@ -335,13 +362,17 @@ class _Ctx:
         if s.index_name:
             self.scope.declare(s.index_name)
         scoped = _declares(s.body)
-        self.loops.append({"continue": start, "breaks": [], "scoped": scoped})
+        loop_scope = self.scope_depth
+        self.loops.append({"continue": start, "breaks": [], "scoped": scoped,
+                           "scope_depth": loop_scope, "iterated": True})
         if scoped:
             self.emit("SCOPE_PUSH")
+            self.scope_depth += 1
         for x in s.body:
             self.stmt(x)
         if scoped:
             self.emit("SCOPE_POP")
+            self.scope_depth -= 1
         self.emit("JUMP", start)
         self.patch(nxt, self.here())
         frame = self.loops.pop()
@@ -367,12 +398,14 @@ class _Ctx:
         """
         if not self.owner.lift_loops:
             return False
+        # Safe VM execution is the default.  Native loop source is only
+        # embedded in an in-memory ProgramCode when explicitly opted in.
+        from .native import enabled as native_enabled
+        if not native_enabled():
+            return False
         if self.fn_depth > 0:
             return False
-        from .native import try_compile_loop, enabled
-
-        if not enabled():
-            return False
+        from .native import try_compile_loop
         result = try_compile_loop(s, lambda n: True)
         if result is None:
             return False
@@ -385,19 +418,30 @@ class _Ctx:
     def _s_Stop(self, s):
         if not self.loops:
             raise CompileError("'stop' outside of a loop", s.line, s.col)
-        if self.loops[-1].get("scoped"):
+        # A stop/next may be nested in one or more block frames (for example a
+        # `when` inside a loop).  Unwind every frame created since the loop
+        # entry; the fall-through compile state is intentionally unchanged.
+        unwind = self.scope_depth - self.loops[-1]["scope_depth"]
+        for _ in range(max(0, unwind)):
             self.emit("SCOPE_POP")
-        j = self.emit("ITER_BREAK", None, line=s.line)
+        opcode = "ITER_BREAK" if self.loops[-1].get("iterated") else "BREAK"
+        j = self.emit(opcode, None, line=s.line)
         self.loops[-1]["breaks"].append(j)
 
     def _s_Next(self, s):
         if not self.loops:
             raise CompileError("'next' outside of a loop", s.line, s.col)
-        if self.loops[-1].get("scoped"):
+        unwind = self.scope_depth - self.loops[-1]["scope_depth"]
+        for _ in range(max(0, unwind)):
             self.emit("SCOPE_POP")
         self.emit("JUMP", self.loops[-1]["continue"], line=s.line)
 
     def _s_Attempt(self, s):
+        # `attempt` is a recoverable control-flow construct, not a lexical
+        # block: bindings made in its body remain available to the following
+        # code and rescue shares that same scope.  This is useful for parsing
+        # into a value and handling a failure immediately afterwards, and it is
+        # also the behavior of the language's existing examples.
         setup = self.emit("TRY_PUSH", None, s.error_name, line=s.line)
         for x in s.body:
             self.stmt(x)

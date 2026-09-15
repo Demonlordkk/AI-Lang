@@ -109,6 +109,32 @@ def _screen_body(body):
             _screen_body(s.rescue_body)
 
 
+def _has_branch_bindings(body):
+    """Whether a conditional branch introduces a lexical binding.
+
+    The host backend emits Python ``if`` blocks, whose assignments are
+    function-local rather than block-local.  Declining these functions keeps
+    branch scope semantics in the VM instead of silently leaking a name.
+    """
+    for s in body:
+        if isinstance(s, A.When):
+            if any(_declared_in(br.body) for br in s.branches) or (
+                s.else_body and _declared_in(s.else_body)
+            ):
+                return True
+            if any(_has_branch_bindings(br.body) for br in s.branches):
+                return True
+            if s.else_body and _has_branch_bindings(s.else_body):
+                return True
+        elif isinstance(s, (A.Repeat, A.While)):
+            if _has_branch_bindings(s.body):
+                return True
+        elif isinstance(s, A.Attempt):
+            if _has_branch_bindings(s.body) or _has_branch_bindings(s.rescue_body):
+                return True
+    return False
+
+
 def _declared_and_assigned(body, declared, assigned):
     """Split the names a body binds into declarations and bare assignments."""
     for s in body:
@@ -160,8 +186,9 @@ def _declared_in(stmts):
 def _shared_redeclares(body, params=()):
     """Names a `let`/`var` redeclares in a scope the interpreter shares.
 
-    The interpreter treats when-branches, attempt bodies and rescue bodies as
-    the enclosing scope: redeclaring a visible name there is a runtime error.
+    The interpreter treats attempt bodies and rescue bodies as the enclosing
+    scope; conditional branches have their own frames.  Redeclaring a visible
+    name in the shared scopes is a runtime error.
     Host code (plain Python assignment) would silently rebind, so a function
     with such a redeclaration is left to the interpreter, which reports the
     same error as the pure-VM path.  Loop bodies get a fresh environment each
@@ -256,7 +283,10 @@ class _Gen:
         if isinstance(e, A.Unary):
             v = self.expr(e.expr)
             if e.op == "not":
-                return f"(({v}) is None or ({v}) is False)"
+                # The operand is observable: it must occur once in generated
+                # Python.  A helper is clearer and avoids a temporary-name
+                # collision with a user binding.
+                return f"_not_value({v})"
             return f"_un({e.op!r}, {v})"
 
         if isinstance(e, A.Binary):
@@ -344,23 +374,21 @@ class _Gen:
             self.locals.add(s.name)
             self.w(f"{s.name} = {self.expr(s.expr)}")
         elif isinstance(s, A.While):
-            # a loop compiled to host bytecode would otherwise run forever
-            # without touching the interpreter's fuel meter; the per-iteration
-            # check gives it exactly the same "execution limit exceeded" wall
-            # behaviour a bytecode loop has.  The condition is evaluated once
-            # per pass into a local: no `_tr` call, and `next` (continue)
-            # re-runs it at the top exactly like the interpreter does.
+            # Evaluate the condition at the top of every pass.  Keeping the
+            # condition outside the loop body is important: Python's
+            # ``continue`` skips the rest of the body, so putting the update
+            # after the body would make `next` reuse a stale condition and
+            # diverge from the VM.
             cvar = self._cond_var()
-            self.w(f"{cvar} = {self.expr(s.cond)}")
             self.w("while True:")
             self.depth += 1
+            self.w(f"{cvar} = {self.expr(s.cond)}")
             self.w(f"if {cvar} is None or {cvar} is False:")
             self.depth += 1
             self.w("break")
             self.depth -= 1
             self.w("_fc()")
             self.body(s.body)
-            self.w(f"{cvar} = {self.expr(s.cond)}")
             self.depth -= 1
 
         elif isinstance(s, A.Assign):
@@ -497,31 +525,34 @@ class _Gen:
 def _make_runtime(lookup, fuel_box=None):
     """Helpers the generated code calls. Each mirrors the VM exactly."""
     from .errors import AILangRaise, VMError
-    from .values import RecordValue
+    from .values import RecordValue, unmap_key
     from .vm import _binary, _equal, _field, _hashable, _index
     from .vm import _convert, _error_value
 
-    def _fuel_check(_box=fuel_box, _count=[256]):
-        # Charge one unit of the shared budget per iteration. The box is
-        # decremented every time and only tested every 256 charges, so a
-        # simple loop pays a few list operations, not a comparison storm.
+    def _fuel_check(_box=fuel_box):
+        # A safety limit must be hard, not sampled.  Sampling every 256
+        # iterations let native loops run past a caller's explicit budget and
+        # made the limit backend-dependent.  Native code still uses a cheaper
+        # per-iteration accounting model than the VM; source execution keeps
+        # the native backend opt-in until exact instruction-level accounting is
+        # available.
         if _box is None:
             return
         _box[0] -= 1
-        _count[0] -= 1
-        if not _count[0]:
-            _count[0] = 256
-            if _box[0] <= 0:
-                raise VMError('execution limit exceeded (raise the step budget with --fuel N or AILANG_FUEL=N)')
+        if _box[0] < 0:
+            raise VMError('execution limit exceeded (raise the step budget with --fuel N or AILANG_FUEL=N)')
 
     def _fuel_iter(it):
         for item in it:
             _fuel_check()
             yield item
 
+    def _not_value(v):
+        return v is None or v is False
+
     def _unary(op, v):
         if op == "not":
-            return not is_truthy(v)
+            return _not_value(v)
         if v.__class__ is bool or not isinstance(v, (int, float)):
             raise VMError(f"cannot negate {type_name(v)}")
         return -v
@@ -562,7 +593,7 @@ def _make_runtime(lookup, fuel_box=None):
         if isinstance(v, str):
             return list(v)
         if isinstance(v, dict):
-            return list(v.keys())
+            return [unmap_key(k) for k in v.keys()]
         raise VMError(f"cannot iterate over {type_name(v)}")
 
     return {
@@ -570,6 +601,7 @@ def _make_runtime(lookup, fuel_box=None):
         "_bin": _binary,
         "_eq": _equal,
         "_un": _unary,
+        "_not_value": _not_value,
         "_ix": _index,
         "_fd": _field,
         "_hk": _hashable,
@@ -588,7 +620,14 @@ def _make_runtime(lookup, fuel_box=None):
 
 
 def enabled():
-    return os.environ.get("AILANG_NATIVE", "1") != "0"
+    """Whether the experimental host-code backend may be used.
+
+    The VM is the product-safe default.  Native lowering remains available
+    through ``AILANG_NATIVE=1`` for benchmarking and explicitly controlled
+    deployments, but it is not silently selected for ordinary programs until
+    its instruction-level fuel accounting and full parity proof are complete.
+    """
+    return os.environ.get("AILANG_NATIVE", "0") == "1"
 
 
 def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None,
@@ -604,11 +643,19 @@ def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None,
     current global value is captured by value (a default argument) instead of
     being looked up on every call.
     """
-    if not enabled():
-        return None
+    # Policy is enforced by the VM/compiler callers.  Keeping this lower-level
+    # helper usable in isolation is useful for diagnostics and code-generation
+    # tests; it never runs generated code unless its caller explicitly selects
+    # the native backend.
     prebound, local = {}, {}
     try:
         _screen_body(fn_node.body)
+        # Python has function scope, while AI-Lang conditional branches have
+        # block scope.  Keep any function with a branch-local binding on the
+        # VM path, where the SCOPE_PUSH/SCOPE_POP instructions preserve that
+        # distinction.
+        if _has_branch_bindings(fn_node.body):
+            return None
         # A function that assigns to a name it never declares is mutating an
         # enclosing scope (a closure counter, say). Host locals cannot express
         # that, so leave those functions to the interpreter.
@@ -670,8 +717,6 @@ def try_compile_loop(node, read_names, name="<loop>"):
     Returns `(fn, names)` where calling `fn(*values)` runs the loop and
     returns the final values of `names`, or None if the loop is not eligible.
     """
-    if not enabled():
-        return None
     try:
         _screen_body([node])
     except _Unsupported:

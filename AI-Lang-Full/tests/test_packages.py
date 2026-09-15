@@ -128,6 +128,29 @@ def test_manifest_must_declare_name_and_version(tmp_path):
         Registry(tmp_path / "reg").publish(d)
 
 
+def test_package_json_rejects_duplicate_keys(tmp_path):
+    d = tmp_path / "bad"
+    d.mkdir()
+    (d / "ailang.package.json").write_text(
+        '{"name":"x","name":"y","version":"1.0.0"}', encoding="utf-8"
+    )
+    with pytest.raises(PackageError, match="duplicate"):
+        Registry(tmp_path / "reg").publish(d)
+
+
+def test_package_symlinks_are_refused(tmp_path):
+    outside = tmp_path / "outside.al"
+    outside.write_text("fn secret() -> Int:\n    give 1.\ndone.\n", encoding="utf-8")
+    d = _pkg(tmp_path, "linked", "1.0.0")
+    link = d / "linked.al"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(PackageError, match="symlink"):
+        digest_dir(d)
+
+
 # ------------------------------------------------------------------ resolver
 
 

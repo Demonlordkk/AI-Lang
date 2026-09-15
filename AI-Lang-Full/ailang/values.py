@@ -3,6 +3,69 @@
 from __future__ import annotations
 
 
+class MapKey:
+    """Hashable wrapper that preserves a structural list map key.
+
+    Python tuples are a convenient implementation detail but exposing them to
+    AI-Lang would change a key back into a different value when ``keys`` or
+    map iteration is used.  The wrapper compares by a recursive immutable form
+    while retaining the original list for display and iteration.
+    """
+
+    __slots__ = ("raw", "canonical")
+
+    def __init__(self, raw):
+        # A map key must be immutable after insertion.  Keep a detached
+        # structural snapshot for display/iteration so mutating the original
+        # AI-Lang list cannot invalidate the dictionary's hash invariant.
+        self.raw = _snapshot_key(raw)
+        self.canonical = tuple(_canonical_key(x) for x in self.raw)
+
+    def __hash__(self):
+        return hash(("List", self.canonical))
+
+    def __eq__(self, other):
+        return isinstance(other, MapKey) and self.canonical == other.canonical
+
+    def __repr__(self):
+        return display(self.raw)
+
+
+def _snapshot_key(v):
+    if isinstance(v, MapKey):
+        return _snapshot_key(v.raw)
+    if isinstance(v, list):
+        return [_snapshot_key(x) for x in v]
+    if isinstance(v, dict):
+        raise TypeError("a Map cannot be used as a Map key")
+    return v
+
+
+def _canonical_key(v):
+    if isinstance(v, MapKey):
+        return v.canonical
+    if isinstance(v, list):
+        return ("List", tuple(_canonical_key(x) for x in v))
+    if isinstance(v, dict):
+        raise TypeError("a Map cannot be used as a Map key")
+    if isinstance(v, bool):
+        return ("Bool", v)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        # AI-Lang numeric equality treats Int and Real as equal.
+        return ("Number", v)
+    if v is None:
+        return ("Nothing",)
+    try:
+        hash(v)
+    except TypeError:
+        raise TypeError(f"{type(v).__name__} cannot be used as a Map key") from None
+    return (type(v).__name__, v)
+
+
+def unmap_key(v):
+    return v.raw if isinstance(v, MapKey) else v
+
+
 class RecordType:
     """A record declaration; calling it constructs a RecordValue."""
 
@@ -114,7 +177,7 @@ def display(v) -> str:
         return repr(v)
     if isinstance(v, str):
         return v
-    if isinstance(v, list):
+    if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_nested(x) for x in v) + "]"
     if isinstance(v, dict):
         return "{" + ", ".join(f"{_nested(k)}: {_nested(x)}" for k, x in v.items()) + "}"
@@ -132,6 +195,21 @@ def _nested(v) -> str:
         escaped = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
         return f'"{escaped}"'
     return display(v)
+
+
+def hashable_key(v):
+    """Return the canonical Python representation of an AI-Lang map key."""
+    if isinstance(v, MapKey):
+        return v
+    if isinstance(v, list):
+        return MapKey(v)
+    if isinstance(v, dict):
+        raise TypeError("a Map cannot be used as a Map key")
+    try:
+        hash(v)
+    except TypeError:
+        raise TypeError(f"{type(v).__name__} cannot be used as a Map key") from None
+    return v
 
 
 def type_name(v) -> str:

@@ -338,7 +338,7 @@ BUILTIN_SIGS = {
     "uuid": ([], TEXT),
     "spawn": ([("fn", FUNCTION), ("arg", ANY)], ANY, 1),
     "await_all": ([("tasks", LIST)], LIST),
-    "await": ([("task", ANY)], ANY),
+    "await": ([("task", ANY), ("timeout", ANY)], ANY, 1),
     "t_matmul_bias": ([("a", ANY), ("b", ANY), ("c", ANY)], ANY),
     "ce_softmax_t": ([("logits", ANY), ("y", ANY)], ANY),
     "t_dropout": ([("x", ANY), ("rate", REAL), ("training", BOOL)], ANY, 1),
@@ -360,7 +360,7 @@ BUILTIN_SIGS = {
     "channel_close": ([("c", MAP)], VOID),
     "http_get": ([("url", TEXT), ("headers", MAP)], MAP, 1),
     "http_post": ([("url", TEXT), ("body", ANY), ("headers", MAP)], MAP, 2),
-    "http_request": ([("url", TEXT), ("method", TEXT), ("body", ANY), ("headers", MAP), ("verify", BOOL), ("timeout", ANY)], MAP, 2),
+    "http_request": ([("url", TEXT), ("method", TEXT), ("body", ANY), ("headers", MAP), ("verify", BOOL), ("timeout", ANY)], MAP, 4),
 }
 
 
@@ -462,14 +462,17 @@ def _builtin_globals():
 
 
 def _builtin_sigs():
-    """BUILTIN_SIGS reconciled against the *real* implementations: each
-    declared parameter name is replaced by the name at the same position in
-    the Python function, and implementations that take *args are marked
+    """Reconcile public signatures with the real implementations.
+
+    The implementation supplies reliable arity and default information, while
+    ``BUILTIN_SIGS`` remains the source of public AI-Lang parameter names.  A
+    Python helper may use short/private names such as ``v`` without changing
+    the language API.  Implementations that take ``*args`` are marked
     variadic (named arguments are rejected for them at check time).
 
-    This keeps the checker and the runtime from drifting: a named argument
-    that passes the checker is guaranteed to exist on the real function, so
-    `f(x: 1)` / `x |> f(a: 1)` can never leak a raw Python TypeError.
+    This keeps the checker and runtime from drifting: a named argument that
+    passes the checker is guaranteed to exist in the documented AI-Lang
+    signature, and the VM's runtime guard still protects unchecked calls.
     """
     global _BUILTIN_SIGS
     if _BUILTIN_SIGS is None:
@@ -490,11 +493,35 @@ def _builtin_sigs():
                     if any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in psig):
                         variadic = True
                     else:
-                        real = [p.name for p in psig]
-                        params = [
-                            (real[i] if i < len(real) else pn, pt)
-                            for i, (pn, pt) in enumerate(params)
+                        # Derive both names and optionality from the callable
+                        # that the VM will actually invoke.  Keeping the
+                        # hand-written arity while a builtin gains a default
+                        # argument was the source of several checker/runtime
+                        # mismatches (notably http_request and await).
+                        real = [
+                            p for p in psig
+                            if p.kind in (
+                                p.POSITIONAL_ONLY,
+                                p.POSITIONAL_OR_KEYWORD,
+                                p.KEYWORD_ONLY,
+                            )
                         ]
+                        # The language-level names are the public API and
+                        # may intentionally differ from private implementation
+                        # names (for example `value` versus Python's `v`).
+                        # Reconcile arity/optionality by position, but do not
+                        # silently rename a documented AI-Lang parameter.
+                        public = list(params)
+                        params = [
+                            (
+                                public[i][0] if i < len(public) else p.name,
+                                public[i][1] if i < len(public) else ANY,
+                            )
+                            for i, p in enumerate(real)
+                        ]
+                        optional = sum(
+                            p.default is not inspect.Parameter.empty for p in real
+                        )
             out[name] = FnSig(params, ret, name, optional, variadic)
         _BUILTIN_SIGS = out
     return _BUILTIN_SIGS
@@ -601,10 +628,10 @@ class TypeChecker:
                     for _f, ftype in s.fields:
                         if not ok(ftype):
                             self._unknown_type(ftype, s)
-                elif isinstance(s, A.Let):
+                elif isinstance(s, (A.Let, A.Var)):
                     if not ok(getattr(s, "declared_type", None)):
                         self._unknown_type(s.declared_type, s)
-                    # lambdas bound in a let carry their own annotations
+                    # lambdas bound in a binding carry their own annotations
                     if isinstance(s.expr, A.FnExpr):
                         check_fn_like(s.expr)
                     elif isinstance(s.expr, A.Call):
@@ -791,15 +818,23 @@ class TypeChecker:
             return
 
         if isinstance(s, A.Attempt):
-            self.push()
+            # `attempt` does not introduce a lexical block.  Its body, rescue
+            # clause, and following statements share the enclosing scope; this
+            # lets a parsed value survive a recoverable failure and matches the
+            # VM's recovery environment.
             for x in s.body:
                 self.stmt(x)
-            self.pop()
-            self.push()
+            if self.scope.local(s.error_name) and not (
+                self.scope is self.global_scope and s.error_name in BUILTIN_SIGS
+            ):
+                self.error(
+                    f"'{s.error_name}' is already defined in this scope; "
+                    "choose a different rescue name",
+                    s,
+                )
             self.scope.declare(s.error_name, ANY, False)
             for x in s.rescue_body:
                 self.stmt(x)
-            self.pop()
             return
 
         self.error(f"unsupported statement {type(s).__name__}", s)
@@ -809,25 +844,43 @@ class TypeChecker:
         self.return_stack.append(ret)
         saved_loop = self.loop_depth
         self.loop_depth = 0
+
+        # Function declarations are lexical.  The old checker kept nested
+        # declarations in the shared ``self.functions`` dictionary, so a name
+        # declared inside one function could be called from an unrelated outer
+        # scope.  Keep a private registry while checking this body and restore
+        # the enclosing registry even when diagnostics are raised later.
+        saved_functions = self.functions
+        saved_records = self.records
+        saved_modules = self.modules
+        self.functions = dict(saved_functions)
+        self.records = dict(saved_records)
+        self.modules = dict(saved_modules)
         self.push("function")
-        seen = set()
-        for pname, ptype in params:
-            if pname in seen:
-                self.error(f"function '{name}' has a duplicate parameter '{pname}'", node)
-            seen.add(pname)
-            self.scope.declare(pname, ty(ptype), False)
-        # nested declarations are visible within the function body
-        self.hoist(body, self.scope)
-        for x in body:
-            self.stmt(x)
-        self.pop()
-        self.loop_depth = saved_loop
-        self.return_stack.pop()
-        if return_type and return_type != "Void" and not self.always_returns(body):
-            self.error(
-                f"function '{name}' declares -> {return_type} but can finish without 'give'",
-                node,
-            )
+        try:
+            seen = set()
+            for pname, ptype in params:
+                if pname in seen:
+                    self.error(f"function '{name}' has a duplicate parameter '{pname}'", node)
+                seen.add(pname)
+                self.scope.declare(pname, ty(ptype), False)
+            # nested declarations are visible within the function body, but
+            # only while that function is being checked.
+            self.hoist(body, self.scope)
+            for x in body:
+                self.stmt(x)
+            if return_type and return_type != "Void" and not self.always_returns(body):
+                self.error(
+                    f"function '{name}' declares -> {return_type} but can finish without 'give'",
+                    node,
+                )
+        finally:
+            self.pop()
+            self.functions = saved_functions
+            self.records = saved_records
+            self.modules = saved_modules
+            self.loop_depth = saved_loop
+            self.return_stack.pop()
 
     def always_returns(self, body) -> bool:
         for s in body:
@@ -1030,8 +1083,25 @@ class TypeChecker:
         return ANY
 
     def check_arity(self, sig: FnSig, arg_types, node, is_record=False):
-        positional = [t for name, t in arg_types if name is None]
-        named = {name: t for name, t in arg_types if name is not None}
+        # Preserve source order here instead of collapsing named arguments into
+        # a dict immediately.  This catches duplicate names and the ambiguous
+        # ``f(a: 1, 2)`` form before the VM would have to guess how to bind it.
+        positional = []
+        named = []
+        saw_named = False
+        for name, t in arg_types:
+            if name is None:
+                if saw_named:
+                    self.error(
+                        f"function '{sig.name}' does not allow a positional argument after a named argument",
+                        node,
+                    )
+                    return
+                positional.append(t)
+            else:
+                saw_named = True
+                named.append((name, t))
+
         if sig.variadic:
             if named:
                 self.error(f"function '{sig.name}' takes positional arguments only", node)
@@ -1043,6 +1113,27 @@ class TypeChecker:
                 )
                 return
             return
+
+        param_names = [p[0] for p in sig.params]
+        types_by_name = dict(sig.params)
+        seen_named = set()
+        for key, _at in named:
+            if key not in types_by_name:
+                self.error(f"'{sig.name}' has no parameter named '{key}'", node)
+                return
+            if key in seen_named:
+                self.error(f"duplicate value for parameter '{key}'", node)
+                return
+            seen_named.add(key)
+
+        # A named argument cannot fill a slot already occupied by a
+        # positional argument.  Positional arguments always bind from the
+        # left, as they do in Closure.invoke and Python builtins.
+        for key, _at in named:
+            if param_names.index(key) < len(positional):
+                self.error(f"duplicate value for parameter '{key}'", node)
+                return
+
         total = len(positional) + len(named)
         low, high = sig.required, len(sig.params)
         if not (low <= total <= high):
@@ -1053,19 +1144,25 @@ class TypeChecker:
                 node,
             )
             return
-        param_names = [p[0] for p in sig.params]
-        for key in named:
-            if key not in param_names:
-                self.error(f"'{sig.name}' has no parameter named '{key}'", node)
-                return
+
+        # Count alone is insufficient for optional signatures: ``round(digits:
+        # 2)`` has one argument but is still missing its required value.
+        bound = set(param_names[: len(positional)]) | seen_named
+        missing = [p for p in param_names[:low] if p not in bound]
+        if missing:
+            self.error(
+                f"function '{sig.name}' is missing required parameter(s): {', '.join(missing)}",
+                node,
+            )
+            return
+
         for (pname, ptype), at in zip(sig.params, positional):
             if not self.compatible(ptype, at):
                 self.error(
                     f"argument '{pname}' of '{sig.name}' expects {ptype} but got {at}", node
                 )
-        types_by_name = dict(sig.params)
-        for key, at in named.items():
-            ptype = types_by_name.get(key, ANY)
+        for key, at in named:
+            ptype = types_by_name[key]
             if not self.compatible(ptype, at):
                 self.error(f"argument '{key}' of '{sig.name}' expects {ptype} but got {at}", node)
 

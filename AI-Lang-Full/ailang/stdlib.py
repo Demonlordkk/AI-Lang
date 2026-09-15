@@ -7,6 +7,7 @@ AI-Lang errors instead of leaking Python exceptions.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import math
@@ -20,9 +21,10 @@ import queue as _queue
 import threading as _threading
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 from .errors import AILangRaise, VMError
-from .values import Module, RecordValue, display, is_truthy, type_name
+from .values import Module, RecordValue, display, hashable_key, is_truthy, type_name, unmap_key
 
 
 def _need_list(v, fname, argname="items"):
@@ -338,7 +340,7 @@ def _range_from(start, stop, step=1):
 
 # ------------------------------------------------------------------ maps
 def _keys(m):
-    return list(_need_map(m, "keys").keys())
+    return [unmap_key(k) for k in _need_map(m, "keys").keys()]
 
 
 def _values(m):
@@ -346,12 +348,19 @@ def _values(m):
 
 
 def _entries(m):
-    return [[k, v] for k, v in _need_map(m, "entries").items()]
+    return [[unmap_key(k), v] for k, v in _need_map(m, "entries").items()]
+
+
+def _map_key(key, fname):
+    try:
+        return hashable_key(key)
+    except TypeError as e:
+        raise VMError(f"{fname}: {e}") from None
 
 
 def _has(m, key):
     if isinstance(m, dict):
-        return key in m
+        return _map_key(key, "has") in m
     if isinstance(m, list):
         return any(_eq(x, key) for x in m)
     if isinstance(m, RecordValue):
@@ -361,7 +370,7 @@ def _has(m, key):
 
 def _get(m, key, default=None):
     if isinstance(m, dict):
-        return m.get(key, default)
+        return m.get(_map_key(key, "get"), default)
     if isinstance(m, list):
         if isinstance(key, int) and not isinstance(key, bool) and -len(m) <= key < len(m):
             return m[key]
@@ -373,13 +382,13 @@ def _get(m, key, default=None):
 
 def _set(m, key, value):
     out = dict(_need_map(m, "set"))
-    out[key] = value
+    out[_map_key(key, "set")] = value
     return out
 
 
 def _remove(m, key):
     out = dict(_need_map(m, "remove"))
-    out.pop(key, None)
+    out.pop(_map_key(key, "remove"), None)
     return out
 
 
@@ -396,7 +405,7 @@ def _json_safe(v):
     if isinstance(v, list):
         return [_json_safe(x) for x in v]
     if isinstance(v, dict):
-        return {str(k): _json_safe(x) for k, x in v.items()}
+        return {display(unmap_key(k)): _json_safe(x) for k, x in v.items()}
     if callable(v):
         raise VMError("json_encode: cannot encode a function")
     return v
@@ -423,18 +432,17 @@ def _json_decode(text):
 # Relative paths in a program resolve against the directory of the program
 # that used them, not whatever directory the shell happened to be in. A
 # script is therefore portable: it behaves the same from anywhere.
-_SCRIPT_DIR = None
+_SCRIPT_DIR = contextvars.ContextVar("ailang_script_dir", default=None)
 
 
 def set_script_dir(path):
-    """Set the base directory relative paths resolve against."""
-    global _SCRIPT_DIR
-    _SCRIPT_DIR = os.fspath(path) if path is not None else None
+    """Set the base directory relative paths resolve against for this context."""
+    _SCRIPT_DIR.set(os.fspath(path) if path is not None else None)
 
 
 def script_dir():
     """Current script directory (the one relative paths resolve against)."""
-    return _SCRIPT_DIR
+    return _SCRIPT_DIR.get()
 
 
 def _resolve(path):
@@ -445,11 +453,12 @@ def _resolve(path):
     to the working directory, that is used instead so existing shell-relative
     invocations keep working.
     """
-    if not isinstance(path, str) or _SCRIPT_DIR is None:
+    base = _SCRIPT_DIR.get()
+    if not isinstance(path, str) or base is None:
         return path
     if os.path.isabs(path):
         return path
-    candidate = os.path.join(_SCRIPT_DIR, path)
+    candidate = os.path.join(base, path)
     if os.path.exists(candidate):
         return candidate
     if os.path.exists(path):
@@ -559,72 +568,163 @@ def _http_post(url, body=None, headers=None):
     return _http_request(url, "POST", body, headers)
 
 
+_MAX_HTTP_BODY = 16 * 1024 * 1024
+
+
 def _http_request(url, method, body=None, headers=None, verify=True, timeout=30):
     _need_text(url, "http", "url")
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+    except ValueError as e:
+        raise VMError(f"http: invalid URL: {e}") from None
+    if scheme not in {"http", "https"} or not hostname:
+        raise VMError("http: url must be an http:// or https:// URL with a host")
+    if not isinstance(method, str) or not method or any(
+        not (ch.isalpha() or ch in "-_") for ch in method
+    ):
+        raise VMError("http: method must be non-empty Text")
+    if type(verify) is not bool:
+        raise VMError("http: verify must be a Bool")
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError("http: timeout must be a finite positive number") from None
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 24 * 60 * 60:
+        raise VMError("http: timeout must be a finite positive number")
+
     data = None
-    hdrs = {"User-Agent": "AI-Lang/2.0"}
-    if headers:
-        hdrs.update({str(k): str(v) for k, v in _need_map(headers, "http", "headers").items()})
+    hdrs = {"User-Agent": "AI-Lang/2.10"}
+    if headers is not None:
+        supplied = _need_map(headers, "http", "headers")
+        for key, value in supplied.items():
+            if not isinstance(key, str) or not key or any(
+                ord(ch) < 33 or ord(ch) > 126 or ch in ":()<>@,;\\\"/[]?={} \t"
+                for ch in key
+            ):
+                raise VMError("http: header names must be valid Text tokens")
+            text_value = str(value)
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in text_value):
+                raise VMError("http: header values cannot contain control characters")
+            hdrs[key] = text_value
     if body is not None:
         if isinstance(body, (dict, list)):
-            data = _json_encode(body).encode()
+            data = _json_encode(body).encode("utf-8")
             hdrs.setdefault("Content-Type", "application/json")
+        elif isinstance(body, str):
+            data = body.encode("utf-8")
+        elif isinstance(body, (bytes, bytearray, memoryview)):
+            data = bytes(body)
         else:
-            data = display(body).encode()
+            raise VMError("http: body must be Text, bytes, a List, or a Map")
+        if len(data) > _MAX_HTTP_BODY:
+            raise VMError("http: request body is too large")
+
     ctx = None
-    if str(url).startswith("https") and not verify:
+    if scheme == "https" and not verify:
         import ssl
 
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=hdrs)
+
+    def read_limited(stream):
+        raw = stream.read(_MAX_HTTP_BODY + 1)
+        if len(raw) > _MAX_HTTP_BODY:
+            raise VMError("http: response body is too large")
+        return raw.decode("utf-8", "replace")
+
     try:
-        with urllib.request.urlopen(req, timeout=float(timeout), context=ctx) as r:
-            raw = r.read().decode("utf-8", "replace")
-            return {"status": r.status, "body": raw, "headers": dict(r.headers)}
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as response:
+            return {
+                "status": response.status,
+                "body": read_limited(response),
+                "headers": dict(response.headers),
+            }
     except urllib.error.HTTPError as e:
-        return {"status": e.code, "body": e.read().decode("utf-8", "replace"), "headers": {}}
-    except Exception as e:
-        raise VMError(f"http {method.lower()}: {e}") from e
+        return {"status": e.code, "body": read_limited(e), "headers": {}}
+    except VMError:
+        raise
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise VMError(f"http {method.lower()}: {e}") from None
 
 
 # ------------------------------------------------------------------ concurrency
 _POOL = None
+_POOL_LOCK = _threading.Lock()
 
 
 def _pool():
     global _POOL
     if _POOL is None:
-        _POOL = ThreadPoolExecutor(max_workers=8)
+        with _POOL_LOCK:
+            if _POOL is None:
+                _POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ailang")
     return _POOL
+
+
+def _isolated_call(fn, args):
+    """Invoke a language closure with a child VM execution context.
+
+    The captured Environment is shared deliberately (mutexes/channels make
+    shared mutable state explicit), but operand stacks, fuel counters, native
+    helper caches, recursion depth and module state are private to the worker.
+    """
+    try:
+        from .vm import Closure
+    except ImportError:
+        Closure = ()
+    if isinstance(fn, Closure):
+        child_vm = fn.vm.fork()
+        fn = Closure(fn.code, fn.env, child_vm, fn.program)
+    return fn(*args)
+
+
+def _submit(fn, args):
+    # ContextVars do not implicitly cross a ThreadPoolExecutor boundary.  The
+    # copied context preserves the script directory for relative file/database
+    # paths without reintroducing a process-global base directory.
+    context = contextvars.copy_context()
+    return _pool().submit(context.run, _isolated_call, fn, tuple(args))
 
 
 def _spawn(fn, *args):
     _need_fn(fn, "spawn")
-    return _pool().submit(fn, *args)
+    return _submit(fn, args)
+
+
+def _task_timeout(timeout, where):
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError(f"{where}: timeout must be a non-negative number") from None
+    if not math.isfinite(value) or value < 0:
+        raise VMError(f"{where}: timeout must be a non-negative finite number")
+    return value
 
 
 def _await_all(tasks):
     tasks = _need_list(tasks, "await_all", "tasks")
     out = []
     for t in tasks:
-        if hasattr(t, "result"):
+        if hasattr(t, "result") and callable(t.result):
             try:
                 out.append(t.result(timeout=120))
             except Exception as e:
                 raise VMError(f"await_all: task failed: {e}") from e
         else:
-            out.append(t)
+            raise VMError("await_all: every item must be a task returned by spawn")
     return out
 
 
 def _await_task(task, timeout=120):
     """Wait for one spawn task and return its result."""
-    if not hasattr(task, "result"):
+    if not hasattr(task, "result") or not callable(task.result):
         raise VMError("await: argument must be a task returned by spawn")
     try:
-        return task.result(timeout=timeout)
+        return task.result(timeout=_task_timeout(timeout, "await"))
     except Exception as e:  # noqa: BLE001 - report the task's fault
         raise VMError(f"await: task failed: {e}") from e
 
@@ -1208,15 +1308,17 @@ def _parallel_map(items, fn, workers=8):
     _need_fn(fn, "parallel_map")
     if not items:
         return []
-    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-        futures = [pool.submit(fn, x) for x in items]
-        out = []
-        for f in futures:
-            try:
-                out.append(f.result(timeout=300))
-            except Exception as e:
-                raise VMError(f"parallel_map: {e}") from e
-        return out
+    workers = int(workers)
+    if workers < 1 or workers > 256:
+        raise VMError("parallel_map: workers must be between 1 and 256")
+    futures = [_submit(fn, (x,)) for x in items]
+    out = []
+    for f in futures:
+        try:
+            out.append(f.result(timeout=300))
+        except Exception as e:
+            raise VMError(f"parallel_map: {e}") from e
+    return out
 
 
 def _retry(fn, attempts=3, delay=0.5):
@@ -1922,9 +2024,10 @@ def _field_of(obj, name):
 
 
 def _hashable_key(v):
-    if isinstance(v, (list, dict)):
-        return display(v)
-    return v
+    try:
+        return hashable_key(v)
+    except TypeError as e:
+        raise VMError(str(e)) from None
 
 
 def _sort_desc(items):
@@ -1949,6 +2052,79 @@ def _counts(items):
         k = _hashable_key(x)
         out[k] = out.get(k, 0) + 1
     return out
+
+
+# Public AI-Lang names for helpers whose concise implementation parameter
+# names are not part of the language API. VM.call_value translates these
+# aliases for named calls; positional calls remain untouched.
+_PUBLIC_PARAM_ALIASES = {
+    "type_of": {"value": "v"},
+    "str": {"value": "v"},
+    "bool": {"value": "v"},
+    "is_tensor": {"value": "v"},
+    "backward": {"loss": "t"},
+    "t_reshape": {"shape": "s"},
+    "t_slice": {"t": "a"},
+    "t_gather": {"t": "a", "indices": "idx"},
+    "t_clip": {"t": "a", "low": "lo", "high": "hi"},
+    "where_t": {"a": "x", "b": "y"},
+    "l2_norm_t": {"t": "a"},
+    "bce_logits_t": {"target": "y"},
+    "huber_t": {"pred": "p", "target": "y"},
+    "mse_t": {"pred": "p", "target": "y"},
+    "mae_t": {"pred": "p", "target": "y"},
+    "bce_t": {"pred": "p", "target": "y"},
+    "ce_t": {"logits": "p", "target": "y"},
+    "json_encode": {"value": "v"},
+    "canvas_size": {"canvas": "c"},
+    "canvas_fill": {"canvas": "c"},
+    "canvas_save": {"canvas": "c"},
+    "pixel": {"canvas": "c"},
+    "rect": {"canvas": "c"},
+    "line": {"canvas": "c"},
+    "circle": {"canvas": "c"},
+    "text": {"canvas": "c"},
+    "store_get": {"fallback": "default"},
+    "panic": {"message": "msg"},
+    "gradcheck": {"loss_fn": "fn"},
+}
+
+
+def _install_public_params(env):
+    """Attach non-invasive keyword metadata to exported Python helpers."""
+    import inspect
+
+    for name, aliases in _PUBLIC_PARAM_ALIASES.items():
+        fn = env.get(name)
+        if fn is None or not callable(fn):
+            continue
+        try:
+            signature = inspect.signature(fn)
+            parameters = list(signature.parameters.values())
+            actual = [
+                p.name
+                for p in parameters
+                if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            ]
+            reverse = {real: public for public, real in aliases.items()}
+            public = tuple(reverse.get(param, param) for param in actual)
+            fn._ailang_param_aliases = dict(aliases)
+            fn._ailang_public_params = public
+            # inspect.signature honours __signature__, which keeps diagnostics
+            # and third-party introspection aligned with the public language
+            # API even when the Python helper uses terse local names.
+            if len(actual) == len(public):
+                translated = iter(public)
+                fn.__signature__ = signature.replace(
+                    parameters=[
+                        p.replace(name=next(translated))
+                        if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+                        else p
+                        for p in parameters
+                    ]
+                )
+        except (AttributeError, TypeError, ValueError):
+            pass
 
 
 def build_globals(argv=None):
@@ -2269,6 +2445,7 @@ def build_globals(argv=None):
         "channel_try_recv": _channel_try_recv,
         "channel_close": _channel_close,
     }
+    _install_public_params(env)
     for name, fn in env.items():
         try:
             fn.ailang_name = name

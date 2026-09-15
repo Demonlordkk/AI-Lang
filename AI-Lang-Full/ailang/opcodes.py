@@ -32,7 +32,7 @@ _NAMES = [
     "CALL", "CALL_KW", "CLOSURE", "RETURN", "RETURN_NONE",
     # iteration
     "ITER_INIT", "ITER_NEXT", "ITER_BREAK", "ITER_END",
-    "RANGE_INIT", "RANGE_NEXT",
+    "RANGE_INIT", "RANGE_NEXT", "BREAK",
     # scopes
     "SCOPE_PUSH", "SCOPE_POP",
     # errors

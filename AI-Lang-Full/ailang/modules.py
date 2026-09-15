@@ -1,16 +1,47 @@
-"""Module loading for AI-Lang.
+"""Safe module loading for AI-Lang.
 
-`use math/stats as stats.` resolves to `math/stats.al` relative to the
-importing file, then the project root. Modules are cached and cycle-safe.
+``use math/stats as stats.`` resolves to ``math/stats.al`` relative to the
+importing project/search roots.  Modules are cached by their canonical file
+path and cycle-safe.  Import names are language identifiers, never arbitrary
+filesystem paths, so ``..``, absolute paths, backslashes, and symlink escapes
+cannot turn an import into a file-read primitive.
 """
 
 from __future__ import annotations
 
+import re
+import threading
 from pathlib import Path
 from typing import Dict, List
 
 from .errors import AILangError, ImportError_
 from .values import Module
+
+
+_MODULE_PART = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _module_parts(path: str) -> List[str]:
+    """Validate and split a source-level module name."""
+    if not isinstance(path, str) or not path:
+        raise ImportError_("module name must be non-empty Text")
+    if path.startswith(("/", "\\")) or "\\" in path:
+        raise ImportError_(f"invalid module name '{path}': use identifier segments separated by '/'")
+    parts = path.split("/")
+    if any(not part or part in {".", ".."} or not _MODULE_PART.fullmatch(part) for part in parts):
+        raise ImportError_(
+            f"invalid module name '{path}': use identifier segments separated by '/'"
+        )
+    return parts
+
+
+def _inside(path: Path, root: Path) -> bool:
+    """Whether canonical ``path`` stays below canonical ``root``."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 class ModuleLoader:
@@ -19,64 +50,94 @@ class ModuleLoader:
         self.globals_factory = globals_factory
         self.cache: Dict[str, Module] = {}
         self.loading: List[str] = []
+        # Module execution mutates the shared cache/loading stack.  A
+        # re-entrant lock makes concurrent handlers/tasks see one complete
+        # module load and still permits a same-thread import chain.
+        self._lock = threading.RLock()
         from .vm import fuel_default
 
         self.fuel = fuel if fuel is not None else fuel_default()
 
     def resolve_path(self, path: str) -> Path:
-        rel = Path(*path.split("/"))
+        parts = _module_parts(path)
+        rel = Path(*parts)
         candidates = []
         for base in self.search_paths:
-            candidates.append(base / rel.with_suffix(".al"))
-            candidates.append(base / rel / "main.al")
-            # installed packages live in ai_modules/<name>/...
-            candidates.append(base / "ai_modules" / rel.with_suffix(".al"))
-            candidates.append(base / "ai_modules" / rel / "main.al")
-        for c in candidates:
-            if c.is_file():
-                return c.resolve()
+            root = base.resolve()
+            candidates.extend(
+                (
+                    base / rel.with_suffix(".al"),
+                    base / rel / "main.al",
+                    # installed packages live in ai_modules/<name>/...
+                    base / "ai_modules" / rel.with_suffix(".al"),
+                    base / "ai_modules" / rel / "main.al",
+                )
+            )
+            for candidate in candidates[-4:]:
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                if resolved.is_file() and _inside(resolved, root):
+                    return resolved
         tried = "\n  ".join(str(c) for c in candidates)
         raise ImportError_(f"module '{path}' not found; looked in:\n  {tried}")
 
     def load(self, path: str) -> Module:
-        if path in self.cache:
-            return self.cache[path]
-        if path in self.loading:
-            chain = " -> ".join(self.loading + [path])
+        with self._lock:
+            return self._load_locked(path)
+
+    def _load_locked(self, path: str) -> Module:
+        # Resolve before consulting the cache.  Different spellings of a
+        # module name must not create duplicate module instances or evade cycle
+        # detection.
+        file = self.resolve_path(path)
+        key = str(file)
+        if key in self.cache:
+            return self.cache[key]
+        if key in self.loading:
+            chain = " -> ".join(self.loading + [key])
             raise ImportError_(f"circular import detected: {chain}")
 
-        file = self.resolve_path(path)
-        source = file.read_text(encoding="utf-8")
+        try:
+            source = file.read_text(encoding="utf-8")
+        except UnicodeDecodeError as e:
+            raise ImportError_(f"module '{path}' ({file}) is not valid UTF-8: {e.reason}") from None
+        except OSError as e:
+            raise ImportError_(f"cannot read module '{path}' ({file}): {e}") from None
 
         from .toolchain import compile_source
         from .vm import VM
 
-        self.loading.append(path)
+        self.loading.append(key)
         try:
-            program = compile_source(source, filename=str(file), search_paths=[file.parent] + self.search_paths)
+            program = compile_source(
+                source,
+                filename=str(file),
+                search_paths=[file.parent] + self.search_paths,
+            )
             child = ModuleLoader([file.parent] + self.search_paths, self.globals_factory, self.fuel)
             child.cache = self.cache
             child.loading = self.loading
+            child._lock = self._lock
             base = self.globals_factory()
-            # VM adopts this dict by reference and the module's own
-            # definitions land in it, so snapshot the builtins beforehand.
+            # VM adopts this dict by reference and the module's definitions
+            # land in it, so snapshot the builtins beforehand.
             baseline = dict(base)
             vm = VM(base, fuel=self.fuel, module_loader=child.load)
             vm.run(program)
             # Export what the module actually defines. Comparing against the
-            # builtin *names* would hide any function that shadows a builtin
-            # (a module defining `mean` is entirely legitimate), so compare
-            # identity instead: a name still bound to the builtin object was
-            # not redefined, anything else was.
+            # builtin *names* would hide a function that intentionally shadows
+            # a builtin; compare identity instead.
             exported = {}
-            for k, v in vm.globals.vars.items():
-                if k.startswith("_"):
+            for name, value in vm.globals.vars.items():
+                if name.startswith("_"):
                     continue
-                if k in baseline and baseline[k] is v:
+                if name in baseline and baseline[name] is value:
                     continue
-                exported[k] = v
+                exported[name] = value
             module = Module(path, exported)
-            self.cache[path] = module
+            self.cache[key] = module
             return module
         except AILangError as e:
             raise ImportError_(f"while importing '{path}' ({file}): {e}") from e
@@ -84,7 +145,7 @@ class ModuleLoader:
             self.loading.pop()
 
     def signatures(self, path: str):
-        """Static export signatures used by the type checker."""
+        """Return static export signatures used by the type checker."""
         try:
             file = self.resolve_path(path)
         except ImportError_:
@@ -94,20 +155,31 @@ class ModuleLoader:
         from .typecheck import FnSig, ty
 
         try:
-            program = parse(file.read_text(encoding="utf-8"))
+            source = file.read_text(encoding="utf-8")
+            program = parse(source)
+        except UnicodeDecodeError as e:
+            raise ImportError_(f"module '{path}' ({file}) is not valid UTF-8: {e.reason}") from None
+        except OSError as e:
+            raise ImportError_(f"cannot read module '{path}' ({file}): {e}") from None
         except AILangError as e:
             # Never swallow a broken module: surface it at the import site.
             raise ImportError_(
                 f"module '{path}' ({file}) failed to parse: {e}", e.line, e.col
             ) from e
         out = {}
-        for s in program.statements:
-            if isinstance(s, A.Fn):
-                out[s.name] = FnSig(
-                    [(n, ty(t)) for n, t in s.params], ty(s.return_type or "Void"), s.name
+        for statement in program.statements:
+            if isinstance(statement, A.Fn):
+                out[statement.name] = FnSig(
+                    [(name, ty(type_name)) for name, type_name in statement.params],
+                    ty(statement.return_type or "Void"),
+                    statement.name,
                 )
-            elif isinstance(s, A.Record):
-                out[s.name] = FnSig([(f, ty(t)) for f, t in s.fields], ty(s.name), s.name)
-            elif isinstance(s, (A.Let, A.Var)):
-                out[s.name] = None
+            elif isinstance(statement, A.Record):
+                out[statement.name] = FnSig(
+                    [(field, ty(type_name)) for field, type_name in statement.fields],
+                    ty(statement.name),
+                    statement.name,
+                )
+            elif isinstance(statement, (A.Let, A.Var)):
+                out[statement.name] = None
         return out

@@ -8,7 +8,16 @@ from typing import Any, Dict, List, Optional
 from .errors import AILangError, AILangRaise, VMError
 import inspect
 from .opcodes import NAMES, OPS
-from .values import Module, RecordType, RecordValue, display, is_truthy, type_name
+from .values import (
+    Module,
+    RecordType,
+    RecordValue,
+    display,
+    hashable_key,
+    is_truthy,
+    unmap_key,
+    type_name,
+)
 
 # bind opcode ints as module-level constants for fast local lookup
 globals().update(OPS)
@@ -108,22 +117,10 @@ class Closure:
         return len(self.code.params)
 
     def __call__(self, *args, **kwargs):
-        if not kwargs:
-            f = self._fast
-            if f is not None and len(args) == f[1]:
-                vm = self.vm
-                try:
-                    result = f[0](*args)
-                except RecursionError:
-                    raise VMError(
-                        "recursion limit exceeded (possible infinite recursion)"
-                    ) from None
-                # the body only changes the shared fuel box if it iterated;
-                # adopt it in that case, mirroring invoke's return path
-                b = vm._fbox[0]
-                if b != vm.fuel:
-                    vm.fuel = b
-                return result
+        # Always enter through VM.invoke.  Native functions are cached per VM
+        # (their generated helpers close over that VM's fuel box), so a closure
+        # shared by spawned workers cannot accidentally execute with another
+        # worker's runtime state.
         return self.vm.invoke(self, args, kwargs or None)
 
     def __repr__(self):
@@ -157,7 +154,9 @@ class VM:
                  module_loader=None, trace: bool = False, trace_lines=None):
         if fuel is None:
             fuel = fuel_default()
-        self.globals = Environment(None, globals_dict or {})
+        self.globals = Environment(
+            None, globals_dict if globals_dict is not None else {}
+        )
         self.globals.vars.setdefault("true", True)
         self.globals.vars.setdefault("false", False)
         self.globals.vars.setdefault("nothing", None)
@@ -176,7 +175,35 @@ class VM:
         self.program = None
         self.module_loader = module_loader
         self._loop_cache = {}
+        # Native helpers close over a fuel box and therefore cannot be shared
+        # across forked/request VMs.  Keep the cache local to this execution
+        # context; the FunctionCode fields remain only as compatibility/debug
+        # metadata for callers that inspect compiled code.
+        self._native_cache = {}
         _init_builtin_names()
+
+    def fork(self, fuel=None):
+        """Create an execution context safe to use on another thread.
+
+        The lexical/global Environment is intentionally shared: AI-Lang
+        programs use mutexes/channels when they want coordinated mutable
+        state.  Operand stacks, recursion depth, fuel, native helper caches,
+        and module execution state belong to the child VM and cannot race with
+        the parent.
+        """
+        child = VM.__new__(VM)
+        child.globals = self.globals
+        child.fuel = self.fuel if fuel is None else fuel
+        child.trace = False
+        child.trace_lines = []
+        child._traced = None
+        child._fbox = [child.fuel]
+        child.depth = 0
+        child.program = self.program
+        child.module_loader = self.module_loader
+        child._loop_cache = {}
+        child._native_cache = {}
+        return child
 
     # ----------------------------------------------------------------- driver
     def run(self, program):
@@ -190,82 +217,64 @@ class VM:
         params = code.params
         nparams = len(params)
 
-        # First call: try to compile this function to host bytecode. If the
-        # backend declines, `native` stays None and we use the interpreter --
-        # the two are behaviourally identical, so either is correct.
-        if not code.native_tried:
+        native_fn = None
+        # Compile at most once per VM context.  A generated helper closes over
+        # this VM's fuel box; caching it on FunctionCode made forked workers
+        # share one worker's budget and other mutable execution state.
+        if code.body is not None and not code.captures:
+            from . import native
+
             code.native_tried = True
-            # The compiled function is cached on FunctionCode, which every
-            # closure built from this source shares. Resolving free names
-            # against one closure's environment would leak that environment
-            # into all the others, so free names may be baked in only when
-            # the *defining* closure's own scope chain resolves them to the
-            # global scope. A name shadowed by an enclosing local must stay
-            # on the VM, or the compiled code would silently read the global
-            # instead of the captured value.
-            if code.body is not None and not code.captures:
-                from .native import try_compile
+            if native.enabled():
+                key = id(code)
+                if key not in self._native_cache:
+                    globals_env = self.globals
 
-                globals_env = self.globals
+                    def _lookup(name, _g=globals_env):
+                        if name in _g.vars:
+                            return _g.vars[name]
+                        raise VMError(f"undefined name '{name}'")
 
-                def _lookup(name, _g=globals_env):
-                    if name in _g.vars:
-                        return _g.vars[name]
-                    raise VMError(f"undefined name '{name}'")
+                    def _resolves_to_global(nm, _chain=closure.env, _g=globals_env):
+                        e = _chain
+                        while e is not None:
+                            if nm in e.vars:
+                                return e is _g
+                            e = e.parent
+                        return False
 
-                def _resolves_to_global(nm, _chain=closure.env, _g=globals_env):
-                    e = _chain
-                    while e is not None:
-                        if nm in e.vars:
-                            return e is _g
-                        e = e.parent
-                    return False
+                    def _can_bake(nm, _g=globals_env):
+                        # only immutable globals may be captured by value: a
+                        # reassignable var must keep resolving live on every call
+                        return nm in _g.immutable and nm in _g.vars
 
-                def _can_bake(nm, _g=globals_env):
-                    # only immutable globals may be captured by value: a
-                    # reassignable var must keep resolving live on every call
-                    return nm in _g.immutable and nm in _g.vars
+                    self._native_cache[key] = native.try_compile(
+                        code, _lookup, code.name,
+                        is_global=_resolves_to_global, fuel_box=self._fbox,
+                        can_bake=_can_bake,
+                    )
+                native_fn = self._native_cache[key]
 
-                code.native = try_compile(
-                    code, _lookup, code.name,
-                    is_global=_resolves_to_global, fuel_box=self._fbox,
-                    can_bake=_can_bake,
-                )
-                if code.native is not None:
-                    closure._fast = (code.native, len(params))
-
-        if code.native is not None and closure._fast is None:
-            closure._fast = (code.native, nparams)
-
-        if code.native is not None and not kwargs and len(args) == nparams:
-            # The caller (_CALL / CALL_KW) just wrote the interpreter's fuel
-            # into the shared box, so the native code sees the true budget.
-            # The box only *changes* if the native body iterated, so the
-            # return path adopts it only when it did — no min(), no write
-            # on the common case of a non-iterating function call.
+        if native_fn is not None and not kwargs and len(args) == nparams:
             self.depth += 1
             if self.depth > self.MAX_DEPTH:
                 self.depth -= 1
                 raise VMError("recursion limit exceeded (possible infinite recursion)")
             try:
-                result = code.native(*args)
-                b = self._fbox[0]
-                if b != self.fuel:
-                    self.fuel = b
+                result = native_fn(*args)
+                self.fuel = self._fbox[0]
                 return result
             except AILangError as exc:
-                # relabel with the AI-Lang line, using the map the backend
-                # attached; done here so the hot path stays wrapper-free
+                # Relabel with the AI-Lang line, using the map the backend
+                # attached; done here so the hot path stays wrapper-free.
                 if not getattr(exc, "line", 0):
-                    lm = getattr(code.native, "_ailang_lines", None)
+                    lm = getattr(native_fn, "_ailang_lines", None)
                     if lm:
                         tb = exc.__traceback__
-                        target = code.native.__code__
+                        target = native_fn.__code__
                         while tb is not None:
                             if tb.tb_frame.f_code is target:
                                 exc.line = lm.get(tb.tb_lineno, 0)
-                                # the line belongs to the compiled function's
-                                # own file, which may be an imported module
                                 if not getattr(exc, "origin", ""):
                                     exc.origin = getattr(code, "origin", "")
                             tb = tb.tb_next
@@ -358,7 +367,8 @@ class VM:
 
         # local aliases: attribute lookups in a hot loop are expensive
         _box = self._fbox
-        _PUSH = PUSH; _LOAD = LOAD; _STORE = STORE; _SET = SET
+        _PUSH = PUSH; _LOAD = LOAD; _LOAD_FAST = LOAD_FAST
+        _STORE = STORE; _SET = SET; _SET_FAST = SET_FAST
         _ADD_NN = ADD_NN; _SUB_NN = SUB_NN; _MUL_NN = MUL_NN
         _LT_NN = LT_NN; _LE_NN = LE_NN; _GT_NN = GT_NN; _GE_NN = GE_NN
         _JUMP = JUMP; _JUMP_IF_FALSE = JUMP_IF_FALSE
@@ -390,7 +400,7 @@ class VM:
 
             try:
                 # ---- hottest opcodes first -------------------------------
-                if op == _LOAD:
+                if op == _LOAD or op == _LOAD_FAST:
                     name = ins[1]
                     e = env
                     while e is not None:
@@ -609,7 +619,7 @@ class VM:
                         push(self.call_value(callee, args))
                         fuel = _box[0]
 
-                elif op == _SET:
+                elif op == _SET or op == _SET_FAST:
                     name = ins[1]
                     value = pop()
                     e = env
@@ -771,6 +781,11 @@ class VM:
                         iters.pop()
                     ip = ins[1]
 
+                elif op == BREAK:
+                    # `stop` in a while loop must not consume an iterator that
+                    # belongs to an enclosing repeat loop.
+                    ip = ins[1]
+
                 elif op == ITER_END:
                     pass
 
@@ -847,12 +862,20 @@ class VM:
                     names = ins[2]
                     kwargs = {}
                     positional = []
+                    saw_named = False
+                    named_keys = []
                     for nm, value in zip(names, args):
                         if nm is None:
+                            if saw_named:
+                                raise VMError("positional argument follows a named argument")
                             positional.append(value)
                         else:
+                            saw_named = True
+                            named_keys.append(nm)
+                            if nm in kwargs:
+                                raise VMError(f"duplicate value for parameter '{nm}'")
                             kwargs[nm] = value
-                    if len(names) != len(set(names)):
+                    if len(named_keys) != len(set(named_keys)):
                         raise VMError("duplicate value for a named argument")
                     _box[0] = fuel
                     self.fuel = fuel
@@ -979,6 +1002,8 @@ class VM:
             name = getattr(callee, "ailang_name", getattr(callee, "__name__", "function"))
             if kwargs:
                 _check_python_named_args(callee, kwargs, name)
+                aliases = getattr(callee, "_ailang_param_aliases", {})
+                kwargs = {aliases.get(key, key): value for key, value in kwargs.items()}
             try:
                 return callee(*args, **kwargs)
             except TypeError as e:
@@ -1005,8 +1030,11 @@ def _check_python_named_args(fn, kwargs, name):
         else:
             named = [
                 p.name for p in sig.parameters.values()
-                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
             ]
+        public = getattr(fn, "_ailang_public_params", None)
+        if public is not None:
+            named = list(public)
         _NAMED_ARG_CACHE[id(fn)] = (fn, named)
     else:
         named = entry[1]
@@ -1030,20 +1058,17 @@ def _make_iter(src):
     if isinstance(src, str):
         return iter(enumerate(src))
     if isinstance(src, dict):
-        return iter(enumerate(list(src.keys())))
+        return iter(enumerate([unmap_key(k) for k in src.keys()]))
     if isinstance(src, range):
         return iter(enumerate(src))
     raise VMError(f"cannot repeat over {type_name(src)}; expected List, Map or Text")
 
 
 def _hashable(key):
-    if isinstance(key, list):
-        # nested lists become nested tuples, so [[1], [2]] is a valid key;
-        # a Map anywhere inside still fails with a clear AI-Lang error
-        return tuple(_hashable(x) for x in key)
-    if isinstance(key, dict):
-        raise VMError("a Map cannot be used as a Map key")
-    return key
+    try:
+        return hashable_key(key)
+    except TypeError as e:
+        raise VMError(str(e)) from None
 
 
 def _index(obj, key):
@@ -1210,7 +1235,7 @@ def _convert(target, v):
             if isinstance(v, str):
                 return list(v)
             if isinstance(v, dict):
-                return list(v.keys())
+                return [unmap_key(k) for k in v.keys()]
             raise VMError(f"cannot convert {type_name(v)} to List")
         if target == "Map":
             if isinstance(v, dict):

@@ -171,17 +171,26 @@ def lex(source: str) -> List[Token]:
                     if j >= n or depth:
                         raise LexError("unterminated { } in text", start_line, start_col)
                     expr_src = source[i + 1 : j].strip()
+                    # The nested expression is lexed later, but it still
+                    # occupies physical source lines.  Advance the outer
+                    # scanner as well so tokens after the closing brace carry
+                    # the correct line/column.
+                    consumed = source[i : j + 1]
+                    newlines = consumed.count("\n")
+                    if newlines:
+                        line += newlines
+                        col = len(consumed.rsplit("\n", 1)[1]) + 1
+                    else:
+                        col += len(consumed)
                     if not expr_src:
                         # bare "{}" stays literal: it is the format() placeholder
                         chars.append("{}")
                         i = j + 1
-                        col += 2
                         continue
                     if chars:
                         parts.append(("lit", "".join(chars)))
                         chars = []
                     parts.append(("expr", expr_src))
-                    col += (j - i) + 1
                     i = j + 1
                     continue
                 if ch == "}" and source[i + 1 : i + 2] == "}":

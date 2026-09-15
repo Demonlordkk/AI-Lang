@@ -391,15 +391,22 @@ def test_examples_agree_under_both_backends(path):
 # ------------------------------------------------------------ backend control
 
 
-def test_backend_can_be_disabled():
+def test_backend_is_safe_opt_in():
     from ailang import native
 
-    os.environ["AILANG_NATIVE"] = "0"
+    old = os.environ.get("AILANG_NATIVE")
     try:
-        assert native.enabled() is False
-    finally:
         os.environ.pop("AILANG_NATIVE", None)
-    assert native.enabled() is True
+        assert native.enabled() is False
+        os.environ["AILANG_NATIVE"] = "0"
+        assert native.enabled() is False
+        os.environ["AILANG_NATIVE"] = "1"
+        assert native.enabled() is True
+    finally:
+        if old is None:
+            os.environ.pop("AILANG_NATIVE", None)
+        else:
+            os.environ["AILANG_NATIVE"] = old
 
 
 def test_unsupported_function_is_declined_not_miscompiled():
