@@ -274,9 +274,8 @@ class _Gen:
                 return "None"
             # a free name either resolves to a captured value (baked in as
             # a default argument) or falls back to a dynamic global lookup
-            pb = self.prebound.get(e.value)
-            if pb is not None:
-                return pb
+            if e.value in self.prebound:
+                return self.prebound[e.value]
             self.free.add(e.value)
             return f"_lk({e.value!r})"
 
@@ -313,7 +312,7 @@ class _Gen:
             return "{" + pairs + "}"
 
         if isinstance(e, A.Convert):
-            return f"_cv({e.target!r}, {self.expr(e.expr)})"
+            return f"_cv({e.type_name!r}, {self.expr(e.expr)})"
 
         raise _Unsupported(type(e).__name__)
 
@@ -407,7 +406,9 @@ class _Gen:
                 )
 
         elif isinstance(s, A.Emit):
-            self.w(f"print(_disp({self.expr(s.expr)}))")
+            # Keep output behind the standard-library binding so native code
+            # cannot bypass host capability policy (terminal.write).
+            self.w(f"_emit({self.expr(s.expr)})")
 
         elif isinstance(s, A.Give):
             self.w(f"return {self.expr(s.expr)}")
@@ -521,8 +522,43 @@ class _Gen:
         )
 
 
+def _validate_generated_source(source):
+    """Reject anything outside the tiny AST language emitted by ``_Gen``.
+
+    Restricted ``__builtins__`` is necessary but not sufficient: a future
+    code-generation regression must not turn native lowering into an arbitrary
+    Python execution primitive.  This second, independent check fails closed
+    before ``exec``.
+    """
+    import ast
+
+    allowed = {
+        ast.Module, ast.FunctionDef, ast.arguments, ast.arg, ast.Return,
+        ast.Assign, ast.Expr, ast.Name, ast.Load, ast.Store, ast.Constant,
+        ast.Call, ast.IfExp, ast.BoolOp, ast.And, ast.Or, ast.NamedExpr,
+        ast.Compare, ast.Is, ast.IsNot, ast.Eq, ast.NotEq, ast.Lt, ast.LtE,
+        ast.Not,
+        ast.Gt, ast.GtE, ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Div,
+        ast.Mod, ast.UnaryOp, ast.USub, ast.List, ast.Dict, ast.Tuple,
+        ast.If, ast.For, ast.While, ast.Break, ast.Continue, ast.Pass,
+        ast.Try, ast.ExceptHandler,
+    }
+    tree = ast.parse(source, mode="exec")
+    for node in ast.walk(tree):
+        if type(node) not in allowed:
+            raise _Unsupported(f"generated AST node {type(node).__name__}")
+        if isinstance(node, ast.Name) and not node.id:
+            raise _Unsupported("empty generated identifier")
+        if isinstance(node, ast.Call) and not isinstance(node.func, (ast.Name, ast.Call)):
+            raise _Unsupported("generated attribute call")
+        if isinstance(node, ast.ExceptHandler):
+            if node.type is None or not isinstance(node.type, ast.Name) or node.type.id != "Exception":
+                raise _Unsupported("generated exception type")
+    return tree
+
+
 # ------------------------------------------------------------------- runtime
-def _make_runtime(lookup, fuel_box=None):
+def _make_runtime(lookup, fuel_box=None, cancel_event=None):
     """Helpers the generated code calls. Each mirrors the VM exactly."""
     from .errors import AILangRaise, VMError
     from .values import RecordValue, unmap_key
@@ -536,6 +572,8 @@ def _make_runtime(lookup, fuel_box=None):
         # per-iteration accounting model than the VM; source execution keeps
         # the native backend opt-in until exact instruction-level accounting is
         # available.
+        if cancel_event is not None and cancel_event.is_set():
+            raise VMError("execution cancelled")
         if _box is None:
             return
         _box[0] -= 1
@@ -582,6 +620,13 @@ def _make_runtime(lookup, fuel_box=None):
     def _raise(value):
         raise AILangRaise(value)
 
+    def _emit(value):
+        # Keep output explicit even if user code shadows the ``print`` name.
+        from .capabilities import require as require_capability
+        require_capability("terminal.write", where="emit")
+        print(display(value))
+        return None
+
     def _rng(n):
         if type(n) is not int:
             raise VMError("range loop needs an Int bound")
@@ -613,6 +658,7 @@ def _make_runtime(lookup, fuel_box=None):
         "_iter": _iterate,
         "_rng": _rng,
         "_raise": _raise,
+        "_emit": _emit,
         "_errval": _error_value,
         "_fc": _fuel_check,
         "_fcit": _fuel_iter,
@@ -631,7 +677,7 @@ def enabled():
 
 
 def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None,
-                can_bake=None):
+                cancel_event=None, can_bake=None):
     """Compile one AI-Lang function to a host function, or return None.
 
     `lookup` resolves a free name against the global scope. `is_global` says
@@ -688,11 +734,23 @@ def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None,
     except Exception:
         return None
 
-    env = _make_runtime(lookup, fuel_box)
+    env = _make_runtime(lookup, fuel_box, cancel_event)
     for n, v in prebound.items():
         env[local[n]] = v
     try:
+        _validate_generated_source(src)
         code = compile(src, f"<ailang:{name}>", "exec")
+        # Generated source is a small implementation detail, not a Python
+        # plugin.  Do not let ``exec`` inject the complete host builtin table;
+        # only the primitives emitted by _Gen are made available.  In
+        # particular this removes open/eval/exec/import from the native path.
+        env["__builtins__"] = {
+            "Exception": Exception,
+            "enumerate": enumerate,
+            "int": int,
+            "range": range,
+            "type": type,
+        }
         exec(code, env)
     except Exception:
         return None

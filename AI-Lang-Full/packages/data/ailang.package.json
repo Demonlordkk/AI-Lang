@@ -1,0 +1,6 @@
+{
+  "name": "data",
+  "version": "3.0.0",
+  "description": "Deterministic, allocation-conscious data transforms written in AI-Lang: chunking, windows, scans, flattening, transposition, frequencies, and stable partitioning.",
+  "dependencies": {}
+}

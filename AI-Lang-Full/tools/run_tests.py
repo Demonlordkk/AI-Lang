@@ -20,6 +20,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import inspect
 import os
@@ -33,8 +34,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TESTS = ROOT / "tests"
 
-PER_TEST_TIMEOUT = int(os.environ.get("RUN_TESTS_TEST_TIMEOUT", "120"))
-TOTAL_TIMEOUT = int(os.environ.get("RUN_TESTS_TOTAL_TIMEOUT", "900"))
+def _env_timeout(name, default):
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return value if value >= 0 else default
+
+
+PER_TEST_TIMEOUT = _env_timeout("RUN_TESTS_TEST_TIMEOUT", 120)
+TOTAL_TIMEOUT = _env_timeout("RUN_TESTS_TOTAL_TIMEOUT", 900)
 
 
 def _install_pytest_stub():
@@ -75,6 +84,17 @@ def _collect(mod):
         yield attr, fn
 
 
+def _cleanup_after_test():
+    """Release resources created through direct host APIs between tests."""
+    try:
+        from ailang.resources import cleanup_process_resources
+        cleanup_process_resources()
+    except Exception:
+        # Cleanup is defensive infrastructure; the test's own result remains
+        # the useful failure if an optional hook cannot be imported.
+        pass
+
+
 def _fixtures(fn):
     params = inspect.signature(fn).parameters
     fixtures = {}
@@ -92,6 +112,16 @@ def _fixtures(fn):
 
 
 def main(argv):
+    options = argparse.ArgumentParser(add_help=True)
+    options.add_argument("--test-timeout", type=int, default=PER_TEST_TIMEOUT,
+                         help="per-test wall timeout in seconds (0 disables)")
+    options.add_argument("--total-timeout", type=int, default=TOTAL_TIMEOUT,
+                         help="whole-suite wall timeout in seconds (0 disables)")
+    options.add_argument("--fail-fast", action="store_true",
+                         help="stop after the first failed test")
+    args, wanted_args = options.parse_known_args(argv)
+    if args.test_timeout < 0 or args.total_timeout < 0:
+        options.error("timeouts must be non-negative")
     _install_pytest_stub()
     from _pytest_stub import _MonkeyPatch, Skipped  # noqa: F401
 
@@ -110,7 +140,7 @@ def main(argv):
     except OSError:
         pass
 
-    wanted = set(argv)
+    wanted = set(wanted_args)
     files = sorted(TESTS.glob("test_*.py"))
     if wanted:
         files = [f for f in files if f.stem.replace("test_", "") in wanted
@@ -125,8 +155,10 @@ def main(argv):
     failures = []
 
     for path in files:
-        if TOTAL_TIMEOUT and time.monotonic() - started > TOTAL_TIMEOUT:
-            print(f"\nTOTAL TIMEOUT after {TOTAL_TIMEOUT}s; "
+        if args.fail_fast and failed:
+            break
+        if args.total_timeout and time.monotonic() - started > args.total_timeout:
+            print(f"\nTOTAL TIMEOUT after {args.total_timeout}s; "
                   f"skipping {len(files)} remaining file(s)")
             break
         try:
@@ -136,11 +168,13 @@ def main(argv):
             failures.append((path.name, "import", traceback.format_exc()))
             continue
         for attr, fn in _collect(mod):
-            if TOTAL_TIMEOUT and time.monotonic() - started > TOTAL_TIMEOUT:
-                print(f"\nTOTAL TIMEOUT after {TOTAL_TIMEOUT}s; stopping")
+            if args.fail_fast and failed:
+                break
+            if args.total_timeout and time.monotonic() - started > args.total_timeout:
+                print(f"\nTOTAL TIMEOUT after {args.total_timeout}s; stopping")
                 break
             fixtures, tmp, monkey = _fixtures(fn)
-            signal.alarm(PER_TEST_TIMEOUT)
+            signal.alarm(args.test_timeout)
             t0 = time.monotonic()
             try:
                 fn(**fixtures)
@@ -151,7 +185,7 @@ def main(argv):
                 signal.alarm(0)
                 failed += 1
                 failures.append((f"{path.name}::{attr}", "timeout",
-                                 f"exceeded {PER_TEST_TIMEOUT}s"))
+                                 f"exceeded {args.test_timeout}s"))
                 print(f"TIMEOUT {path.name}::{attr}")
             except Skipped as e:
                 signal.alarm(0)
@@ -164,6 +198,8 @@ def main(argv):
                                  traceback.format_exc()))
                 print(f"FAIL {path.name}::{attr}")
             finally:
+                signal.alarm(0)
+                _cleanup_after_test()
                 if monkey is not None:
                     monkey.undo()
                 if tmp is not None:
@@ -171,6 +207,12 @@ def main(argv):
 
                     shutil.rmtree(tmp, ignore_errors=True)
 
+    _cleanup_after_test()
+    try:
+        from ailang.stdlib import _shutdown_pool
+        _shutdown_pool()
+    except Exception:
+        pass
     print(f"\n{passed} passed, {failed} failed, {skipped} skipped, "
           f"{passed + failed + skipped} total in {time.monotonic() - started:.1f}s")
     for name, kind, detail in failures:

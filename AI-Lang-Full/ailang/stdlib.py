@@ -7,6 +7,7 @@ AI-Lang errors instead of leaking Python exceptions.
 
 from __future__ import annotations
 
+import atexit
 import contextvars
 import hashlib
 import json
@@ -23,7 +24,19 @@ import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
+from .capabilities import (
+    CapabilitySet,
+    capability_check,
+    capability_require,
+    capability_scope,
+    guarded,
+    normalize as normalize_capabilities,
+    resource_command,
+    resource_host,
+    resource_path,
+)
 from .errors import AILangRaise, VMError
+from .resources import register as register_resource
 from .values import Module, RecordValue, display, hashable_key, is_truthy, type_name, unmap_key
 
 
@@ -581,6 +594,8 @@ def _http_request(url, method, body=None, headers=None, verify=True, timeout=30)
         raise VMError(f"http: invalid URL: {e}") from None
     if scheme not in {"http", "https"} or not hostname:
         raise VMError("http: url must be an http:// or https:// URL with a host")
+    from .capabilities import require as require_capability
+    require_capability("net.connect", resource_host(hostname), "http")
     if not isinstance(method, str) or not method or any(
         not (ch.isalpha() or ch in "-_") for ch in method
     ):
@@ -595,7 +610,7 @@ def _http_request(url, method, body=None, headers=None, verify=True, timeout=30)
         raise VMError("http: timeout must be a finite positive number")
 
     data = None
-    hdrs = {"User-Agent": "AI-Lang/2.10"}
+    hdrs = {"User-Agent": "AI-Lang/3.0"}
     if headers is not None:
         supplied = _need_map(headers, "http", "headers")
         for key, value in supplied.items():
@@ -654,6 +669,23 @@ def _http_request(url, method, body=None, headers=None, verify=True, timeout=30)
 # ------------------------------------------------------------------ concurrency
 _POOL = None
 _POOL_LOCK = _threading.Lock()
+_TASK_CANCEL = contextvars.ContextVar("ailang_task_cancel", default=None)
+
+
+def _sleep(seconds):
+    """Sleep with task cancellation checks instead of an uninterruptible wait."""
+    try:
+        value = min(float(seconds), 30.0)
+    except (TypeError, ValueError, OverflowError):
+        raise VMError("sleep: seconds must be a finite non-negative number") from None
+    if not math.isfinite(value) or value < 0:
+        raise VMError("sleep: seconds must be a finite non-negative number")
+    event = _TASK_CANCEL.get()
+    if event is None:
+        time.sleep(value)
+    elif event.wait(value):
+        raise VMError("execution cancelled")
+    return None
 
 
 def _pool():
@@ -665,29 +697,70 @@ def _pool():
     return _POOL
 
 
-def _isolated_call(fn, args):
+def _shutdown_pool():
+    global _POOL
+    with _POOL_LOCK:
+        pool, _POOL = _POOL, None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=True, cancel_futures=True)
+        except TypeError:  # Python versions without cancel_futures
+            pool.shutdown(wait=True)
+
+
+atexit.register(_shutdown_pool)
+
+
+def _isolated_call(fn, args, cancel_event=None):
     """Invoke a language closure with a child VM execution context.
 
     The captured Environment is shared deliberately (mutexes/channels make
     shared mutable state explicit), but operand stacks, fuel counters, native
     helper caches, recursion depth and module state are private to the worker.
+    The cancellation event lets scope teardown stop an unfinished task
+    promptly instead of waiting for the default fuel budget.
     """
+    token = _TASK_CANCEL.set(cancel_event)
     try:
-        from .vm import Closure
-    except ImportError:
-        Closure = ()
-    if isinstance(fn, Closure):
-        child_vm = fn.vm.fork()
-        fn = Closure(fn.code, fn.env, child_vm, fn.program)
-    return fn(*args)
+        try:
+            from .vm import Closure
+        except ImportError:
+            Closure = ()
+        if isinstance(fn, Closure):
+            child_vm = fn.vm.fork(cancel_event=cancel_event)
+            fn = Closure(fn.code, fn.env, child_vm, fn.program)
+        return fn(*args)
+    finally:
+        _TASK_CANCEL.reset(token)
 
 
 def _submit(fn, args):
     # ContextVars do not implicitly cross a ThreadPoolExecutor boundary.  The
-    # copied context preserves the script directory for relative file/database
-    # paths without reintroducing a process-global base directory.
+    # copied context preserves the script directory and capability/resource
+    # scope for relative paths without reintroducing process-global state.
     context = contextvars.copy_context()
-    return _pool().submit(context.run, _isolated_call, fn, tuple(args))
+    cancel_event = _threading.Event()
+    future = _pool().submit(
+        context.run, _isolated_call, fn, tuple(args), cancel_event
+    )
+    # Future objects normally have no public cancellation callback.  This
+    # private attribute is local to the object and avoids a second registry.
+    future._ailang_cancel_event = cancel_event
+
+    def cleanup():
+        # Cancellation is immediate for queued work.  A running task is
+        # bounded by its own VM fuel budget; wait briefly so completed runs do
+        # not retain references indefinitely, but never hang teardown forever.
+        cancel_event = getattr(future, "_ailang_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
+        future.cancel()
+        try:
+            future.result(timeout=0.25)
+        except Exception:
+            pass
+    register_resource(cleanup)
+    return future
 
 
 def _spawn(fn, *args):
@@ -742,9 +815,17 @@ def _as_mutex(m, name):
 
 def _lock(m, timeout=30):
     lk = _as_mutex(m, "lock")
-    if not lk.acquire(timeout=timeout):
-        raise VMError("lock: timed out waiting for the mutex")
-    return m
+    limit = _task_timeout(timeout, "lock")
+    deadline = time.monotonic() + limit
+    event = _TASK_CANCEL.get()
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        if lk.acquire(timeout=min(0.05, remaining)):
+            return m
+        if event is not None and event.is_set():
+            raise VMError("execution cancelled")
+        if remaining <= 0:
+            raise VMError("lock: timed out waiting for the mutex")
 
 
 def _unlock(m):
@@ -778,12 +859,15 @@ def _channel_recv(c):
     """Blocking receive; returns nothing once the channel is closed and drained."""
     c = _as_channel(c, "channel_recv")
     q = c["__queue__"]
+    event = _TASK_CANCEL.get()
     while True:
         try:
             return q.get(timeout=0.05)
         except _queue.Empty:
             if c["closed"][0]:
                 return None
+            if event is not None and event.is_set():
+                raise VMError("execution cancelled")
 
 
 def _channel_try_recv(c):
@@ -1596,6 +1680,9 @@ def _momentum_step(state, rate=None, mu=None):
             continue
         v, d, g = state["v"][pi], p.data, p.grad
         if _is_arr(d):
+            if not _is_arr(v):
+                v = _asarr(v)
+                state["v"][pi] = v
             # v <- mu*v + g  (decay the old velocity, THEN add the gradient)
             v *= mu
             v += _asarr(g)
@@ -1637,6 +1724,12 @@ def _adam_step(state, rate=0.01, b1=0.9, b2=0.999, eps=1e-8):
         d, g = p.data, p.grad
         if _is_arr(d):
             np_ = _accel().np()
+            if not _is_arr(m):
+                m = _asarr(m)
+                state["m"][pi] = m
+            if not _is_arr(v):
+                v = _asarr(v)
+                state["v"][pi] = v
             ga = _asarr(g)
             m = m * b1 + (1.0 - b1) * ga
             v = v * b2 + (1.0 - b2) * ga * ga
@@ -1686,6 +1779,12 @@ def _adamw_step(state, rate=None, wd=None, b1=0.9, b2=0.999, eps=1e-8):
         d, g = p.data, p.grad
         if _is_arr(d):
             np_ = _accel().np()
+            if not _is_arr(m):
+                m = _asarr(m)
+                state["m"][pi] = m
+            if not _is_arr(v):
+                v = _asarr(v)
+                state["v"][pi] = v
             ga = _asarr(g)
             m = m * b1 + (1.0 - b1) * ga
             v = v * b2 + (1.0 - b2) * ga * ga
@@ -2127,7 +2226,173 @@ def _install_public_params(env):
             pass
 
 
-def build_globals(argv=None):
+def _effect_arg(args, kwargs, index, name, default=None):
+    if name in kwargs:
+        return kwargs[name]
+    if len(args) > index:
+        return args[index]
+    return default
+
+
+def _effect_path(index=0, name=None):
+    def resolve(args, kwargs):
+        value = _effect_arg(args, kwargs, index, name or "path")
+        return resource_path(_resolve(str(value)))
+    return resolve
+
+
+def _effect_host(index=0, name=None):
+    def resolve(args, kwargs):
+        value = _effect_arg(args, kwargs, index, name or "host")
+        return resource_host(value)
+    return resolve
+
+
+def _effect_url(index=0, name="url"):
+    def resolve(args, kwargs):
+        value = _effect_arg(args, kwargs, index, name)
+        return resource_host(urlparse(str(value)).hostname or str(value))
+    return resolve
+
+
+def _effect_endpoint(host_index, port_index, host_name="host", port_name="port"):
+    def resolve(args, kwargs):
+        host = _effect_arg(args, kwargs, host_index, host_name, "0.0.0.0")
+        port = _effect_arg(args, kwargs, port_index, port_name)
+        return resource_host(f"{host}:{port}")
+    return resolve
+
+
+def _effect_db(index=0, name="db"):
+    def resolve(args, kwargs):
+        value = _effect_arg(args, kwargs, index, name)
+        return resource_path(getattr(value, "path", str(value)))
+    return resolve
+
+
+def _effect_socket(index=0, name="socket"):
+    def resolve(args, kwargs):
+        value = _effect_arg(args, kwargs, index, name)
+        return resource_host(getattr(value, "addr", str(value)))
+    return resolve
+
+
+def _effect_library(index=0, name="lib"):
+    def resolve(args, kwargs):
+        value = _effect_arg(args, kwargs, index, name)
+        # ffi_call receives a bound function, whose library provenance is
+        # retained on ``fn.lib``; ffi_open/ffi_symbol receive the library
+        # object directly.
+        value = getattr(value, "lib", value)
+        return resource_path(getattr(value, "path", str(value)))
+    return resolve
+
+
+def _device_profile():
+    from .training import device_profile
+    return device_profile()
+
+
+def _batch_budget(item_bytes=0, requested=0):
+    from .training import batch_budget
+    return batch_budget(item_bytes, requested)
+
+
+def _sleep_save(path, state, cursor=0, metrics=None, epoch=0,
+                metadata=None, signing_key=None, key_id=""):
+    from .training import save_checkpoint
+    return save_checkpoint(path, state, cursor, metrics, epoch, metadata,
+                           signing_key, key_id)
+
+
+def _sleep_load(path, signing_key=None, require_signature=False):
+    from .training import load_checkpoint, restore_checkpoint_state
+    checkpoint = load_checkpoint(path, signing_key, bool(require_signature))
+    checkpoint["state"] = restore_checkpoint_state(checkpoint["state"])
+    return checkpoint
+
+
+def _active_train(data, step_fn, checkpoint_path, options=None):
+    from .training import active_train
+    return active_train(data, step_fn, checkpoint_path, options)
+
+
+def _model_save(path, model, metadata=None, signing_key=None, key_id=""):
+    from .model_state import save_model
+    return save_model(path, model, metadata, signing_key, key_id)
+
+
+def _model_load(path, template=None, signing_key=None, require_signature=False):
+    from .model_state import load_model
+    return load_model(path, template, signing_key, bool(require_signature))
+
+
+def _optimizer_save(path, optimizer, metadata=None, signing_key=None, key_id=""):
+    from .model_state import save_optimizer
+    return save_optimizer(path, optimizer, metadata, signing_key, key_id)
+
+
+def _optimizer_load(path, params=None, signing_key=None, require_signature=False):
+    from .model_state import load_optimizer
+    return load_optimizer(path, params, signing_key, bool(require_signature))
+
+
+def _apply_capability_guards(env, policy):
+    """Guard every stdlib entry point that crosses an ambient-effect boundary."""
+    def guard(names, capability, resource=None):
+        for name in names:
+            fn = env.get(name)
+            if fn is not None:
+                env[name] = guarded(fn, name, capability, resource=resource, policy=policy)
+
+    guard(("clock", "now", "timestamp"), "clock.read")
+    guard(("print",), "terminal.write")
+    guard(("random", "random_int", "randn", "uuid", "seed"), "random.use")
+    guard(("input", "read_line"), "terminal.read")
+    guard(("read_file", "read_lines", "read_csv", "list_dir", "path_exists", "is_dir",
+           "find_files"), "fs.read", _effect_path())
+    guard(("write_file", "append_file", "write_lines", "write_csv", "make_dir",
+           "delete_file"), "fs.write", _effect_path())
+    guard(("canvas_save",), "fs.write", _effect_path(1, "path"))
+    guard(("plot",), "fs.write", _effect_path(0, "path"))
+    guard(("sleep_save", "model_save", "optimizer_save"), "fs.write", _effect_path(0, "path"))
+    guard(("sleep_load", "model_load", "optimizer_load"), "fs.read", _effect_path(0, "path"))
+    guard(("active_train",), "fs", _effect_path(2, "checkpoint_path"))
+    guard(("run",), "process.exec", lambda args, kwargs: resource_command(
+        _effect_arg(args, kwargs, 0, "cmd", "")))
+    guard(("env",), "env.read", lambda args, kwargs: str(
+        _effect_arg(args, kwargs, 0, "name", "")))
+    guard(("ffi_open",), "ffi.load", lambda args, kwargs: resource_host(
+        _effect_arg(args, kwargs, 0, "name", "")))
+    guard(("ffi_fn", "ffi_symbol", "ffi_info"), "ffi.load",
+          _effect_library(0, "lib"))
+    guard(("ffi_call",), "ffi.load", _effect_library(0, "fn"))
+    guard(("db_open", "store_open"), "db.open", _effect_path())
+    guard(("db_exec", "db_query", "db_one", "db_many", "db_transaction", "db_tables",
+           "db_close", "store_put", "store_get", "store_delete", "store_keys"),
+          "db.open", _effect_db())
+    guard(("serve",), "net.listen", _effect_endpoint(2, 0))
+    # serve_stop performs a provenance-aware check in net.py so a scoped host
+    # grant can authorize exactly the server being stopped.
+    guard(("tcp_listen",), "net.listen", _effect_endpoint(1, 0))
+    guard(("tcp_accept",), "net.listen", _effect_socket())
+    guard(("tcp_connect",), "net.connect", _effect_endpoint(0, 1, "host", "port"))
+    guard(("tcp_send", "tcp_receive"), "net.connect", _effect_socket())
+    # tcp_close selects net.listen or net.connect from the socket's
+    # provenance inside a backend-level guard; wrapping it with the broad
+    # alias here would unnecessarily require both grants.
+    guard(("http_get", "http_post", "http_request"), "net.connect", _effect_url())
+
+
+def build_globals(argv=None, capabilities=None):
+    """Create the standard environment for one execution context.
+
+    The default is backwards-compatible trusted execution.  Hosts that run
+    untrusted source should pass a ``CapabilitySet`` (or use the CLI's
+    ``--sandbox`` flag); every ambient-effect builtin is then wrapped with a
+    check before it is called.
+    """
+    policy = normalize_capabilities(capabilities)
     env = {
         # core
         "len": _len,
@@ -2143,7 +2408,7 @@ def build_globals(argv=None):
         "sum": _sum,
         "clock": time.time,
         "now": time.time,
-        "sleep": lambda seconds: time.sleep(min(float(seconds), 30)),
+        "sleep": _sleep,
         "print": lambda value="": (print(display(value)), None)[1],
         "assert": _assert,
         "is_nothing": lambda value: value is None,
@@ -2288,6 +2553,15 @@ def build_globals(argv=None):
         "huber_t": lambda p, y, delta=1.0: _ad().huber_loss(p, y, delta),
         "l2_penalty_t": lambda *params: _ad().l2_penalty(list(params)),
         "ml_backend": lambda: _accel().info(),
+        "device_profile": _device_profile,
+        "batch_budget": _batch_budget,
+        "sleep_save": _sleep_save,
+        "sleep_load": _sleep_load,
+        "active_train": _active_train,
+        "model_save": _model_save,
+        "model_load": _model_load,
+        "optimizer_save": _optimizer_save,
+        "optimizer_load": _optimizer_load,
         "momentum": _momentum_state,
         "momentum_step": _momentum_step,
         "adamw": _adamw_state,
@@ -2428,6 +2702,12 @@ def build_globals(argv=None):
         "args": lambda: list(argv or []),
         "script_dir": script_dir,
         "input": lambda prompt="": input(display(prompt)),
+        # capabilities: policy inspection is safe; scope only attenuates the
+        # currently granted set and can never mint a new authority.
+        "capability_check": lambda name, resource=None: capability_check(name, resource, policy),
+        "capability_require": lambda name, resource=None: capability_require(name, resource, policy),
+        "capability_scope": lambda requested, fn: capability_scope(requested, fn, policy),
+        "capability_info": lambda: policy.describe(),
         # net
         "http_get": _http_get,
         "http_post": _http_post,
@@ -2445,6 +2725,7 @@ def build_globals(argv=None):
         "channel_try_recv": _channel_try_recv,
         "channel_close": _channel_close,
     }
+    _apply_capability_guards(env, policy)
     _install_public_params(env)
     for name, fn in env.items():
         try:

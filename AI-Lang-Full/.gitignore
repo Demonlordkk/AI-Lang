@@ -22,5 +22,6 @@ examples/apps/*.db
 examples/apps/*.db-wal
 examples/apps/*.db-shm
 
-# trained model artifacts (created by examples/apps)
+# trained model and sleep-memory artifacts (created by examples/apps/ml)
 *.almodel
+*.alstate

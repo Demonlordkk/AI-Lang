@@ -1,4 +1,4 @@
-# AI-Lang
+# AI-Lang 3.0.0
 
 A concise, general-purpose programming language with a static checker, a
 bytecode VM, a module system, and a complete toolchain.
@@ -659,6 +659,8 @@ just `mean_t((t_matmul(x, w) - y) * (t_matmul(x, w) - y))`.
 | Guardrails | `early_stop` `early_stop_step` `gradcheck` |
 | Metrics | `accuracy` `f1` `train_test_split` |
 | Train | `backward` `zero_grad` `sgd_step` `momentum` `momentum_step` `adam` `adam_step` `adamw` `adamw_step` `clip_grad` |
+| Adaptive work | `device_profile` `batch_budget` `active_train` `sleep_save` `sleep_load` |
+| Persistence | `model_save` `model_load` `optimizer_save` `optimizer_load` |
 
 Tensors broadcast (a bias vector adds across every row), shapes are checked
 with readable errors, and `backward` is iterative so network depth is not
@@ -723,6 +725,70 @@ ask `shape_of(...)`); the net has no hidden layer (linear models can't
 separate non-linear data — XOR is the canonical case); or the data itself has
 no signal.
 
+### Adaptive active training and sleep memory
+
+Training work is a bounded service, not an assumption that the whole dataset
+fits in RAM. `device_profile()` reports a conservative memory budget and the
+active tensor backend; `batch_budget(item_bytes, requested)` turns an item-size
+estimate into a safe batch limit. Both are best-effort signals, so a program
+can still impose a smaller explicit limit for battery, thermal, or latency
+budgets.
+
+`active_train(data, step_fn, checkpoint_path, options)` runs one or more
+bounded batches, atomically saves progress, and returns control. The callback
+receives `(batch, state)` and returns `{"state": next_state, "loss": value}`.
+The checkpoint carries the cursor, epoch, metrics, model/user state, and step
+metadata. A later invocation with the same checkpoint path resumes at the next
+item; it does not replay the completed chunk. `max_items`, `max_seconds`,
+`checkpoint_every`, `batch_size`, `epochs`, and `reserved_bytes`/`model_bytes`
+let the same source adapt from a short mobile
+foreground window to a long server job. Even an explicit `batch_size` is
+capped by the device budget. An empty or small data
+set is handled without a dummy batch.
+
+```text
+use packages/neural as nn.
+
+let net := nn.mlp([2, 8, 2], 7).
+let rows := [[[0.0, 1.0], [1.0, 0.0]],
+             [[1.0, 0.0], [0.0, 1.0]],
+             [[0.1, 0.9], [1.0, 0.0]]].
+fn loss_fn(logits: Any, target: Any) -> Any:
+    give ce_t(logits, target).
+done.
+
+let progress := nn.active(net, rows, loss_fn, "model.sleep", {
+    "batch_size": 32, "max_items": 128, "max_seconds": 2.0,
+    "epochs": 20, "rate": 0.01, "wd": 0.0, "checkpoint_every": 1
+}).
+emit {"sleeping": progress.sleeping, "complete": progress.complete,
+      "cursor": progress.cursor, "loss": progress.metrics.loss}.
+```
+
+The neural package includes `nn.active`, which persists the network and AdamW
+moments in the scheduler state and rebinds optimizer parameters after a
+restart. For separate deployment and optimizer files, use
+`nn.save_bundle`/`nn.load_bundle`. The lower-level `model_save`, `model_load`, `optimizer_save`, and
+`optimizer_load` functions work for custom model maps and tensor structures
+too; they accept the same optional HMAC key/key-id and required-signature
+controls. Pass a model template to `model_load` to restore
+AI-Lang record types; without one, records become field-compatible maps and
+all tensor leaves are still live trainable tensors.
+
+Sleep checkpoints are atomic (`fsync` plus replace), bounded, canonical JSON,
+and verified with SHA-256 before state is returned. `sleep_save` accepts an
+optional HMAC key and key id, while `sleep_load` can require and verify that
+signature; `active_train` accepts the same policy through `signing_key`,
+`key_id`, and `require_signature` options. Keep keys outside the checkpoint
+and grant only the required `fs.read`/`fs.write` paths. This is persistence
+and integrity protection, not a substitute for an OS sandbox.
+
+The supporting source packages are deliberately small and portable:
+`packages/data` contains deterministic chunk/window/scan/flatten helpers,
+`packages/metrics` contains explicit classification/regression metrics, and
+`packages/learning` exposes the device-aware scheduler and persistence
+vocabulary so applications can stay mostly in AI-Lang.
+
 ### Production toolkit
 
 Small examples teach the mechanics; a real training run needs a few more
@@ -760,9 +826,11 @@ validation f1:    1.0
 reload identical: true
 ```
 
-That is the numpy engine, in about 3 s; the reference engine runs the same
-program in 22 s and lands at train 1.0 / validation 0.967 — the engines
-share one API and one result quality, and each one is reproducible.
+Those figures are workload- and host-dependent. The benchmark deliberately
+runs the same source on each engine when numpy is available; this checkout's
+verification host has no numpy, so it reports the reference result and skips
+the accelerator rather than inventing a speedup. Both paths share one API,
+and seeded runs are reproducible within the selected engine.
 
 ### From data to deployment
 
@@ -775,9 +843,12 @@ the language like any other value:
 2. **Train.** The loop above.
 3. **Evaluate.** `accuracy(probs, labels)` over the holdout, or `argmax` by
    hand for anything custom.
-4. **Save.** `nn.save(net, "model.almodel")` writes the weights as a JSON
-   file — an exact float round-trip, so a loaded model predicts
-   bit-identically to the trained one.
+4. **Save.** `nn.save(net, "model.almodel")` writes an atomic,
+   integrity-checked model checkpoint — an exact float round-trip, so a
+   loaded model predicts bit-identically to the trained one. Legacy JSON
+   weight files remain readable. For resumable optimization, use
+   `nn.save_bundle(net, optimizer, model_path, optimizer_path)` and
+   `nn.load_bundle(model_path, optimizer_path, template)`.
 5. **Serve.** `examples/apps/predictor.al` is the whole story in one file:
    train a classifier with the autodiff engine, save it, and start a web app
    in the same process — `POST /predict` runs the forward pass on the request
@@ -799,10 +870,12 @@ The autodiff engine has two backends with identical semantics:
   program: `AILANG_NUMPY=0` turns it off, and `ml_backend()` reports which
   engine is live.
 
-Measured on this machine (`tools/bench_ml.py`): the same spiral-classification
-training program takes **6.3 s on the reference engine and 0.68 s on the
-numpy engine — about a 9× speedup**. Deterministic programs produce
-bit-identical output on both — the test suite runs every example and
+`tools/bench_ml.py` measures the same spiral-classification program on both
+engines when both are available. In the 2026-09-15 verification run for this
+checkout, the reference workload completed in **5.85 s** with final accuracy
+**1.0**; numpy was not installed, so no accelerator speedup is claimed.
+Deterministic programs produce bit-identical output on both — the test suite
+runs every example and
 differential test on both engines and asserts it. Seeded random programs
 (dropout is the one place the training loop draws) are reproducible word
 for word *within* an engine: `seed(n)` fixes every stream the engine owns.
@@ -821,7 +894,7 @@ shipping a CUDA build of the interpreter.
 | Machine | What the model gets |
 | --- | --- |
 | Termux, Raspberry Pi, locked-down box | The reference engine — pure Python, nothing installed |
-| Desktop Python with numpy | The numpy engine, picked up automatically (~9× on training) |
+| Desktop Python with numpy | The numpy engine, picked up automatically; measure the workload-specific gain |
 | Colab / Jupyter | Same as desktop, in a single file |
 | CUDA server | The numpy engine for now; device speed is a binding away via FFI |
 
@@ -1147,17 +1220,19 @@ so an install is reproducible and tampering is detected:
   stats: digest mismatch (expected sha256:521cfc2dc981..., got sha256:a96c18a8b34a...)
 ```
 
-Seven packages ship in `packages/`: `text` (casing, padding, word counts),
+Ten packages ship in `packages/`: `text` (casing, padding, word counts),
 `collections` (set operations, rotation, frequency tables), `testing`
 (assertions that report what actually differed, plus `prop_test`, a
-property-based test runner), `neural` (a feed-forward net built from the
-tensor operators, plus model save/load — see
-[Building models](#building-models-automatic-differentiation)), `webapp`
-(routing, static files, middleware and the professional `make_*` helpers for
-web apps — see [Building apps](#building-apps)), `cli` (argument parsing,
-usage text, tables, progress bars, color and config for terminal apps — see
-[Building apps](#building-apps)) and `stream` (lazy infinite streams — see
-[Beyond the usual](#beyond-the-usual)).
+property-based test runner), `data` (deterministic chunking, windows, scans,
+and flattening), `metrics` (classification and regression measurements),
+`learning` (device-aware active training and persistence helpers), `neural`
+(a feed-forward net built from the tensor operators, active training, and
+model save/load — see [Building models](#building-models-automatic-differentiation)),
+`webapp` (routing, static files, middleware and the professional `make_*`
+helpers for web apps — see [Building apps](#building-apps)), `cli` (argument
+parsing, usage text, tables, progress bars, color and config for terminal apps
+— see [Building apps](#building-apps)) and `stream` (lazy infinite streams —
+see [Beyond the usual](#beyond-the-usual)).
 
 ## Running anywhere
 
@@ -1184,7 +1259,9 @@ python3 ailang-bundle.pyz run program.al
 ```
 
 Copy it to a server, a container, a Raspberry Pi, or a locked-down machine with
-no package manager, and it runs as-is.
+no package manager, and it runs as-is. The bundle also carries the bundled
+AI-Lang source packages, including `data`, `metrics`, `learning`, and `neural`,
+so `use packages/neural as nn.` does not require a separate package checkout.
 
 ## Diagnostics
 
@@ -1210,10 +1287,11 @@ program.al:2:0: runtime error: index 99 is out of range for a list of 1
 The VM dispatches on integer opcodes through a frequency-ordered chain, and
 the compiler emits specialised instructions when it can prove operand types.
 Benchmark results are workload- and host-dependent. The reproducible local
-benchmark is `python3 tools/bench_ml.py`; the latest verification run completed
-the pure-Python two-layer spiral workload in 4.93 s with final accuracy 1.0.
-The optional numpy accelerator was unavailable in that environment, so no
-numpy speedup is claimed here. See [Two engines, one language](#two-engines-one-language).
+benchmark is `python3 tools/bench_ml.py`; the 2026-09-15 verification run
+completed the pure-Python two-layer spiral workload in 5.85 s with final
+accuracy 1.0. The optional numpy accelerator was
+unavailable in that environment, so no numpy speedup is claimed here. See
+[Two engines, one language](#two-engines-one-language).
 
 Key optimisations:
 
@@ -1277,7 +1355,9 @@ source → lexer → parser → AST → type checker → optimizer → compiler 
 | `ailang/stdlib.py` | Built-in functions |
 | `ailang/autodiff.py` | Reference tensor engine + reverse-mode autodiff |
 | `ailang/accel.py` | Optional numpy backend (same operations, numpy arrays) |
-| `ailang/modules.py` | Module resolution and caching |
+| `ailang/training.py` | Device profiling, adaptive batches, atomic sleep/resume scheduler |
+| `ailang/model_state.py` | JSON model/optimizer persistence and tensor restoration |
+| `ailang/modules.py` | Module resolution, package sources, and caching |
 | `ailang/bytecode.py` | Deterministic artifact serialization |
 | `ailang/cli.py` | Command-line interface |
 
@@ -1300,6 +1380,26 @@ wall-clock timeout (120 s, `RUN_TESTS_TEST_TIMEOUT`), the whole run has a
 total cap (900 s, `RUN_TESTS_TOTAL_TIMEOUT`), and a file filter is accepted
 (`python3 tools/run_tests.py contracts ml`). With pytest installed the same
 suite runs through it unchanged.
+
+## Design lessons from other ecosystems
+
+AI-Lang is not claiming that one language or company is best at every job.
+This is a practical comparison of recurring tradeoffs seen by developers,
+and the product decisions they motivate:
+
+| Ecosystem or approach | Repeated developer cost | AI-Lang response | Remaining tradeoff |
+| --- | --- | --- | --- |
+| Python scientific stacks | Excellent iteration, but environments, native wheels, and dependency versions can make a small model hard to move to a phone or locked-down host. | A zero-dependency reference tensor engine, one source-level API, an optional numpy accelerator, a standalone bundle, and JSON model checkpoints. | The pure-Python path is slower, and native GPU bindings still require an explicit host integration. |
+| C++/Rust systems code | Strong control and speed, but ownership, build systems, and template/generic boilerplate can make experimentation expensive. | AI-Lang keeps explicit types, contracts, bounded execution, and capability checks while making common data/model operations short and directly executable. | It does not replace Rust/C++ for every hard real-time or kernel-level workload. |
+| JavaScript/web runtimes | Ubiquitous deployment, but callback/Promise boundaries, package sprawl, and differing server/browser APIs can complicate portable data jobs. | Uniform functions, a VM/native fallback, explicit effects, and the same model/data packages for CLI, service, and device programs. | Browser embedding and a GPU web backend are host integrations, not built into the core. |
+| Julia and other specialised numerical languages | High-level numerical code, but deployment size, package availability, and ecosystem assumptions can matter on constrained devices. | Dependency-free execution, bounded active batches, device profiling, and sleep/resume checkpoints make the constrained case a first-class target. | Large-scale distributed training is not hidden behind this API. |
+| Framework-first ML workflows | Frameworks accelerate production, but opaque graphs, version-specific serialization, and framework lock-in can make a model boundary brittle. | Tensor graphs are ordinary AI-Lang values; model and optimizer state use bounded, integrity-checked JSON and can be restored with a template. | Advanced layers and accelerators still need to be written or bound explicitly. |
+| Cloud platforms and large package ecosystems | Managed scale is convenient, while provider lock-in, recurring cost, supply-chain risk, and interrupted-job handling remain operational concerns. | Capability-scoped effects, signed packages, local/portable execution, atomic checkpoints, and resumable active training make failure and migration explicit. | Operators still need their own sandbox, key management, dataset identity, and service observability. |
+
+These are design lessons rather than benchmark claims. When a number matters,
+measure the actual model, device, and backend with `tools/bench_ml.py`; the
+repository's tests report behavior and correctness, not a universal language
+ranking.
 
 ## Status
 

@@ -1,7 +1,7 @@
 """Single source of truth for AI-Lang version metadata."""
 
 LANGUAGE = "AI-Lang"
-VERSION = "2.10.0"
+VERSION = "3.0.0"
 # AILBC-4 removes executable host-Python source from artifacts.  Artifacts
 # produced by older formats must not be accepted by a newer runtime because
 # AILBC-3 could carry native-loop source that the VM executed with exec().

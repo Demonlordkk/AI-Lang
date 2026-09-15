@@ -32,11 +32,21 @@ implemented by the reference VM and checked by the conformance suite.
 | Reliability | Met for language errors: structured diagnostics carry source positions; `attempt`/`rescue` handles recoverable failures, while `panic` and `exit` remain uncatchable. |
 | Determinism | Met for builds: AILBC-4 artifacts use canonical JSON and an `artifact_sha256`; package lockfiles and package signatures use sorted content digests. |
 | Portability | Met for the reference runtime: the interpreter uses Python's standard library and supports a dependency-free zipapp; numpy is optional acceleration only. |
-| Extensibility | Met: modules, seven source packages, records, autodiff, networking, storage, FFI, and the CLI are separate APIs. |
+| Extensibility | Met: modules, ten source packages (including data, metrics, learning, and neural), records, autodiff, networking, storage, FFI, and the CLI are separate APIs. |
 | Maintainability | Met in practice: lexer, parser, checker, optimizer, compiler, VM, stdlib, packages, and platform modules are separated and exercised by a dependency-free test runner. |
 | Scalability | Partial: lazy ranges, streams, bounded concurrency, native loop/function lowering, optional tensor acceleration, and incremental-safe module caching exist; a distributed compiler/runtime does not. |
 | Performance | Improved and measured with specialized VM opcodes, peephole fusion, allocation-aware loops, native lowering, and optional numpy tensors. Absolute timings remain host- and workload-dependent; use `tools/bench_ml.py` and `ailang run --profile` for local measurements. |
 | Capability-based security | Partial: artifact loading rejects host-code loops and validates integrity/schema; module/package paths are constrained and packages can be signed. File, process, network, database, and FFI builtins are still explicit escape hatches rather than a complete capability-typed security model. |
+
+## v3.0.0 adaptive training
+
+See [07_active_training.md](07_active_training.md) for the device-aware
+active-training scheduler, atomic sleep checkpoints, model/optimizer
+persistence, and the neural/data/metrics/learning packages. The reference
+runtime remains dependency-free; acceleration is optional. The README's
+[design lessons](../README.md#design-lessons-from-other-ecosystems) records
+which recurring costs in other language, framework, and platform ecosystems
+informed these choices and which tradeoffs remain.
 
 ## Artifact safety boundary
 

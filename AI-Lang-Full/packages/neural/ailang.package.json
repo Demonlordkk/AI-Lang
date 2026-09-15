@@ -1,1 +1,6 @@
-{"name": "neural", "version": "1.0.0", "description": "Feed-forward network components written in AI-Lang itself: a net, its forward pass, and a training loop.", "dependencies": {}}
+{
+  "name": "neural",
+  "version": "3.0.0",
+  "description": "Portable feed-forward networks written in AI-Lang: differentiable layers, active device-aware training, atomic model and optimizer persistence, and legacy model loading.",
+  "dependencies": {}
+}

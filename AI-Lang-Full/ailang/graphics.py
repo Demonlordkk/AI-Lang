@@ -15,9 +15,11 @@ raising, so generated drawings never fail on a rounding error.
 """
 from __future__ import annotations
 
+import os
 import struct
 import zlib
 
+from .capabilities import require, resource_path
 from .errors import VMError
 
 _FONT = {
@@ -63,6 +65,18 @@ _FONT = {
     "Y": ("101", "101", "010", "010", "010"),
     "Z": ("111", "001", "010", "100", "111"),
 }
+
+
+def _runtime_path(path):
+    path = os.fspath(path)
+    try:
+        from .stdlib import script_dir
+        base = script_dir()
+    except (ImportError, AttributeError):
+        base = None
+    if base and not os.path.isabs(path):
+        return os.path.join(base, path)
+    return path
 
 
 class _Canvas:
@@ -254,6 +268,8 @@ def canvas_save(c, path):
         + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
         + chunk(b"IEND", b"")
     )
+    path = _runtime_path(path)
+    require("fs.write", resource_path(path), "canvas_save")
     try:
         with open(str(path), "wb") as fh:
             fh.write(png)

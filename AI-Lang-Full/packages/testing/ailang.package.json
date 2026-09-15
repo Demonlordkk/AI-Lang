@@ -1,1 +1,1 @@
-{"name": "testing", "version": "1.0.0", "description": "Assertion helpers for fn test_* suites.", "dependencies": {}}
+{"name":"testing","version":"3.0.0","description":"Assertion helpers for fn test_* suites.","dependencies":{}}

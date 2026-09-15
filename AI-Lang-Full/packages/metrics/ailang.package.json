@@ -1,0 +1,6 @@
+{
+  "name": "metrics",
+  "version": "3.0.0",
+  "description": "Auditable classification and regression metrics written in AI-Lang, with explicit edge-case policy and deterministic threshold helpers.",
+  "dependencies": {}
+}

@@ -1,0 +1,6 @@
+{
+  "name": "learning",
+  "version": "3.0.0",
+  "description": "Universal active-training scheduler: device-aware batches, atomic sleep checkpoints, resumable cursors, and bounded work for phones, desktops, servers, and embedded devices.",
+  "dependencies": {}
+}

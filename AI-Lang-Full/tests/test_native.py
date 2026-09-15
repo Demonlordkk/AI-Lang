@@ -374,16 +374,27 @@ def test_examples_agree_under_both_backends(path):
     env_native = dict(os.environ, AILANG_NATIVE="1")
     env_vm = dict(os.environ, AILANG_NATIVE="0")
     cwd = path.parent
+
+    # This example intentionally persists a cursor between invocations. The
+    # parity assertion compares the two engines on the same fresh work unit;
+    # its resume contract is covered independently by test_training.py.
+    checkpoint = path.with_suffix(".alstate") if path.name == "active_training.al" else None
+    if checkpoint is not None:
+        checkpoint.unlink(missing_ok=True)
     a = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), "run", str(path)],
         capture_output=True, text=True, env=env_native, cwd=cwd,
         timeout=300,
     )
+    if checkpoint is not None:
+        checkpoint.unlink(missing_ok=True)
     b = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), "run", str(path)],
         capture_output=True, text=True, env=env_vm, cwd=cwd,
         timeout=300,
     )
+    if checkpoint is not None:
+        checkpoint.unlink(missing_ok=True)
     assert a.stdout == b.stdout, f"{path.name} diverged between backends"
     assert a.returncode == b.returncode
 

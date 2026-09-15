@@ -25,6 +25,7 @@ import ctypes.util
 import sys
 import threading
 
+from .capabilities import require, resource_host, resource_path
 from .errors import VMError
 
 # AI-Lang type name -> ctypes type. Deliberately small and explicit.
@@ -98,6 +99,7 @@ def ffi_open(name):
     """Load a shared library and return a handle."""
     if not isinstance(name, str):
         raise VMError("ffi_open: library name must be Text")
+    require("ffi.load", resource_host(name), "ffi_open")
     with _lock:
         if name in _libs:
             return _libs[name]
@@ -128,6 +130,7 @@ def ffi_fn(lib, symbol, argtypes=None, restype="void"):
     """
     if not isinstance(lib, _Lib):
         raise VMError("ffi_fn: first argument must be a library from ffi_open")
+    require("ffi.load", resource_path(lib.path), "ffi_fn")
     if not isinstance(symbol, str) or not symbol or "\x00" in symbol:
         raise VMError("ffi_fn: symbol name must be non-empty Text without NUL bytes")
     argtypes = argtypes if argtypes is not None else []
@@ -187,6 +190,7 @@ def ffi_call(fn, args=None):
     """Call a bound foreign function."""
     if not isinstance(fn, _Fn):
         raise VMError("ffi_call: first argument must be a function from ffi_fn")
+    require("ffi.load", resource_path(fn.lib.path), "ffi_call")
     args = args if args is not None else []
     if not isinstance(args, list):
         raise VMError("ffi_call: arguments must be a List")
@@ -218,6 +222,7 @@ def ffi_symbol(lib, symbol):
     """Report whether a library exports a symbol."""
     if not isinstance(lib, _Lib):
         raise VMError("ffi_symbol: first argument must be a library from ffi_open")
+    require("ffi.load", resource_path(lib.path), "ffi_symbol")
     return hasattr(lib.handle, str(symbol))
 
 
@@ -225,4 +230,5 @@ def ffi_info(lib):
     """Describe a loaded library."""
     if not isinstance(lib, _Lib):
         raise VMError("ffi_info: argument must be a library from ffi_open")
+    require("ffi.load", resource_path(lib.path), "ffi_info")
     return {"path": lib.path, "id": lib.id, "platform": sys.platform}

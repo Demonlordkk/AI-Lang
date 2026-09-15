@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
+from .capabilities import require as require_capability
 from .errors import AILangError, AILangRaise, VMError
 import inspect
 from .opcodes import NAMES, OPS
@@ -151,7 +153,8 @@ class VM:
     MAX_DEPTH = 2500
 
     def __init__(self, globals_dict: Dict[str, Any] = None, fuel: int = None,
-                 module_loader=None, trace: bool = False, trace_lines=None):
+                 module_loader=None, trace: bool = False, trace_lines=None,
+                 cancel_event=None):
         if fuel is None:
             fuel = fuel_default()
         self.globals = Environment(
@@ -161,6 +164,7 @@ class VM:
         self.globals.vars.setdefault("false", False)
         self.globals.vars.setdefault("nothing", None)
         self.fuel = fuel
+        self.cancel_event = cancel_event or threading.Event()
         # line tracing (`ailang trace`): print each source line as it executes
         self.trace = trace
         self.trace_lines = trace_lines or []
@@ -182,7 +186,7 @@ class VM:
         self._native_cache = {}
         _init_builtin_names()
 
-    def fork(self, fuel=None):
+    def fork(self, fuel=None, cancel_event=None):
         """Create an execution context safe to use on another thread.
 
         The lexical/global Environment is intentionally shared: AI-Lang
@@ -194,6 +198,7 @@ class VM:
         child = VM.__new__(VM)
         child.globals = self.globals
         child.fuel = self.fuel if fuel is None else fuel
+        child.cancel_event = cancel_event or self.cancel_event
         child.trace = False
         child.trace_lines = []
         child._traced = None
@@ -251,7 +256,7 @@ class VM:
                     self._native_cache[key] = native.try_compile(
                         code, _lookup, code.name,
                         is_global=_resolves_to_global, fuel_box=self._fbox,
-                        can_bake=_can_bake,
+                        cancel_event=self.cancel_event, can_bake=_can_bake,
                     )
                 native_fn = self._native_cache[key]
 
@@ -261,6 +266,8 @@ class VM:
                 self.depth -= 1
                 raise VMError("recursion limit exceeded (possible infinite recursion)")
             try:
+                if self.cancel_event.is_set():
+                    raise VMError("execution cancelled")
                 result = native_fn(*args)
                 self.fuel = self._fbox[0]
                 return result
@@ -320,7 +327,7 @@ class VM:
         fn = cache.get(idx)
         if fn is not None:
             return fn
-        from .native import _make_runtime
+        from .native import _make_runtime, _validate_generated_source
 
         # every free name must resolve now, through the live scope chain
         def _lookup(name, _e=env):
@@ -331,8 +338,16 @@ class VM:
                 e = e.parent
             raise VMError(f"undefined name '{name}'")
 
-        runtime = _make_runtime(_lookup, self._fbox)
+        runtime = _make_runtime(_lookup, self._fbox, self.cancel_event)
         try:
+            _validate_generated_source(src)
+            runtime["__builtins__"] = {
+                "Exception": Exception,
+                "enumerate": enumerate,
+                "int": int,
+                "range": range,
+                "type": type,
+            }
             exec(compile(src, f"<ailang:loop{idx}>", "exec"), runtime)
         except Exception:
             return None
@@ -380,6 +395,8 @@ class VM:
         _LOAD_INDEX = LOAD_INDEX
 
         while ip < n:
+            if self.cancel_event.is_set():
+                raise VMError("execution cancelled", line_table.get(ip, 0))
             fuel -= 1
             if fuel < 0:
                 _box[0] = fuel
@@ -720,6 +737,7 @@ class VM:
                     push(_field(pop(), ins[1]))
 
                 elif op == PRINT:
+                    require_capability("terminal.write", where="emit")
                     print(display(pop()))
 
                 elif op == TO_BOOL:

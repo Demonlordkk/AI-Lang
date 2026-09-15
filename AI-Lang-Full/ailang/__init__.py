@@ -9,10 +9,12 @@ Public API:
 
 from __future__ import annotations
 
+from .capabilities import CapabilitySet
 from .errors import (
     AILangError,
     AILangRaise,
     CheckError,
+    CapabilityError,
     CompileError,
     LexError,
     ParseError,
@@ -30,9 +32,11 @@ __all__ = [
     "VERSION",
     "BYTECODE_FORMAT",
     "AILangError",
+    "CapabilitySet",
     "LexError",
     "ParseError",
     "CheckError",
+    "CapabilityError",
     "CompileError",
     "VMError",
     "AILangRaise",

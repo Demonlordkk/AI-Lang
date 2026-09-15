@@ -5,11 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
+from .capabilities import normalize as normalize_capabilities, use as use_capabilities
 from .compiler import Compiler, ProgramCode
 from .contracts import desugar
 from .errors import AILangError
 from .optimizer import optimize
 from .parser import parse
+from .resources import scope as resource_scope
 from .stdlib import build_globals
 from .typecheck import TypeChecker
 from .vm import VM
@@ -53,20 +55,27 @@ def run_source(
     check: bool = True,
     fuel: Optional[int] = None,
     trace: bool = False,
+    capabilities=None,
 ):
     from .modules import ModuleLoader
     from .vm import fuel_default
 
     if fuel is None:
         fuel = fuel_default()
+    policy = normalize_capabilities(capabilities)
     paths = search_paths or [Path(filename).parent if filename != "<source>" else Path.cwd()]
-    program = compile_source(source, filename, paths, check=check,
-                             lift_loops=not trace)
-    loader = ModuleLoader(paths, lambda: build_globals(argv), fuel)
-    vm = VM(build_globals(argv), fuel=fuel, module_loader=loader.load,
-            trace=trace, trace_lines=source.splitlines())
-    vm.run(program)
-    return vm
+    # Install the policy while compiling and executing.  This is important for
+    # imported modules and ContextVar-aware spawned tasks, not just the root
+    # VM's globals.
+    with resource_scope():
+        with use_capabilities(policy):
+            program = compile_source(source, filename, paths, check=check,
+                                     lift_loops=not trace)
+            loader = ModuleLoader(paths, lambda: build_globals(argv, policy), fuel)
+            vm = VM(build_globals(argv, policy), fuel=fuel, module_loader=loader.load,
+                    trace=trace, trace_lines=source.splitlines())
+            vm.run(program)
+            return vm
 
 
 def _project_root(start: Path):
@@ -81,7 +90,7 @@ def _project_root(start: Path):
     return None
 
 
-def run_file(path, argv=None, check=True, fuel=None, trace=False):
+def run_file(path, argv=None, check=True, fuel=None, trace=False, capabilities=None):
     p = Path(path)
     source = p.read_text(encoding="utf-8")
     # relative paths inside the program resolve against the program's own
@@ -97,12 +106,14 @@ def run_file(path, argv=None, check=True, fuel=None, trace=False):
         root = _project_root(p.parent.resolve())
         if root is not None and root not in paths:
             paths.append(root)
-        return run_source(source, str(p), paths, argv, check, fuel, trace=trace)
+        return run_source(source, str(p), paths, argv, check, fuel, trace=trace,
+                          capabilities=capabilities)
     finally:
         set_script_dir(prev)
 
 
-def run_artifact(path, argv=None, fuel=None):
+def run_artifact(path, argv=None, fuel=None, capabilities=None,
+                 signing_key=None, require_signature=False):
     """Execute a compiled .albc.json artifact directly.
 
     The artifact is rehydrated into a ProgramCode and run through the same
@@ -116,18 +127,21 @@ def run_artifact(path, argv=None, fuel=None):
     from .vm import VM
 
     p = Path(path)
-    program = load(p)
+    program = load(p, signing_key=signing_key, require_signature=require_signature)
+    policy = normalize_capabilities(capabilities)
     prev = script_dir()
     set_script_dir(p.parent.resolve())
     try:
-        paths = [p.parent.resolve(), Path.cwd()]
-        root = _project_root(p.parent.resolve())
-        if root is not None and root not in paths:
-            paths.append(root)
-        loader = ModuleLoader(paths, lambda: build_globals(argv), fuel)
-        vm = VM(build_globals(argv), fuel=fuel, module_loader=loader.load)
-        vm.run(program)
-        return vm
+        with resource_scope():
+            with use_capabilities(policy):
+                paths = [p.parent.resolve(), Path.cwd()]
+                root = _project_root(p.parent.resolve())
+                if root is not None and root not in paths:
+                    paths.append(root)
+                loader = ModuleLoader(paths, lambda: build_globals(argv, policy), fuel)
+                vm = VM(build_globals(argv, policy), fuel=fuel, module_loader=loader.load)
+                vm.run(program)
+                return vm
     finally:
         set_script_dir(prev)
 

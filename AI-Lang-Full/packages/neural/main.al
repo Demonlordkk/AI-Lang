@@ -129,31 +129,90 @@ fn accuracy(probs: Any, expected: List) -> Real:
     give to Real(correct) / to Real(len(got)).
 done.
 
-# ---------------------------------------------------------------- persistence
-# A trained net as a JSON file: weights and biases as nested lists. Train
-# once, then load the file from a web app or a CLI without retraining —
-# this is the bridge between the neural package and app building.
-
-# Save `net` to `path` (JSON, exact float round-trip).
-fn save(net: Any, path: Text):
-    var ws := [].
-    var bs := [].
-    repeat layer in net.layers:
-        append(ws, value_of(layer.w)).
-        append(bs, value_of(layer.b)).
+# --------------------------------------------------------- active training
+# Train data rows incrementally with the universal sleep/resume scheduler.
+# Each row is [features, target], for example:
+#   [[0.0, 1.0], [1, 0]]
+# `loss_fn` receives (logits, target_tensor). The model and optimizer are
+# included in the checkpoint state, so a later invocation continues with the
+# next chunk even after a mobile process was stopped.
+fn active(net: Any, rows: List, loss_fn: Function, checkpoint: Text, options: Map) -> Map:
+    let ps := params(net).
+    let rate := get(options, "rate", 0.001).
+    let wd := get(options, "wd", 0.01).
+    let optimizer := adamw(ps, rate, wd).
+    let initial := {"net": net, "optimizer": optimizer}.
+    let configured := set(options, "state", initial).
+    fn run_batch(batch: List, saved: Any) -> Map:
+        let current_net := saved.net.
+        let current_optimizer := set(saved.optimizer, "params", params(current_net)).
+        let xs := tensor(map(batch, \row -> row[0])).
+        let ys := tensor(map(batch, \row -> row[1])).
+        let current_params := params(current_net).
+        zero_grad(current_params).
+        let loss := loss_fn(forward(current_net, xs), ys).
+        backward(loss).
+        when has(options, "clip_norm"):
+            clip_grad(current_params, get(options, "clip_norm", 1.0)).
+        done.
+        adamw_step(current_optimizer).
+        # The model tensors are already persisted in `net`; omitting the
+        # optimizer's duplicate parameter references keeps mobile checkpoints
+        # smaller. The callback rebinds them before the next step.
+        let checkpoint_optimizer := set(current_optimizer, "params", []).
+        give {"state": {"net": current_net, "optimizer": checkpoint_optimizer},
+            "loss": value_of(loss)}.
     done.
-    write_file(path, json_encode({"weights": ws, "biases": bs})).
+    give active_train(rows, run_batch, checkpoint, configured).
 done.
 
-# Load a net saved by save(); the weights are fresh trainable params, so the
-# loaded model can also be fine-tuned.
+# ---------------------------------------------------------------- persistence
+# A model checkpoint keeps the network structure, trainable tensors, and
+# integrity metadata in the shared atomic persistence format. It is safe to
+# use at an active-training sleep boundary and remains loadable on a host that
+# has no numpy accelerator.
+
+# Save `net` to `path`. The older JSON weights/biases format is still accepted
+# by load() for backwards compatibility with existing applications.
+fn save(net: Any, path: Text):
+    model_save(path, net, {"package": "neural"}).
+done.
+
+# Load a model saved by save(); the template-free loader returns records as
+# field-compatible maps, so forward(), params(), and fine-tuning continue to
+# work without requiring a Python pickle or a desktop-only runtime.
 fn load(path: Text) -> Any:
-    let doc := json_decode(read_file(path)).
-    var layers := [].
-    var i := 0.
-    while i < len(doc.weights):
-        append(layers, Layer(param(tensor(doc.weights[i])), param(tensor(doc.biases[i])))).
-        i <- i + 1.
+    attempt:
+        let loaded := model_load(path).
+        when has(loaded, "layers"):
+            give loaded.
+        done.
+        raise "model checkpoint does not contain neural layers".
+    rescue e:
+        # Legacy neural files were plain {weights, biases} JSON. Keep them
+        # deployable while new saves use authenticated atomic checkpoints.
+        let doc := json_decode(read_file(path)).
+        var layers := [].
+        var i := 0.
+        while i < len(doc.weights):
+            append(layers, Layer(param(tensor(doc.weights[i])), param(tensor(doc.biases[i])))).
+            i <- i + 1.
+        done.
+        give Net(layers).
     done.
-    give Net(layers).
+done.
+
+# Save and restore a model plus its optimizer moments as two independently
+# replaceable files. Rebinding the restored optimizer to the restored model's
+# fresh parameters makes this suitable for a later active_train window.
+fn save_bundle(net: Any, optimizer: Map, model_path: Text, optimizer_path: Text) -> Map:
+    let m := model_save(model_path, net, {"package": "neural", "bundle": true}).
+    let o := optimizer_save(optimizer_path, optimizer, {"package": "neural", "bundle": true}).
+    give {"model": m, "optimizer": o}.
+done.
+
+fn load_bundle(model_path: Text, optimizer_path: Text, template: Any) -> Map:
+    let net := model_load(model_path, template).
+    let optimizer := optimizer_load(optimizer_path, params(net)).
+    give {"model": net, "optimizer": optimizer}.
 done.

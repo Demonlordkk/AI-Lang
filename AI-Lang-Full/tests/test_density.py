@@ -205,7 +205,13 @@ def test_single_file_bundle_builds_and_runs(tmp_path):
     assert bundle.exists()
 
     prog = tmp_path / "p.al"
-    prog.write_text('let n := 21.\nemit "bundled {n * 2}".\n', encoding="utf-8")
+    prog.write_text(
+        'let n := 21.\n'
+        'emit "bundled {n * 2}".\n'
+        'use packages/learning as learning.\n'
+        'emit learning.batch_size(1024, 4).\n',
+        encoding="utf-8",
+    )
     run = subprocess.run(
         [sys.executable, str(bundle), "run", str(prog)],
         capture_output=True,
@@ -214,6 +220,7 @@ def test_single_file_bundle_builds_and_runs(tmp_path):
     )
     assert run.returncode == 0, run.stderr
     assert "bundled 42" in run.stdout
+    assert "4\n" in run.stdout
 
 
 # ------------------------------------------- call-frame immutability (perf fix)

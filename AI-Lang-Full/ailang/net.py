@@ -31,7 +31,9 @@ from urllib.parse import parse_qs, urlparse
 
 from pathlib import Path
 
+from .capabilities import require, resource_host, resource_path
 from .errors import VMError
+from .resources import register as register_resource
 
 _servers = {}
 _next = [1]
@@ -42,6 +44,10 @@ def _port(value, where):
     if type(value) is not int or not 0 <= value <= 65535:
         raise VMError(f"{where}: port must be an Int between 0 and 65535")
     return value
+
+
+def _endpoint(host, port):
+    return resource_host(f"{host}:{port}")
 
 
 def _timeout(value, where, default=None):
@@ -66,6 +72,14 @@ class _Sock:
         self.addr = addr
         self.id = _next[0]
         _next[0] += 1
+        register_resource(lambda sock=self: _close_quiet(sock))
+
+
+def _close_quiet(sock):
+    try:
+        sock.sock.close()
+    except (AttributeError, OSError):
+        pass
 
 
 def tcp_listen(port, host="0.0.0.0", backlog=64):
@@ -75,6 +89,7 @@ def tcp_listen(port, host="0.0.0.0", backlog=64):
         raise VMError("tcp_listen: host must be non-empty Text")
     if type(backlog) is not int or not 1 <= backlog <= 65535:
         raise VMError("tcp_listen: backlog must be an Int between 1 and 65535")
+    require("net.listen", _endpoint(host, port), "tcp_listen")
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -89,6 +104,7 @@ def tcp_accept(listener, timeout=None):
     """Wait for a connection; returns a connected socket."""
     if not isinstance(listener, _Sock) or listener.kind != "listener":
         raise VMError("tcp_accept: argument must be a socket from tcp_listen")
+    require("net.listen", resource_host(listener.addr), "tcp_accept")
     timeout = _timeout(timeout, "tcp_accept")
     previous_timeout = listener.sock.gettimeout()
     try:
@@ -115,6 +131,7 @@ def tcp_connect(host, port, timeout=10.0):
         raise VMError("tcp_connect: host must be non-empty Text")
     port = _port(port, "tcp_connect")
     timeout = _timeout(timeout, "tcp_connect", 10.0)
+    require("net.connect", _endpoint(host, port), "tcp_connect")
     try:
         s = socket.create_connection((host, port), timeout=timeout)
         s.settimeout(None)
@@ -139,6 +156,7 @@ def tcp_send(conn, data):
     """Send UTF-8 text or bytes over a connection; returns the byte count."""
     if not isinstance(conn, _Sock) or conn.kind != "connection":
         raise VMError("tcp_send: argument must be a connected socket")
+    require("net.connect", resource_host(conn.addr), "tcp_send")
     payload = _payload(data, "tcp_send")
     try:
         conn.sock.sendall(payload)
@@ -151,6 +169,7 @@ def tcp_receive(conn, limit=65536, timeout=None):
     """Read up to `limit` bytes as UTF-8 text; empty text means peer closed."""
     if not isinstance(conn, _Sock) or conn.kind != "connection":
         raise VMError("tcp_receive: argument must be a connected socket")
+    require("net.connect", resource_host(conn.addr), "tcp_receive")
     if type(limit) is not int or not 1 <= limit <= _MAX_SOCKET_READ:
         raise VMError(
             f"tcp_receive: limit must be an Int between 1 and {_MAX_SOCKET_READ}"
@@ -177,6 +196,8 @@ def tcp_close(sock):
     """Close a socket."""
     if not isinstance(sock, _Sock):
         raise VMError("tcp_close: argument must be a socket")
+    require("net.listen" if sock.kind == "listener" else "net.connect",
+            resource_host(sock.addr), "tcp_close")
     try:
         sock.sock.close()
     except OSError:
@@ -321,10 +342,12 @@ def _ssl_context(spec):
     else:
         raise VMError("serve: ssl must be a cert path or a [cert, key] pair")
     cert = str(cert)
+    require("fs.read", resource_path(cert), "serve ssl certificate")
     if not Path(cert).is_file():
         raise VMError(f"serve: ssl certificate not found: {cert}")
     if key is not None:
         key = str(key)
+        require("fs.read", resource_path(key), "serve ssl key")
         if not Path(key).is_file():
             raise VMError(f"serve: ssl key not found: {key}")
     ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
@@ -402,6 +425,7 @@ def serve(port, handler, host="0.0.0.0", background=False, ssl=None):
     if not callable(handler):
         raise VMError("serve: second argument must be a function taking a request")
     port = _port(port, "serve")
+    require("net.listen", _endpoint(host, port), "serve")
     ctx = _ssl_context(ssl) if ssl is not None else None
     request_context = contextvars.copy_context()
     request_slots = threading.BoundedSemaphore(_MAX_SERVER_WORKERS)
@@ -503,6 +527,7 @@ def serve(port, handler, host="0.0.0.0", background=False, ssl=None):
     ident = _next_server_id()
     with _SERVERS_LOCK:
         _SERVERS[ident] = httpd
+    register_resource(lambda httpd=httpd: _stop_server_quiet(httpd))
     actual_port = int(httpd.server_address[1])
 
     if background:
@@ -520,6 +545,17 @@ def serve(port, handler, host="0.0.0.0", background=False, ssl=None):
         with _SERVERS_LOCK:
             _SERVERS.pop(ident, None)
     return None
+
+
+def _stop_server_quiet(httpd):
+    try:
+        httpd.shutdown()
+    except Exception:
+        pass
+    try:
+        httpd.server_close()
+    except Exception:
+        pass
 
 
 def _shutdown_all():
@@ -543,6 +579,11 @@ atexit.register(_shutdown_all)
 
 def serve_stop(server):
     """Stop a background server started by ``serve(..., background: true)``."""
+    if isinstance(server, dict):
+        target = _endpoint(server.get("host", "0.0.0.0"), server.get("port", "*"))
+    else:
+        target = "*"
+    require("net.listen", target, "serve_stop")
     ident = server.get("id") if isinstance(server, dict) else server
     with _SERVERS_LOCK:
         httpd = _SERVERS.pop(ident, None)

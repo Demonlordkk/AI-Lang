@@ -8,11 +8,18 @@ import sys
 import time
 from pathlib import Path
 
+from .capabilities import CapabilitySet
 from .errors import AILangError, Panic, ProcessExit
 from .values import display
 from .version import LANGUAGE, VERSION
 
 BANNER = f"{LANGUAGE} {VERSION}"
+ARTIFACT_KEY_ENV = "AILANG_ARTIFACT_KEY"
+
+
+def _artifact_key(args, option):
+    value = getattr(args, option, None)
+    return value if value is not None else os.environ.get(ARTIFACT_KEY_ENV)
 
 
 def _fail(exc: AILangError, source=None, filename="<source>"):
@@ -33,6 +40,32 @@ def _read_source(path: Path) -> str:
         raise AILangError(f"could not be read: {e.strerror or e}") from None
 
 
+def _execution_capabilities(args):
+    """Resolve CLI capability flags without changing legacy trusted runs."""
+    specs = list(getattr(args, "allow", []) or [])
+    if not getattr(args, "sandbox", False) and not specs:
+        return None
+    try:
+        return CapabilitySet.from_specs(specs)
+    except ValueError as e:
+        raise AILangError(f"invalid capability policy: {e}") from None
+
+
+def _add_capability_flags(parser):
+    parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="deny ambient effects unless explicitly granted with --allow",
+    )
+    parser.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        metavar="CAPABILITY[=RESOURCE]",
+        help="grant an effect, optionally restricted by a resource glob; repeatable",
+    )
+
+
 def cmd_trace(args):
     from .toolchain import run_file
 
@@ -46,7 +79,8 @@ def cmd_trace(args):
     source = None
     try:
         source = _read_source(path)
-        run_file(path, argv=args.args, check=not args.no_check, fuel=args.fuel, trace=True)
+        run_file(path, argv=args.args, check=not args.no_check, fuel=args.fuel,
+                 trace=True, capabilities=_execution_capabilities(args))
         return 0
     except ProcessExit as e:
         return e.code
@@ -128,9 +162,16 @@ def cmd_run(args):
         # a built artifact runs directly: rehydrate, no re-parse, no re-check
         try:
             if args.profile:
-                _profile_run(lambda: run_artifact(path, argv=args.args, fuel=args.fuel))
+                _profile_run(lambda: run_artifact(
+                    path, argv=args.args, fuel=args.fuel,
+                    capabilities=_execution_capabilities(args),
+                    signing_key=_artifact_key(args, "verify_key"),
+                    require_signature=args.require_signature))
             else:
-                run_artifact(path, argv=args.args, fuel=args.fuel)
+                run_artifact(path, argv=args.args, fuel=args.fuel,
+                             capabilities=_execution_capabilities(args),
+                             signing_key=_artifact_key(args, "verify_key"),
+                             require_signature=args.require_signature)
             return 0
         except ProcessExit as e:
             return e.code
@@ -152,11 +193,12 @@ def cmd_run(args):
         if args.profile:
             _profile_run(
                 lambda: run_file(path, argv=args.args, check=not args.no_check,
-                                 fuel=args.fuel)
+                                 fuel=args.fuel, capabilities=_execution_capabilities(args))
             )
         else:
             run_file(path, argv=args.args, check=not args.no_check,
-                     fuel=args.fuel, trace=args.trace)
+                     fuel=args.fuel, trace=args.trace,
+                     capabilities=_execution_capabilities(args))
         return 0
     except ProcessExit as e:
         return e.code
@@ -205,7 +247,13 @@ def cmd_build(args):
         # but refuses to replace a directory with an artifact (bytecode.write
         # performs the final atomic replacement).
         out.parent.mkdir(parents=True, exist_ok=True)
-        obj = write(program, out, source)
+        obj = write(
+            program,
+            out,
+            source,
+            signing_key=_artifact_key(args, "sign_key"),
+            key_id=args.key_id,
+        )
     except AILangError as e:
         return _fail(e, source, str(path))
     except (OSError, ValueError, UnicodeError, RecursionError) as e:
@@ -554,6 +602,16 @@ def build_parser():
         action="store_true",
         help="print each source line as it executes",
     )
+    p.add_argument(
+        "--verify-key",
+        help=f"HMAC key for authenticating artifacts (or {ARTIFACT_KEY_ENV})",
+    )
+    p.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="reject unsigned artifacts",
+    )
+    _add_capability_flags(p)
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("check", help="type-check without running")
@@ -563,6 +621,11 @@ def build_parser():
     p = sub.add_parser("build", help="compile to a bytecode artifact")
     p.add_argument("file")
     p.add_argument("-o", "--output")
+    p.add_argument(
+        "--sign-key",
+        help=f"HMAC key for artifact signing (or {ARTIFACT_KEY_ENV})",
+    )
+    p.add_argument("--key-id", default="", help="label stored with the artifact signature")
     p.set_defaults(fn=cmd_build)
 
     p = sub.add_parser("fmt", help="format source in place")
@@ -604,6 +667,7 @@ def build_parser():
     p.add_argument("args", nargs="*", help="arguments passed to the program")
     p.add_argument("--fuel", type=int, default=None)
     p.add_argument("--no-check", action="store_true")
+    _add_capability_flags(p)
     p.set_defaults(fn=cmd_trace)
 
     p = sub.add_parser("dis", help="disassemble a program to opcodes")

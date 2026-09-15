@@ -30,6 +30,7 @@ _MAX_INSTRUCTIONS = 10_000_000
 _MAX_SEQUENCE_COUNT = 10_000_000
 _MAX_JSON_DEPTH = 1_000
 _MAX_INTEGER_DIGITS = 10_000
+_SIGNATURE_ALG = "hmac-sha256"
 
 # The VM currently supports every opcode listed here.  Keeping the arity table
 # next to the artifact validator makes a malformed file fail before dispatch,
@@ -414,7 +415,57 @@ def _validate_function(value, name, function_names, record_names, is_main=False)
     return value
 
 
-def artifact(program: ProgramCode, source: str | None = None) -> dict:
+def _canonical_json(value) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _unsigned_artifact(obj: dict) -> dict:
+    """Return the exact object covered by an artifact signature."""
+    return {
+        key: value
+        for key, value in obj.items()
+        if key not in {"artifact_sha256", "signature"}
+    }
+
+
+def _artifact_signature(payload: bytes, key: str) -> str:
+    if not isinstance(key, str) or not key:
+        raise ValueError("artifact signing needs a non-empty text key")
+    return hmac.new(key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _signed_artifact_payload(obj: dict, key_id: str) -> bytes:
+    # Authenticate key metadata too; otherwise an attacker could relabel the
+    # publisher/key id while retaining a valid MAC over the code.
+    return _canonical_json({
+        "artifact": _unsigned_artifact(obj),
+        "key_id": key_id,
+    })
+
+
+def _validate_signature(value, name):
+    if not isinstance(value, dict):
+        _corrupt(name, "signature is not an object")
+    if set(value) - {"alg", "key_id", "sig"}:
+        _corrupt(name, "signature contains unknown fields")
+    if value.get("alg") != _SIGNATURE_ALG:
+        _corrupt(name, "unsupported signature algorithm")
+    key_id = value.get("key_id", "")
+    sig = value.get("sig")
+    if not isinstance(key_id, str) or len(key_id) > 256:
+        _corrupt(name, "signature key_id is malformed")
+    if not isinstance(sig, str) or len(sig) != 64 or any(c not in "0123456789abcdef" for c in sig):
+        _corrupt(name, "signature value is malformed")
+
+
+def artifact(program: ProgramCode, source: str | None = None,
+             signing_key: str | None = None, key_id: str = "") -> dict:
     """Return a canonical, safe artifact object for ``program``."""
     if not isinstance(program, ProgramCode):
         raise ValueError("cannot serialize a non-ProgramCode program")
@@ -443,20 +494,25 @@ def artifact(program: ProgramCode, source: str | None = None) -> dict:
         # artifacts use ordinary validated VM instructions.
         "native_loops": [],
     }
-    raw = json.dumps(
-        obj,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    obj["artifact_sha256"] = hashlib.sha256(raw).hexdigest()
+    if signing_key is not None:
+        if not isinstance(key_id, str) or len(key_id) > 256:
+            raise ValueError("artifact signing key_id must be text of at most 256 characters")
+        obj["signature"] = {
+            "alg": _SIGNATURE_ALG,
+            "key_id": key_id,
+            "sig": _artifact_signature(_signed_artifact_payload(obj, key_id), signing_key),
+        }
+    # The integrity digest covers the signature metadata as well.  This gives
+    # callers a deterministic corruption check even when they intentionally
+    # defer authenticating the artifact until a key is available.
+    obj["artifact_sha256"] = hashlib.sha256(_canonical_json(obj)).hexdigest()
     return obj
 
 
-def write(program: ProgramCode, path, source: str | None = None) -> dict:
+def write(program: ProgramCode, path, source: str | None = None,
+          signing_key: str | None = None, key_id: str = "") -> dict:
     """Atomically write a deterministic artifact and return its object."""
-    obj = artifact(program, source)
+    obj = artifact(program, source, signing_key=signing_key, key_id=key_id)
     target = Path(path)
     if target.exists() and target.is_dir():
         raise ValueError(f"cannot write bytecode artifact to directory {target}")
@@ -487,13 +543,14 @@ def write(program: ProgramCode, path, source: str | None = None) -> dict:
     return obj
 
 
-def read(path) -> dict:
-    """Read and strictly validate an executable artifact.
+def read(path, signing_key: str | None = None,
+         require_signature: bool = False) -> dict:
+    """Read, validate, and optionally authenticate an executable artifact.
 
-    Validation happens before rehydration.  The integrity field is a
-    tamper/truncation detector, not an authenticity mechanism; applications
-    that execute artifacts from an untrusted source should authenticate the
-    file at a higher layer as well.
+    ``artifact_sha256`` detects accidental/casual tampering.  When a signing
+    key is supplied, the embedded HMAC authenticates the complete canonical
+    artifact payload; ``require_signature`` rejects unsigned artifacts even
+    when no key is configured.  Validation happens before rehydration.
     """
     target = Path(path)
     name = target.name or str(target)
@@ -549,7 +606,9 @@ def read(path) -> dict:
         if "main" in missing:
             _corrupt(name, "missing or malformed 'main'")
         _corrupt(name, f"missing required field(s): {', '.join(sorted(missing))}")
-    unknown = set(obj) - required_top
+    if "signature" in obj:
+        _validate_signature(obj["signature"], name)
+    unknown = set(obj) - required_top - {"signature"}
     if unknown:
         _corrupt(name, f"unknown top-level field(s): {', '.join(sorted(unknown))}")
 
@@ -583,6 +642,27 @@ def read(path) -> dict:
         raise ValueError(
             f"bytecode artifact {name} failed its integrity check "
             "(artifact_sha256 mismatch - the file was modified or truncated)"
+        )
+
+    signature = obj.get("signature")
+    if signature is None:
+        if require_signature or signing_key is not None:
+            raise ValueError(
+                f"bytecode artifact {name} is unsigned; a trusted signature is required"
+            )
+    elif signing_key is not None:
+        expected = _artifact_signature(
+            _signed_artifact_payload(obj, signature.get("key_id", "")),
+            signing_key,
+        )
+        if not hmac.compare_digest(expected, signature["sig"]):
+            raise ValueError(
+                f"bytecode artifact {name} failed signature authentication "
+                f"(key_id {signature.get('key_id', '')!r})"
+            )
+    elif require_signature:
+        raise ValueError(
+            f"bytecode artifact {name} has a signature but no verification key was supplied"
         )
 
     records = obj["records"]
@@ -638,9 +718,10 @@ def read(path) -> dict:
     return obj
 
 
-def load(path) -> ProgramCode:
-    """Rehydrate a validated artifact into a ``ProgramCode``."""
-    obj = read(path)
+def load(path, signing_key: str | None = None,
+         require_signature: bool = False) -> ProgramCode:
+    """Rehydrate an authenticated and validated artifact into ProgramCode."""
+    obj = read(path, signing_key=signing_key, require_signature=require_signature)
 
     def mk(d):
         return FunctionCode(

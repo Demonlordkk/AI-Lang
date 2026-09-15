@@ -83,40 +83,55 @@ class ModuleLoader:
         tried = "\n  ".join(str(c) for c in candidates)
         raise ImportError_(f"module '{path}' not found; looked in:\n  {tried}")
 
+    def _bundled_source(self, path: str):
+        """Read a source package embedded in the standalone zipapp, if any."""
+        try:
+            from ._bundled_sources import SOURCES
+        except ImportError:
+            return None
+        return SOURCES.get(path)
+
     def load(self, path: str) -> Module:
         with self._lock:
             return self._load_locked(path)
 
     def _load_locked(self, path: str) -> Module:
-        # Resolve before consulting the cache.  Different spellings of a
+        # Resolve before consulting the cache. Different spellings of a
         # module name must not create duplicate module instances or evade cycle
-        # detection.
-        file = self.resolve_path(path)
-        key = str(file)
+        # detection. A bundle can provide source through importlib resources
+        # when its package files live inside the zipapp rather than a directory.
+        file = None
+        bundled = None
+        try:
+            file = self.resolve_path(path)
+            key = str(file)
+            filename = str(file)
+            source = file.read_text(encoding="utf-8")
+        except ImportError_ as resolution_error:
+            bundled = self._bundled_source(path)
+            if bundled is None:
+                raise resolution_error
+            key = f"<bundle:{path}>"
+            filename = key
+            source = bundled
+        except UnicodeDecodeError as e:
+            raise ImportError_(f"module '{path}' ({file}) is not valid UTF-8: {e.reason}") from None
+        except OSError as e:
+            raise ImportError_(f"cannot read module '{path}' ({file}): {e}") from None
         if key in self.cache:
             return self.cache[key]
         if key in self.loading:
             chain = " -> ".join(self.loading + [key])
             raise ImportError_(f"circular import detected: {chain}")
 
-        try:
-            source = file.read_text(encoding="utf-8")
-        except UnicodeDecodeError as e:
-            raise ImportError_(f"module '{path}' ({file}) is not valid UTF-8: {e.reason}") from None
-        except OSError as e:
-            raise ImportError_(f"cannot read module '{path}' ({file}): {e}") from None
-
         from .toolchain import compile_source
         from .vm import VM
 
         self.loading.append(key)
         try:
-            program = compile_source(
-                source,
-                filename=str(file),
-                search_paths=[file.parent] + self.search_paths,
-            )
-            child = ModuleLoader([file.parent] + self.search_paths, self.globals_factory, self.fuel)
+            search = [file.parent] + self.search_paths if file is not None else self.search_paths
+            program = compile_source(source, filename=filename, search_paths=search)
+            child = ModuleLoader(search, self.globals_factory, self.fuel)
             child.cache = self.cache
             child.loading = self.loading
             child._lock = self._lock
@@ -140,31 +155,36 @@ class ModuleLoader:
             self.cache[key] = module
             return module
         except AILangError as e:
-            raise ImportError_(f"while importing '{path}' ({file}): {e}") from e
+            raise ImportError_(f"while importing '{path}' ({filename}): {e}") from e
         finally:
             self.loading.pop()
 
     def signatures(self, path: str):
         """Return static export signatures used by the type checker."""
+        file = None
         try:
             file = self.resolve_path(path)
+            source = file.read_text(encoding="utf-8")
+            filename = str(file)
         except ImportError_:
-            return {}
+            source = self._bundled_source(path)
+            if source is None:
+                return {}
+            filename = f"<bundle:{path}>"
+        except UnicodeDecodeError as e:
+            raise ImportError_(f"module '{path}' ({file}) is not valid UTF-8: {e.reason}") from None
+        except OSError as e:
+            raise ImportError_(f"cannot read module '{path}' ({file}): {e}") from None
         from .parser import parse
         from . import ast_nodes as A
         from .typecheck import FnSig, ty
 
         try:
-            source = file.read_text(encoding="utf-8")
             program = parse(source)
-        except UnicodeDecodeError as e:
-            raise ImportError_(f"module '{path}' ({file}) is not valid UTF-8: {e.reason}") from None
-        except OSError as e:
-            raise ImportError_(f"cannot read module '{path}' ({file}): {e}") from None
         except AILangError as e:
             # Never swallow a broken module: surface it at the import site.
             raise ImportError_(
-                f"module '{path}' ({file}) failed to parse: {e}", e.line, e.col
+                f"module '{path}' ({filename}) failed to parse: {e}", e.line, e.col
             ) from e
         out = {}
         for statement in program.statements:

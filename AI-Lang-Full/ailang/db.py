@@ -21,11 +21,28 @@ import json
 import sqlite3
 import threading
 
+from .capabilities import require, resource_path
 from .errors import VMError
+from .resources import register as register_resource
 from .values import MapKey, RecordValue, unmap_key
 
 _id_lock = threading.Lock()
 _next = [1]
+
+
+def _runtime_path(path):
+    """Resolve the same script-relative path used by the stdlib wrapper."""
+    if path == ":memory:":
+        return path
+    try:
+        from .stdlib import script_dir
+        base = script_dir()
+    except (ImportError, AttributeError):
+        base = None
+    if base and not path.startswith(("/", "\\")):
+        import os
+        return os.path.join(base, path)
+    return path
 
 
 class _DB:
@@ -47,11 +64,25 @@ class _DB:
         with _id_lock:
             self.id = _next[0]
             _next[0] += 1
+        register_resource(lambda db=self: _close_quiet(db))
+
+
+def _close_quiet(db):
+    if db.closed:
+        return
+    with db.lock:
+        try:
+            db.conn.close()
+        except sqlite3.Error:
+            pass
+        finally:
+            db.closed = True
 
 
 def _check(db, where):
     if not isinstance(db, _DB):
         raise VMError(f"{where}: first argument must be a database from db_open")
+    require("db.open", resource_path(db.path), where)
     if db.closed:
         raise VMError(f"{where}: database is closed")
     return db
@@ -88,6 +119,8 @@ def db_open(path=":memory:"):
     """Open (or create) a database. ':memory:' is a temporary one."""
     if not isinstance(path, str):
         raise VMError("db_open: path must be Text")
+    path = _runtime_path(path)
+    require("db.open", resource_path(path), "db_open")
     try:
         conn = sqlite3.connect(path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -218,13 +251,7 @@ def db_tables(db):
 def db_close(db):
     """Close the database."""
     db = _check(db, "db_close")
-    with db.lock:
-        try:
-            db.conn.close()
-        except sqlite3.Error:
-            pass
-        finally:
-            db.closed = True
+    _close_quiet(db)
     return None
 
 

@@ -72,6 +72,12 @@ class VMError(AILangError):
     stage = "runtime error"
 
 
+class CapabilityError(VMError):
+    """An effect was attempted without an explicitly granted capability."""
+
+    stage = "capability error"
+
+
 class ImportError_(AILangError):
     stage = "import error"
 
@@ -121,6 +127,7 @@ __all__ = [
     "CheckError",
     "CompileError",
     "VMError",
+    "CapabilityError",
     "ImportError_",
     "AILangRaise",
     "Panic",
