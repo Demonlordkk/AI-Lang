@@ -57,9 +57,14 @@ python3 ailang.py run examples/basic.al
 
 | Command | Purpose |
 | --- | --- |
-| `ailang run FILE [args...]` | Type-check, compile and execute a program |
+| `ailang run FILE [args...]` | Type-check, compile and execute a program (`.al` or a built `.albc.json`) |
+| `ailang run FILE --profile` | Run and print a top-15 cProfile time table |
 | `ailang check FILE` | Static analysis only, no execution |
 | `ailang build FILE [-o OUT]` | Emit a deterministic bytecode artifact |
+
+A built `.albc.json` artifact runs directly with `ailang run`, exactly like
+its source — same output, same `args`, no re-parse, no re-check — so a
+shipped program needs only the interpreter and one file.
 | `ailang test FILE` | Run every `fn test_*()` and report results |
 | `ailang fmt FILE [--check]` | Canonical formatting |
 | `ailang lint FILE` | Style and correctness diagnostics |
@@ -432,7 +437,20 @@ Available everywhere without imports.
 
 **Network** — `http_get` `http_post` `http_request` `serve` `serve_stop`
 
-**Concurrency** — `spawn` `await_all` `parallel_map`
+> HTTPS, both directions: `serve(port, handler, host, background, cert)`
+> takes a combined cert+key PEM path (or a `[cert, key]` pair) as its fifth
+> argument and serves TLS; `http_request(url, method, body, headers, verify,
+> timeout)` speaks `https://` natively, with an opt-out of certificate
+> verification for self-signed endpoints. Servers cap request bodies at ~1 MB
+> (413) and drop idle connections after 30 s.
+
+**Concurrency** — `spawn` `await_all` `parallel_map` `await` `mutex` `lock`
+`unlock` `channel` `channel_send` `channel_recv` `channel_try_recv`
+`channel_close`
+
+> `spawn` runs a function on a shared thread pool; `await(task)` joins one
+> task, `await_all` joins many. `mutex()`/`lock`/`unlock` guard shared state;
+> `channel()` gives threads a queue with `send`/`recv`/`try_recv`/`close`.
 
 **Statistics** — `mean` `median` `variance` `stddev` `percentile`
 `normalize` `standardize` `correlation` `bincount`
@@ -454,6 +472,11 @@ plain `+` `-` `*` `/` and unary `-` on tensors. Full table in
 **Automation** — `read_csv` `write_csv` `read_lines` `write_lines`
 `list_dir` `find_files` `path_exists` `is_dir` `make_dir` `delete_file`
 `run` `timestamp` `retry` `timed`
+
+**Packages** — `ailang publish` (optionally HMAC-SHA256 signed with
+`--key`/`AILANG_REGISTRY_KEY`), `ailang add`, `ailang install` (enforces
+publisher signatures when a key is set), `ailang verify` (digests +
+signatures)
 
 ---
 

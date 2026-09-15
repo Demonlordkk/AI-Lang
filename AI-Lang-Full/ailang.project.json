@@ -1,6 +1,6 @@
 {
   "name": "ai-lang",
-  "version": "2.9.0",
+  "version": "2.9.5",
   "language": "AI-Lang",
   "entry": "examples/basic.al",
   "source_dirs": ["examples"],
