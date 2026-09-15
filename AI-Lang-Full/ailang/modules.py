@@ -14,12 +14,14 @@ from .values import Module
 
 
 class ModuleLoader:
-    def __init__(self, search_paths: List[Path], globals_factory, fuel=50_000_000):
+    def __init__(self, search_paths: List[Path], globals_factory, fuel=None):
         self.search_paths = [Path(p).resolve() for p in search_paths]
         self.globals_factory = globals_factory
         self.cache: Dict[str, Module] = {}
         self.loading: List[str] = []
-        self.fuel = fuel
+        from .vm import fuel_default
+
+        self.fuel = fuel if fuel is not None else fuel_default()
 
     def resolve_path(self, path: str) -> Path:
         rel = Path(*path.split("/"))

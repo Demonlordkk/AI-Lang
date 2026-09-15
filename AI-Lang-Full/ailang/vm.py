@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 
 from .errors import AILangError, AILangRaise, VMError
@@ -114,11 +115,29 @@ class _Break(Exception):
     pass
 
 
+def fuel_default() -> int:
+    """The default step budget: 50,000,000 steps.
+
+    Overridable with `AILANG_FUEL=N` (a positive integer) for programs that
+    legitimately need a bigger budget, e.g. multi-million-iteration loops.
+    """
+    raw = os.environ.get("AILANG_FUEL", "")
+    try:
+        n = int(raw)
+        if n > 0:
+            return n
+    except ValueError:
+        pass
+    return 50_000_000
+
+
 class VM:
     MAX_DEPTH = 2500
 
-    def __init__(self, globals_dict: Dict[str, Any] = None, fuel: int = 50_000_000,
+    def __init__(self, globals_dict: Dict[str, Any] = None, fuel: int = None,
                  module_loader=None):
+        if fuel is None:
+            fuel = fuel_default()
         self.globals = Environment(None, globals_dict or {})
         self.globals.vars.setdefault("true", True)
         self.globals.vars.setdefault("false", False)
@@ -320,7 +339,9 @@ class VM:
             if fuel < 0:
                 _box[0] = fuel
                 self.fuel = fuel
-                raise VMError("execution limit exceeded")
+                raise VMError(
+                    'execution limit exceeded (raise the step budget with --fuel N or AILANG_FUEL=N)',
+                    line_table.get(ip, 0))
             ins = code[ip]
             op = ins[0]
             ip += 1

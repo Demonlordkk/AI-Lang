@@ -50,10 +50,13 @@ def run_source(
     search_paths: Optional[List] = None,
     argv: Optional[List[str]] = None,
     check: bool = True,
-    fuel: int = 50_000_000,
+    fuel: Optional[int] = None,
 ):
     from .modules import ModuleLoader
+    from .vm import fuel_default
 
+    if fuel is None:
+        fuel = fuel_default()
     paths = search_paths or [Path(filename).parent if filename != "<source>" else Path.cwd()]
     program = compile_source(source, filename, paths, check=check)
     loader = ModuleLoader(paths, lambda: build_globals(argv), fuel)
@@ -74,7 +77,7 @@ def _project_root(start: Path):
     return None
 
 
-def run_file(path, argv=None, check=True, fuel=50_000_000):
+def run_file(path, argv=None, check=True, fuel=None):
     p = Path(path)
     source = p.read_text(encoding="utf-8")
     # relative paths inside the program resolve against the program's own

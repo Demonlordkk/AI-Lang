@@ -42,7 +42,10 @@ def cmd_run(args):
     source = None
     try:
         source = _read_source(path)
-        run_file(path, argv=args.args, check=not args.no_check)
+        if args.fuel is not None and args.fuel <= 0:
+            print("ailang: --fuel must be a positive number of steps", file=sys.stderr)
+            return 2
+        run_file(path, argv=args.args, check=not args.no_check, fuel=args.fuel)
         return 0
     except ProcessExit as e:
         return e.code
@@ -389,6 +392,12 @@ def build_parser():
     p.add_argument("file")
     p.add_argument("args", nargs="*", help="arguments passed to the program")
     p.add_argument("--no-check", action="store_true", help="skip static checking")
+    p.add_argument(
+        "--fuel",
+        type=int,
+        default=None,
+        help="step budget for the run (default 50,000,000, or AILANG_FUEL)",
+    )
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("check", help="type-check without running")

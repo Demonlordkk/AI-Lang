@@ -490,6 +490,8 @@ class TypeChecker:
         self.module_resolver = module_resolver
         self.return_stack = []
         self.loop_depth = 0
+        # unknown type names are reported once, at their first occurrence
+        self._unknown_types = set()
         for name, sig in _builtin_sigs().items():
             self.functions[name] = replace(sig)
             self.global_scope.declare(name, FUNCTION, False)
@@ -599,6 +601,9 @@ class TypeChecker:
         visit(statements)
 
     def _unknown_type(self, name, node):
+        if name in self._unknown_types:
+            return
+        self._unknown_types.add(name)
         hint = _closest(name, sorted(set(self.records) | set(__import__(
             "ailang.lexer", fromlist=["TYPE_NAMES"]).TYPE_NAMES))) if name else []
         extra = ""
@@ -644,12 +649,17 @@ class TypeChecker:
         if isinstance(s, (A.Let, A.Var)):
             t = self.expr(s.expr)
             if s.declared_type:
-                declared = ty(s.declared_type)
-                if not self.compatible(declared, t):
-                    self.error(
-                        f"cannot bind {t} to '{s.name}' declared as {declared}", s
-                    )
-                t = declared
+                if s.declared_type in self._unknown_types:
+                    # the declared type itself is the error; a bind check
+                    # against it would only repeat the same unknown name
+                    pass
+                else:
+                    declared = ty(s.declared_type)
+                    if not self.compatible(declared, t):
+                        self.error(
+                            f"cannot bind {t} to '{s.name}' declared as {declared}", s
+                        )
+                    t = declared
             # user bindings may shadow builtins; only real redeclaration is an error
             if self.scope.local(s.name) and not (
                 self.scope is self.global_scope and s.name in BUILTIN_SIGS

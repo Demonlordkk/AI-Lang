@@ -279,11 +279,15 @@ def lint(source: str):
                 issues.append((n, message))
     # structural checks via the parser
     try:
+        from .contracts import desugar
         from .parser import parse
         from .typecheck import TypeChecker
         from .errors import AILangError
 
         program = parse(source)
+        # contracts desugar to ordinary statements; lint must see the same
+        # tree the compiler sees, not raw Needs/Ensures nodes
+        desugar(program)
         try:
             TypeChecker().check(program)
         except AILangError as e:

@@ -65,6 +65,25 @@ python3 ailang.py run examples/basic.al
 | `ailang lint FILE` | Style and correctness diagnostics |
 | `ailang repl` | Interactive session with persistent state |
 
+### The step budget
+
+Every run has a step budget (fuel): a hard ceiling on how many interpreter
+steps a program may take, so a genuine infinite loop fails with a clean
+error instead of hanging the machine. The default is 50,000,000 steps, and
+it is overridable when a program legitimately needs more — a
+multi-million-iteration numerical loop, for instance:
+
+```bash
+ailang run heavy.al --fuel 200000000      # or:
+AILANG_FUEL=200000000 ailang run heavy.al
+```
+
+Exhaustion is a normal, catchable error that says exactly what to do:
+
+```
+program.al:4:0: runtime error: execution limit exceeded (raise the step budget with --fuel N or AILANG_FUEL=N)
+```
+
 ---
 
 ## Language tour

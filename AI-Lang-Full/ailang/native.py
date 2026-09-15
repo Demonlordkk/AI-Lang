@@ -271,7 +271,7 @@ class _Gen:
         elif isinstance(s, A.While):
             # a loop compiled to host bytecode would otherwise run forever
             # without touching the interpreter's fuel meter; the per-iteration
-            # check gives it exactly the same "execution limit exceeded"
+            # check gives it exactly the same "execution limit exceeded" wall
             # behaviour a bytecode loop has
             self.w(f"while _tr({self.expr(s.cond)}):")
             self.depth += 1
@@ -419,7 +419,7 @@ def _make_runtime(lookup, fuel_box=None):
         if not _count[0]:
             _count[0] = 256
             if _box[0] <= 0:
-                raise VMError("execution limit exceeded")
+                raise VMError('execution limit exceeded (raise the step budget with --fuel N or AILANG_FUEL=N)')
 
     def _fuel_iter(it):
         for item in it:
