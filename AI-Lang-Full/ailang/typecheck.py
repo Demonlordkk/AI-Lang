@@ -303,7 +303,7 @@ BUILTIN_SIGS = {
     "store_get": ([("db", ANY), ("key", TEXT), ("fallback", ANY)], ANY, 1),
     "store_delete": ([("db", ANY), ("key", TEXT)], BOOL),
     "store_keys": ([("db", ANY), ("prefix", TEXT)], LIST, 1),
-    "serve": ([("port", INT), ("handler", FUNCTION), ("host", TEXT), ("background", BOOL)], ANY, 2),
+    "serve": ([("port", INT), ("handler", FUNCTION), ("host", TEXT), ("background", BOOL), ("ssl", ANY)], ANY, 2),
     "serve_stop": ([("server", ANY)], VOID),
     "tcp_listen": ([("port", INT), ("host", TEXT), ("backlog", INT)], ANY, 2),
     "tcp_accept": ([("listener", ANY), ("timeout", ANY)], ANY, 1),
@@ -339,7 +339,7 @@ BUILTIN_SIGS = {
     "await_all": ([("tasks", LIST)], LIST),
     "http_get": ([("url", TEXT), ("headers", MAP)], MAP, 1),
     "http_post": ([("url", TEXT), ("body", ANY), ("headers", MAP)], MAP, 2),
-    "http_request": ([("url", TEXT), ("method", TEXT), ("body", ANY), ("headers", MAP)], MAP, 2),
+    "http_request": ([("url", TEXT), ("method", TEXT), ("body", ANY), ("headers", MAP), ("verify", BOOL), ("timeout", ANY)], MAP, 2),
 }
 
 

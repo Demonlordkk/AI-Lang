@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import json
 import socket
+import ssl as _ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import atexit
 from urllib.parse import parse_qs, urlparse
+
+from pathlib import Path
 
 from .errors import VMError
 
@@ -156,13 +159,47 @@ def _normalise(response):
     return status, headers, body
 
 
-def serve(port, handler, host="0.0.0.0", background=False):
-    """Run an HTTP server; every request calls `handler(request)`."""
+MAX_BODY_BYTES = 1_000_000
+"""Default request-body cap for `serve` (~1 MB); larger requests get 413."""
+
+
+def _ssl_context(spec):
+    """Build a server SSLContext from a cert path or a [cert, key] pair."""
+    if isinstance(spec, str):
+        cert, key = spec, None
+    elif isinstance(spec, (list, tuple)) and len(spec) == 2:
+        cert, key = spec
+    else:
+        raise VMError("serve: ssl must be a cert path or a [cert, key] pair")
+    cert = str(cert)
+    if not Path(cert).is_file():
+        raise VMError(f"serve: ssl certificate not found: {cert}")
+    if key is not None:
+        key = str(key)
+        if not Path(key).is_file():
+            raise VMError(f"serve: ssl key not found: {key}")
+    ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.load_cert_chain(certfile=cert, keyfile=key)
+    except Exception as e:
+        raise VMError(f"serve: cannot load ssl certificate: {e}") from e
+    return ctx
+
+
+def serve(port, handler, host="0.0.0.0", background=False, ssl=None):
+    """Run an HTTP (or HTTPS, when `ssl` is given) server.
+
+    Every request calls `handler(request)`. `ssl` accepts a single PEM file
+    holding both certificate and key, or a `[cert, key]` pair.
+    """
     if not callable(handler):
         raise VMError("serve: second argument must be a function taking a request")
+    ctx = _ssl_context(ssl) if ssl is not None else None
 
     class _H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = 30  # idle keep-alive connections cannot pin a worker thread
+        MAX_BODY = MAX_BODY_BYTES
 
         def log_message(self, *a):  # silence stderr access logs
             pass
@@ -170,6 +207,15 @@ def serve(port, handler, host="0.0.0.0", background=False):
         def _dispatch(self):
             try:
                 length = int(self.headers.get("content-length") or 0)
+                if length > self.MAX_BODY:
+                    data = b"request body too large"
+                    self.send_response(413)
+                    self.send_header("content-length", str(len(data)))
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    self.close_connection = True
+                    return
                 body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
                 req = _request_map(self, body)
                 status, headers, text = _normalise(handler(req))
@@ -190,6 +236,8 @@ def serve(port, handler, host="0.0.0.0", background=False):
     except OSError as e:
         raise VMError(f"serve: cannot bind {host}:{port}: {e}") from e
     httpd.daemon_threads = True
+    if ctx is not None:
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 
     ident = _next[0]
     _next[0] += 1

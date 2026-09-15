@@ -557,7 +557,7 @@ def _http_post(url, body=None, headers=None):
     return _http_request(url, "POST", body, headers)
 
 
-def _http_request(url, method, body=None, headers=None):
+def _http_request(url, method, body=None, headers=None, verify=True, timeout=30):
     _need_text(url, "http", "url")
     data = None
     hdrs = {"User-Agent": "AI-Lang/2.0"}
@@ -569,9 +569,16 @@ def _http_request(url, method, body=None, headers=None):
             hdrs.setdefault("Content-Type", "application/json")
         else:
             data = display(body).encode()
+    ctx = None
+    if str(url).startswith("https") and not verify:
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=float(timeout), context=ctx) as r:
             raw = r.read().decode("utf-8", "replace")
             return {"status": r.status, "body": raw, "headers": dict(r.headers)}
     except urllib.error.HTTPError as e:
