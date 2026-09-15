@@ -61,6 +61,8 @@ python3 ailang.py run examples/basic.al
 | `ailang run FILE --profile` | Run and print a top-15 cProfile time table |
 | `ailang check FILE` | Static analysis only, no execution |
 | `ailang build FILE [-o OUT]` | Emit a deterministic bytecode artifact |
+| `ailang trace FILE [args...]` | Run, printing each source line as it executes |
+| `ailang dis FILE` | Disassemble to opcodes without running |
 
 A built `.albc.json` artifact runs directly with `ailang run`, exactly like
 its source — same output, same `args`, no re-parse, no re-check — so a
@@ -88,6 +90,25 @@ Exhaustion is a normal, catchable error that says exactly what to do:
 ```
 program.al:4:0: runtime error: execution limit exceeded (raise the step budget with --fuel N or AILANG_FUEL=N)
 ```
+
+### Debugging
+
+Three tools for when a program misbehaves:
+
+* **`ailang trace FILE`** prints each source line as it executes, numbered
+  — the last line printed is the line about to misbehave. `ailang run FILE
+  --trace` does the same for a normal run. Tracing never changes the
+  program's output; it only slows it down.
+* **`ailang dis FILE`** prints the bytecode without running: per-function
+  headers, instruction numbers, opcode names and inline arguments. It
+  type-checks first, so a `dis` that completes is a program the checker
+  accepts.
+* **`panic(msg)`** is the fatal sibling of `raise`. Unlike an error, a
+  panic cannot be caught by `attempt` / `rescue` — like `exit()`, it is a
+  process-level event, in both engines. Use it for states where continuing
+  is never correct: corrupt configuration, missing credentials, an
+  invariant that should be impossible. The run stops with `ailang:
+  panic: msg` on stderr and exit code 1.
 
 ---
 
@@ -626,7 +647,12 @@ just `mean_t((t_matmul(x, w) - y) * (t_matmul(x, w) - y))`.
 | Activations | `t_sigmoid` `t_relu` `t_tanh` `t_softmax` |
 | Element-wise | `t_clip` `where_t` `l2_norm_t` |
 | Reduce | `sum_t` `mean_t` |
-| Losses | `mse_t` `mae_t` `bce_t` `bce_logits_t` `ce_t` `huber_t` `l2_penalty_t` |
+| Losses | `mse_t` `mae_t` `bce_t` `bce_logits_t` `ce_t` `huber_t` `l2_penalty_t` `ce_softmax_t` |
+| Fused | `t_matmul_bias` `ce_softmax_t` `t_dropout` |
+| Init | `xavier` `he_init` |
+| Schedules | `lr_step_decay` `lr_cosine` |
+| Guardrails | `early_stop` `early_stop_step` `gradcheck` |
+| Metrics | `accuracy` `f1` `train_test_split` |
 | Train | `backward` `zero_grad` `sgd_step` `momentum` `momentum_step` `adam` `adam_step` `adamw` `adamw_step` `clip_grad` |
 
 Tensors broadcast (a bias vector adds across every row), shapes are checked
@@ -692,6 +718,47 @@ ask `shape_of(...)`); the net has no hidden layer (linear models can't
 separate non-linear data — XOR is the canonical case); or the data itself has
 no signal.
 
+### Production toolkit
+
+Small examples teach the mechanics; a real training run needs a few more
+things, and they are all standard-library functions — still no framework:
+
+| Concern | Functions | Notes |
+| --- | --- | --- |
+| Regularisation | `t_dropout(x, rate, training)` | Inverted dropout: scaled pass-through while training, identity at evaluation — one net serves both |
+| Weight init | `xavier(n, m, seed)` `he_init(n, m, seed)` | Glorot for tanh, Kaiming for relu; `nn.mlp_init(sizes, seed, init)` builds a net with either |
+| Learning-rate schedule | `lr_step_decay(step, rate, factor, every)` `lr_cosine(step, total, rate, floor)` | Pure functions of the epoch — pass the result to the optimizer step |
+| Early stopping | `early_stop(patience)` `early_stop_step(state, val_loss)` | Tracks the best validation loss and reports when to stop |
+| Metrics | `f1(y_true, y_pred, threshold)` | Joins `accuracy` for per-class reporting |
+| Self-verification | `gradcheck(params, loss_fn)` | Analytic vs numerical gradients; around 1e-9..1e-10 means the engine is sound |
+| Fast layers | `t_matmul_bias(x, w, b)` `ce_softmax_t(logits, y)` | Fused forward+backward primitives — about 1.5× faster training, same gradients |
+
+`examples/ml/production_classifier.al` is the reference production run on
+these primitives: a 3-arm spiral split 120/30 into train and validation, a
+`[2, 24, 24, 3]` net with He init, dropout 0.1, AdamW under a cosine
+schedule, early stopping on validation loss, a gradcheck on the
+deterministic path, per-class F1, and a save/reload round-trip. It is
+seeded end to end, so it is reproducible word for word — on every repeated
+run and on both backends:
+
+```
+spiral: 150 points (120 train / 30 validation)...
+gradcheck: 2.93e-10
+  ...
+stopped at epoch 1374 (best val 0.09124)
+train accuracy:   1.0
+validation acc:   1.0
+validation f1:    1.0
+  class 0: f1 1.0
+  class 1: f1 1.0
+  class 2: f1 1.0
+reload identical: true
+```
+
+That is the numpy engine, in about 3 s; the reference engine runs the same
+program in 22 s and lands at train 1.0 / validation 0.967 — the engines
+share one API and one result quality, and each one is reproducible.
+
 ### From data to deployment
 
 A model in AI-Lang is data plus functions, so it flows through the rest of
@@ -729,9 +796,11 @@ The autodiff engine has two backends with identical semantics:
 
 Measured on this machine (`tools/bench_ml.py`): the same spiral-classification
 training program takes **6.3 s on the reference engine and 0.68 s on the
-numpy engine — about a 9× speedup** — with bit-identical outputs. The test
-suite runs every example and differential test on both engines and asserts
-identical output.
+numpy engine — about a 9× speedup**. Deterministic programs produce
+bit-identical output on both — the test suite runs every example and
+differential test on both engines and asserts it. Seeded random programs
+(dropout is the one place the training loop draws) are reproducible word
+for word *within* an engine: `seed(n)` fixes every stream the engine owns.
 
 A word about GPUs, said plainly: AI-Lang has **no built-in GPU path**. A
 Colab notebook or CUDA server gets the numpy accelerator, which is a large

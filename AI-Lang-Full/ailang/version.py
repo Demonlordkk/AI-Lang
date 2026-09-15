@@ -1,7 +1,7 @@
 """Single source of truth for AI-Lang version metadata."""
 
 LANGUAGE = "AI-Lang"
-VERSION = "2.9.5"
+VERSION = "2.10.0"
 BYTECODE_FORMAT = "AILBC-3"
 
 __all__ = ["LANGUAGE", "VERSION", "BYTECODE_FORMAT"]
