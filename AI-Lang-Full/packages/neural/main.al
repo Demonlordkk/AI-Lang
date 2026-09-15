@@ -22,13 +22,22 @@ done.
 # A multi-layer network from a list of layer widths, e.g. [2, 8, 3] is
 # 2 inputs -> 8 hidden -> 3 outputs. Hidden layers are tanh; the final
 # layer is linear so the caller chooses softmax/sigmoid/identity.
-fn mlp(sizes: List, seed: Int) -> Any:
+#
+# `init` picks the weight scheme: "randn" (historical default), "xavier"
+# (Glorot, good for tanh) or "he" (Kaiming, good for relu).
+fn mlp(sizes: List, seed: Int, init: Text) -> Any:
     var layers := [].
     var i := 0.
     while i < len(sizes) - 1:
         let n_in := sizes[i].
         let n_out := sizes[i + 1].
-        append(layers, Layer(param(randn(n_in, n_out, nothing, seed + i)), param(zeros(n_out)))).
+        when init == "xavier":
+            append(layers, Layer(param(xavier(n_in, n_out, seed + i)), param(zeros(n_out)))).
+        elif init == "he":
+            append(layers, Layer(param(he_init(n_in, n_out, seed + i)), param(zeros(n_out)))).
+        else:
+            append(layers, Layer(param(randn(n_in, n_out, nothing, seed + i)), param(zeros(n_out)))).
+        done.
         i <- i + 1.
     done.
     give Net(layers).
@@ -38,10 +47,25 @@ done.
 fn forward(net: Any, x: Any) -> Any:
     var a := x.
     repeat layer at i in net.layers:
-        a <- t_add(t_matmul(a, layer.w), layer.b).
+        a <- t_matmul_bias(a, layer.w, layer.b).
         when i < len(net.layers) - 1:
             a <- t_tanh(a).
         done.
+    done.
+    give a.
+done.
+
+# Forward pass with inverted dropout between the hidden layers. `rate` 0
+# (or training false) makes it identical to forward().
+fn forward_drop(net: Any, x: Any, rate: Real, training: Bool) -> Any:
+    var a := x.
+    var i := 0.
+    while i < len(net.layers):
+        a <- t_matmul_bias(a, get(net.layers, i).w, get(net.layers, i).b).
+        when i < len(net.layers) - 1:
+            a <- t_dropout(t_tanh(a), rate, training).
+        done.
+        i <- i + 1.
     done.
     give a.
 done.

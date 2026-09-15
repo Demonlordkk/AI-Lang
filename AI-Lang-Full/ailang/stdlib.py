@@ -1621,6 +1621,127 @@ def _randn(rows, cols=None, scale=None, seed=None):
     return [[rng.gauss(0.0, sd) for _ in range(c)] for _ in range(r)]
 
 
+# ------------------------------------------------------- production training
+def _xavier(n_in, n_out, seed=None):
+    """Glorot-uniform init: U(-limit, limit), limit = sqrt(6 / (fan_in+fan_out))."""
+    n_in = _need_int(n_in, "xavier", "n_in"); n_out = _need_int(n_out, "xavier", "n_out")
+    rng = _random.Random(seed) if seed is not None else _random
+    limit = math.sqrt(6.0 / max(1, n_in + n_out))
+    return [[rng.uniform(-limit, limit) for _ in range(n_out)] for _ in range(n_in)]
+
+
+def _he_init(n_in, n_out, seed=None):
+    """Kaiming-uniform init for ReLU nets: U(-limit, limit), limit = sqrt(6 / fan_in)."""
+    n_in = _need_int(n_in, "he_init", "n_in"); n_out = _need_int(n_out, "he_init", "n_out")
+    rng = _random.Random(seed) if seed is not None else _random
+    limit = math.sqrt(6.0 / max(1, n_in))
+    return [[rng.uniform(-limit, limit) for _ in range(n_out)] for _ in range(n_in)]
+
+
+def _lr_step_decay(step, initial, factor, every):
+    """Step decay: initial * factor ** (step // every)."""
+    return float(initial) * (float(factor) ** (int(step) // int(every)))
+
+
+def _lr_cosine(step, total, initial, floor=0.0):
+    """Cosine annealing from `initial` down to `floor` over `total` steps."""
+    import math as _m
+
+    total = max(1, int(total))
+    frac = min(int(step), total) / total
+    return float(floor) + (float(initial) - float(floor)) * 0.5 * (1.0 + _m.cos(_m.pi * frac))
+
+
+def _early_stop(patience):
+    return {"best": None, "steps": 0, "patience": _need_int(patience, "early_stop", "patience")}
+
+
+def _early_stop_step(state, val_loss):
+    """One validation checkpoint. Returns {stop, best, improved, waiting}."""
+    if not isinstance(state, dict) or "best" not in state:
+        raise VMError("early_stop_step: first argument must come from early_stop()")
+    val_loss = float(val_loss)
+    improved = state["best"] is None or val_loss < state["best"]
+    if improved:
+        state["best"] = val_loss
+        state["steps"] = 0
+    else:
+        state["steps"] += 1
+    return {
+        "stop": state["steps"] >= state["patience"],
+        "best": state["best"],
+        "improved": improved,
+        "waiting": state["steps"],
+    }
+
+
+def _gradcheck(params, fn, eps=1e-6):
+    """Compare analytical gradients against central numerical differences.
+
+    `fn` is a function of no arguments giving the scalar loss graph. Returns
+    the worst relative error over every parameter element — a healthy
+    autodiff engine reports values around 1e-7..1e-10.
+    """
+    from .autodiff import Tensor, backward
+
+    ts = [Tensor.of(p) if not isinstance(p, Tensor) else p for p in _need_list(params, "gradcheck")]
+    for p in ts:
+        if not p.requires_grad:
+            raise VMError("gradcheck: every parameter must be a trainable param()")
+    if not callable(fn):
+        raise VMError("gradcheck: second argument must be a loss function")
+    eps = float(eps)
+
+    # analytical gradients
+    for p in ts:
+        p.zero_grad()
+    loss = fn()
+    backward(loss)
+    ana = [list(p.grad) for p in ts]
+
+    worst = 0.0
+    for idx, p in enumerate(ts):
+        data = p.data
+        n = len(data)
+        base = data[:] if isinstance(data, list) else [float(v) for v in data]
+        for i in range(n):
+            old = base[i]
+            data[i] = old + eps
+            fp = float(fn().value() if hasattr(fn(), "value") else fn())
+            data[i] = old - eps
+            fm = float(fn().value() if hasattr(fn(), "value") else fn())
+            data[i] = old
+            num = (fp - fm) / (2.0 * eps)
+            a = float(ana[idx][i])
+            denom = max(1.0, abs(num), abs(a))
+            err = abs(num - a) / denom
+            if err > worst:
+                worst = err
+    # leave the graph's gradients in place (the analytical ones)
+    return float(worst)
+
+
+def _f1(y_true, y_pred, threshold=0.5):
+    """Binary F1 of predicted probabilities (or 0/1 labels) vs true labels."""
+    y_true = _need_list(y_true, "f1", "y_true")
+    y_pred = _need_list(y_pred, "f1", "y_pred")
+    if len(y_true) != len(y_pred):
+        raise VMError(f"f1: length mismatch {len(y_true)} vs {len(y_pred)}")
+    tp = fp = fn_ = 0
+    for t, v in zip(y_true, y_pred):
+        pos, pred = (float(t) >= 0.5), (float(v) >= threshold)
+        if pred and pos:
+            tp += 1
+        elif pred and not pos:
+            fp += 1
+        elif not pred and pos:
+            fn_ += 1
+    denom = 2 * tp + fp + fn_
+    if denom == 0:
+        return 0.0
+    return (2.0 * tp) / denom
+
+
 # ------------------------------------------------------------------ install
 
 # --------------------------------------------------- collection operations
@@ -1956,6 +2077,9 @@ def build_globals(argv=None):
         "t_tanh": lambda a: _ad().t_tanh(a),
         "t_softmax": lambda a: _ad().t_softmax(a),
         "t_matmul": lambda a, b: _ad().matmul(a, b),
+        "t_matmul_bias": lambda a, b, c: _ad().matmul_bias(a, b, c),
+        "ce_softmax_t": lambda logits, y: _ad().ce_softmax(logits, y),
+        "t_dropout": lambda x, rate, training=True: _ad().dropout(x, rate, bool(training)),
         "t_transpose": lambda a: _ad().transpose(a),
         "t_reshape": lambda a, s: _ad().reshape(a, s),
         "t_slice": lambda a, start, stop=None, axis=0: _ad().t_slice(a, start, stop, axis),
@@ -1980,6 +2104,15 @@ def build_globals(argv=None):
         "mae_t": lambda p, y: _ad().mae_loss(p, y),
         "bce_t": lambda p, y: _ad().bce_loss(p, y),
         "ce_t": lambda p, y: _ad().ce_loss(p, y),
+        # production training
+        "xavier": _xavier,
+        "he_init": _he_init,
+        "lr_step_decay": _lr_step_decay,
+        "lr_cosine": _lr_cosine,
+        "early_stop": _early_stop,
+        "early_stop_step": _early_stop_step,
+        "gradcheck": _gradcheck,
+        "f1": _f1,
         # machine learning
         "sigmoid": _sigmoid,
         "relu": _relu,

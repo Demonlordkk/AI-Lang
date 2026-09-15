@@ -41,15 +41,19 @@ let weights := [w1, b1, w2, b2].
 let opt := momentum(weights, 0.05, 0.9).
 
 fn logits(x: Any) -> Any:
-    let h := t_relu(t_add(t_matmul(x, w1), b1)).
-    give t_add(t_matmul(h, w2), b2).
+    let h := t_relu(t_matmul_bias(x, w1, b1)).
+    give t_matmul_bias(h, w2, b2).
 done.
+
+# the data tensors are built once, outside the loop
+let X := tensor(xs).
+let Y := tensor(ys).
 
 emit "training a 2-layer net on the {arms}-arm spiral ({n} points)...".
 var epoch := 0.
 while epoch < 1200:
     zero_grad(weights).
-    let loss := ce_t(logits(tensor(xs)), tensor(ys)).
+    let loss := ce_softmax_t(logits(X), Y).
     backward(loss).
     clip_grad(weights, 5.0).
     momentum_step(opt).
@@ -60,7 +64,7 @@ while epoch < 1200:
     epoch <- epoch + 1.
 done.
 
-let probs := value_of(logits(tensor(xs))).
+let probs := value_of(logits(X)).
 var correct := 0.
 repeat i in range(n):
     when argmax(probs[i]) == labels[i]:

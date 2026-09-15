@@ -25,6 +25,7 @@ Two engines drive the same graph:
 from __future__ import annotations
 
 import math
+import operator
 from typing import List, Optional, Tuple
 
 from . import accel
@@ -36,6 +37,14 @@ def _prod(shape) -> int:
     for d in shape:
         n *= d
     return n
+
+
+def _flat1d(t: "Tensor") -> List[float]:
+    """A tensor's data as a flat 1-D python list (engine-agnostic)."""
+    d = t.data
+    if isinstance(d, list):
+        return d
+    return [float(v) for v in d.reshape(-1)]
 
 
 def _flatten(value, out: List[float], shape: Optional[List[int]], depth: int):
@@ -193,8 +202,7 @@ class Tensor:
             if accel.have() and not isinstance(sg, list):
                 sg += accel.asarr(g)
             else:
-                for i, v in enumerate(g):
-                    sg[i] += v
+                self.grad = list(map(operator.add, sg, g))
 
     def __repr__(self):
         return f"Tensor(shape={list(self.shape)}, {self.value()})"
@@ -695,20 +703,22 @@ def matmul(a, b):
 
         return a._child(out, (n, m), (a, b), backward, "matmul")
 
-    brows = [bd[p * m:(p + 1) * m] for p in range(k)]
+    # forward as dot products against B's columns: the inner loop is a
+    # tight accumulator, which is ~1.5x faster in pure Python than
+    # spreading each A element across a row of B
+    bcols = [[bd[p * m + j] for p in range(k)] for j in range(m)]
     out = [0.0] * (n * m)
     for i in range(n):
-        ai = i * k
+        arow = ad[i * k:(i + 1) * k]
         oi = i * m
-        for p in range(k):
-            av = ad[ai + p]
-            if av == 0.0:
-                continue
-            brow = brows[p]
-            for j in range(m):
-                out[oi + j] += av * brow[j]
+        for j, bc in enumerate(bcols):
+            s = 0.0
+            for p in range(k):
+                s += arow[p] * bc[p]
+            out[oi + j] = s
 
     def backward(g):
+        brows = [bd[p * m:(p + 1) * m] for p in range(k)]
         if a.requires_grad:
             # ga = g @ B^T, as row dots against B's rows
             ga = [0.0] * (n * k)
@@ -736,6 +746,184 @@ def matmul(a, b):
             b._accum(gb)
 
     return a._child(out, (n, m), (a, b), backward, "matmul")
+
+
+def matmul_bias(a, b, c):
+    """`a @ b + c` in one node: the single most common MLP pattern.
+
+    One graph node instead of two, one gradient accumulation instead of
+    two — measurably faster in the reference engine, identical math.
+    `c` is a length-m vector (or 1-D row) broadcast across the rows.
+    """
+    a, b, c = T(a), T(b), T(c)
+    if len(a.shape) != 2 or len(b.shape) != 2:
+        raise VMError("matmul_bias needs two 2-D tensors")
+    n, k = a.shape
+    k2, m = b.shape
+    if k != k2:
+        raise VMError(f"matmul_bias: inner dimensions differ ({k} vs {k2})")
+    cdata = _flat1d(c)
+    if len(cdata) != m and len(cdata) != 1:
+        raise VMError(f"matmul_bias: bias length {len(cdata)} does not fit width {m}")
+    if len(cdata) == 1:
+        cdata = cdata * m
+    ad, bd = a.data, b.data
+
+    if accel.have():
+        np_ = accel.np()
+        A = ad.reshape(n, k)
+        B = bd.reshape(k, m)
+        out = np_.ascontiguousarray(A @ B + np_.asarray(cdata, dtype=np_.float64),
+                                   dtype=np_.float64).reshape(-1)
+
+        def backward(g):
+            g = np_.asarray(g, dtype=np_.float64).reshape(n, m)
+            if a.requires_grad:
+                a._accum((g @ B.T).reshape(-1))
+            if b.requires_grad:
+                b._accum((A.T @ g).reshape(-1))
+            if c.requires_grad:
+                c._accum((g.sum(axis=0)).reshape(-1))
+
+        return a._child(out, (n, m), (a, b, c), backward, "matmul_bias")
+
+    bcols = [[bd[p * m + j] for p in range(k)] for j in range(m)]
+    out = [0.0] * (n * m)
+    for i in range(n):
+        arow = ad[i * k:(i + 1) * k]
+        oi = i * m
+        for j, bc in enumerate(bcols):
+            s = cdata[j]
+            for p in range(k):
+                s += arow[p] * bc[p]
+            out[oi + j] = s
+
+    def backward(g):
+        brows = [bd[p * m:(p + 1) * m] for p in range(k)]
+        if a.requires_grad:
+            ga = [0.0] * (n * k)
+            for i in range(n):
+                grow = g[i * m:(i + 1) * m]
+                base = i * k
+                for p in range(k):
+                    s = 0.0
+                    for x, y in zip(grow, brows[p]):
+                        s += x * y
+                    ga[base + p] = s
+            a._accum(ga)
+        if b.requires_grad:
+            acols = [[ad[i * k + p] for i in range(n)] for p in range(k)]
+            gcols = [[g[i * m + j] for i in range(n)] for j in range(m)]
+            gb = [0.0] * (k * m)
+            for p in range(k):
+                ap = acols[p]
+                for j in range(m):
+                    s = 0.0
+                    for x, y in zip(ap, gcols[j]):
+                        s += x * y
+                    gb[p * m + j] = s
+            b._accum(gb)
+        if c.requires_grad:
+            gc = [0.0] * m
+            for i in range(n):
+                grow = g[i * m:(i + 1) * m]
+                for j in range(m):
+                    gc[j] += grow[j]
+            c._accum(gc)
+
+    return a._child(out, (n, m), (a, b, c), backward, "matmul_bias")
+
+
+def dropout(a, rate, training=True):
+    """Inverted dropout: scaled pass-through during training, identity at
+    inference. `training=false` (or rate 0) returns `a` itself, so the same
+    graph is correct for both training and evaluation."""
+    a = T(a)
+    rate = float(rate)
+    if not training or rate <= 0.0:
+        return a
+    if rate >= 1.0:
+        raise VMError("dropout: rate must be in [0, 1)")
+    n = a.size
+    keep = 1.0 - rate
+
+    if accel.have():
+        m = accel.np()
+        mask = (m.random.rand(n) >= rate).astype(m.float64) / keep
+        ad = a.data.reshape(-1)
+        out = (ad * mask).reshape(a.shape) if a.shape else ad * mask
+
+        def backward(g):
+            if a.requires_grad:
+                g = m.asarray(g, dtype=m.float64).reshape(-1)
+                a._accum((g * mask).reshape(ad.shape))
+
+        return a._child(out.reshape(-1), a.shape, (a,), backward, "dropout")
+
+    import random as _random
+
+    mask = [1.0 / keep if _random.random() >= rate else 0.0 for _ in range(n)]
+    ad = list(a.data)
+    out = [ad[i] * mask[i] for i in range(n)]
+
+    def backward(g):
+        if a.requires_grad:
+            a._accum([g[i] * mask[i] for i in range(n)])
+
+    return a._child(out, a.shape, (a,), backward, "dropout")
+
+
+def ce_softmax(logits, target):
+    """Softmax cross-entropy, fused: `ce_t(t_softmax(x), y)` in one node.
+
+    Numerically stabilised (row-max shift), averaged over rows exactly like
+    `ce_t`, and one gradient pass instead of two. `target` holds one-hot (or
+    soft) label rows of the same shape as `logits`.
+    """
+    a, y = T(logits), T(target)
+    if a.shape != y.shape or len(a.shape) != 2:
+        raise VMError(
+            f"ce_softmax needs matching 2-D shapes, got {list(a.shape)} and {list(y.shape)}"
+        )
+    rows, cols = a.shape
+    ad = _flat1d(a)
+    yd = _flat1d(y)
+
+    if accel.have():
+        m = accel.np()
+        X = m.asarray(ad, dtype=m.float64).reshape(rows, cols)
+        Y = m.asarray(yd, dtype=m.float64).reshape(rows, cols)
+        M = X.max(axis=1, keepdims=True)
+        E = m.exp(X - M)
+        S = E.sum(axis=1, keepdims=True)
+        P = (E / S).reshape(-1)
+        total = float(-m.sum(Y * (X - M - m.log(S))) / rows)
+
+        def backward(g):
+            if a.requires_grad:
+                a._accum((g[0] / rows) * (P - Y.reshape(-1)))
+
+        return a._child(_buf([total]), (), (a, y), backward, "ce_softmax")
+
+    total = 0.0
+    P = [0.0] * (rows * cols)
+    for r in range(rows):
+        base = r * cols
+        row = ad[base:base + cols]
+        mx = max(row)
+        exps = [math.exp(v - mx) for v in row]
+        s = math.fsum(exps)
+        for j in range(cols):
+            P[base + j] = exps[j] / s
+            total -= yd[base + j] * (row[j] - mx - math.log(s))
+    total = total / rows
+
+    def backward(g):
+        if a.requires_grad:
+            scale = g[0] / rows
+            a._accum([scale * (P[i] - yd[i]) for i in range(rows * cols)])
+
+    return a._child(_buf([total]), (), (a, y), backward, "ce_softmax")
 
 
 def transpose(a):
