@@ -148,15 +148,16 @@ def _project_root(start=None):
     return None
 
 
-def _registry(args):
-    from .packages import Registry
+def _registry(args, key=None):
+    from .packages import SIGNING_KEY_ENV, Registry
 
+    key = key or os.environ.get(SIGNING_KEY_ENV)
     if getattr(args, "registry", None):
-        return Registry(Path(args.registry))
+        return Registry(Path(args.registry), key=key)
     env = os.environ.get("AILANG_REGISTRY")
     if env:
-        return Registry(Path(env))
-    return Registry(Path.home() / ".ailang" / "registry")
+        return Registry(Path(env), key=key)
+    return Registry(Path.home() / ".ailang" / "registry", key=key)
 
 
 def cmd_install(args):
@@ -167,7 +168,7 @@ def cmd_install(args):
         print("ailang: no ailang.project.json found", file=sys.stderr)
         return 1
     try:
-        resolved = install(root, _registry(args))
+        resolved = install(root, _registry(args, key=getattr(args, "key", None)))
     except PackageError as e:
         print(f"ailang: {e}", file=sys.stderr)
         return 1
@@ -177,17 +178,21 @@ def cmd_install(args):
     for name, info in sorted(resolved.items()):
         print(f"  installed {name} {info['version']}")
     print(f"{len(resolved)} package(s) installed into ai_modules/")
+    for name, info in sorted(resolved.items()):
+        if info.get("signature") == "unverifiable":
+            print(f"  note: {name} {info['version']} is signed but could not be "
+                  f"verified (set AILANG_REGISTRY_KEY)")
     return 0
 
 
 def cmd_verify(args):
-    from .packages import verify
+    from .packages import SIGNING_KEY_ENV, verify
 
     root = _project_root()
     if root is None:
         print("ailang: no ailang.project.json found", file=sys.stderr)
         return 1
-    problems = verify(root)
+    problems = verify(root, key=os.environ.get(SIGNING_KEY_ENV))
     if problems:
         for p in problems:
             print(f"  {p}", file=sys.stderr)
@@ -200,12 +205,15 @@ def cmd_verify(args):
 def cmd_publish(args):
     from .packages import PackageError
 
+    reg = _registry(args, key=getattr(args, "key", None))
     try:
-        name, version = _registry(args).publish(Path(args.dir))
+        name, version = reg.publish(Path(args.dir), publisher=getattr(args, "publisher", None))
     except PackageError as e:
         print(f"ailang: {e}", file=sys.stderr)
         return 1
     print(f"published {name} {version}")
+    if reg.key is not None:
+        print("  signed (hmac-sha256)")
     return 0
 
 
@@ -478,6 +486,7 @@ def build_parser():
 
     p = sub.add_parser("install", help="install dependencies into ai_modules/")
     p.add_argument("--registry")
+    p.add_argument("--key", help="signing key (or AILANG_REGISTRY_KEY)")
     p.set_defaults(fn=cmd_install)
 
     p = sub.add_parser("add", help="add a dependency and install it")
@@ -492,6 +501,8 @@ def build_parser():
     p = sub.add_parser("publish", help="publish a package directory to the registry")
     p.add_argument("dir")
     p.add_argument("--registry")
+    p.add_argument("--key", help="HMAC signing key (or AILANG_REGISTRY_KEY)")
+    p.add_argument("--publisher", help="publisher name recorded in the signature")
     p.set_defaults(fn=cmd_publish)
 
     p = sub.add_parser("repl", help="start an interactive session")

@@ -24,8 +24,10 @@ tilde (`~1.2.3`, same minor) and `*` (any).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -33,6 +35,8 @@ MANIFEST = "ailang.package.json"
 PROJECT = "ailang.project.json"
 LOCKFILE = "ailang.lock.json"
 MODULES_DIR = "ai_modules"
+SIGNATURE = "signature.json"
+SIGNING_KEY_ENV = "AILANG_REGISTRY_KEY"
 
 
 class PackageError(Exception):
@@ -121,11 +125,93 @@ def read_manifest(pkg_dir: Path) -> dict:
     return m
 
 
-class Registry:
-    """A directory of packages, laid out as `<name>/<version>/`."""
+def _signable_files(pkg_dir: Path):
+    """The files a package ships: every `.al` source plus the manifest,
+    sorted so the signature is independent of filesystem ordering."""
+    return sorted(
+        [f for f in pkg_dir.rglob("*.al") if f.is_file()] + [pkg_dir / MANIFEST]
+    )
 
-    def __init__(self, root: Path):
+
+def _signed_payload(name: str, version: str, pkg_dir: Path) -> bytes:
+    manifest = read_manifest(pkg_dir)
+    files = {
+        f.relative_to(pkg_dir).as_posix(): hashlib.sha256(f.read_bytes()).hexdigest()
+        for f in _signable_files(pkg_dir)
+    }
+    doc = {"name": name, "version": version, "manifest": manifest, "files": files}
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sign_payload(payload: bytes, key: str) -> str:
+    return hmac.new(key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def verify_signature(payload: bytes, sig: str, key: str) -> bool:
+    return hmac.compare_digest(sign_payload(payload, key), sig)
+
+
+class Registry:
+    """A directory of packages, laid out as `<name>/<version>/`.
+
+    When constructed with a `key`, `publish` signs every package
+    (HMAC-SHA256 over manifest + file digests) and `install`/`verify`
+    enforce the signature, so a tampered package is rejected.
+    """
+
+    def __init__(self, root: Path, key: Optional[str] = None):
         self.root = Path(root)
+        self.key = key
+
+    def signature_path(self, name: str, version: str) -> Path:
+        return self.root / name / version / SIGNATURE
+
+    def check_signature(self, name: str, version: str) -> Tuple[str, str]:
+        """Return (status, detail) where status is one of:
+
+        * "ok"           — a signature is present and verifies
+        * "invalid"      — a signature is present but does NOT verify
+        * "unverifiable" — a signature is present but no key is set
+        * "unsigned"     — the package carries no signature
+        """
+        sig_path = self.signature_path(name, version)
+        if not sig_path.is_file():
+            return "unsigned", "no publisher signature"
+        sig = read_json(sig_path)
+        publisher = sig.get("publisher") or "unknown"
+        if self.key is None:
+            return "unverifiable", f"signed by {publisher}; no key set"
+        payload = _signed_payload(name, version, self.path(name, version))
+        if verify_signature(payload, str(sig.get("sig", "")), self.key):
+            return "ok", f"signature by {publisher} verified"
+        return "invalid", f"signature by {publisher} does not match (wrong key or tampered package)"
+
+    def publish(self, src: Path, publisher: Optional[str] = None) -> Tuple[str, str]:
+        m = read_manifest(src)
+        name, version = m["name"], m["version"]
+        dest = self.root / name / version
+        if dest.exists():
+            raise PackageError(
+                f"{name} {version} is already published; bump the version first"
+            )
+        dest.mkdir(parents=True)
+        for f in sorted(src.rglob("*.al")):
+            rel = f.relative_to(src)
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dest / rel)
+        shutil.copy2(src / MANIFEST, dest / MANIFEST)
+        if self.key is not None:
+            payload = _signed_payload(name, version, dest)
+            write_json(
+                dest / SIGNATURE,
+                {
+                    "alg": "hmac-sha256",
+                    "publisher": publisher or m.get("publisher", ""),
+                    "created": int(time.time()),
+                    "sig": sign_payload(payload, self.key),
+                },
+            )
+        return name, version
 
     def versions(self, name: str) -> List[str]:
         d = self.root / name
@@ -141,22 +227,6 @@ class Registry:
         if not (p / MANIFEST).is_file():
             raise PackageError(f"{name} {version} is not in the registry at {self.root}")
         return p
-
-    def publish(self, src: Path) -> Tuple[str, str]:
-        m = read_manifest(src)
-        name, version = m["name"], m["version"]
-        dest = self.root / name / version
-        if dest.exists():
-            raise PackageError(
-                f"{name} {version} is already published; bump the version first"
-            )
-        dest.mkdir(parents=True)
-        for f in sorted(src.rglob("*.al")):
-            rel = f.relative_to(src)
-            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, dest / rel)
-        shutil.copy2(src / MANIFEST, dest / MANIFEST)
-        return name, version
 
 
 # ------------------------------------------------------------------- resolver
@@ -237,13 +307,23 @@ def install(project_dir: Path, registry: Registry) -> Dict[str, dict]:
                 f"integrity check failed for {name} {info['version']}: "
                 f"expected {info['digest']}, got {actual}"
             )
+        status, detail = registry.check_signature(name, info["version"])
+        if status == "invalid":
+            raise PackageError(
+                f"signature verification failed for {name} {info['version']}: {detail}"
+            )
+        info["signature"] = status
 
     write_json(
         project_dir / LOCKFILE,
         {
             "lockfile_version": 1,
             "packages": {
-                n: {"version": i["version"], "digest": i["digest"]}
+                n: {
+                    "version": i["version"],
+                    "digest": i["digest"],
+                    **({"signature": i["signature"]} if i.get("signature") != "unsigned" else {}),
+                }
                 for n, i in sorted(resolved.items())
             },
         },
@@ -251,8 +331,9 @@ def install(project_dir: Path, registry: Registry) -> Dict[str, dict]:
     return resolved
 
 
-def verify(project_dir: Path) -> List[str]:
-    """Recompute digests of installed packages. Returns a list of problems."""
+def verify(project_dir: Path, key: Optional[str] = None) -> List[str]:
+    """Recompute digests (and signatures, when a key is given) of installed
+    packages. Returns a list of problems."""
     project_dir = Path(project_dir)
     lock_path = project_dir / LOCKFILE
     if not lock_path.is_file():
@@ -270,4 +351,10 @@ def verify(project_dir: Path) -> List[str]:
                 f"{name}: digest mismatch (expected {info['digest'][:19]}..., "
                 f"got {actual[:19]}...)"
             )
+        sig_path = d / SIGNATURE
+        if sig_path.is_file() and key is not None:
+            sig = read_json(sig_path)
+            payload = _signed_payload(name, info["version"], d)
+            if not verify_signature(payload, str(sig.get("sig", "")), key):
+                problems.append(f"{name}: signature does not match")
     return problems

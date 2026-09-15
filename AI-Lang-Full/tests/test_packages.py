@@ -21,6 +21,7 @@ from ailang.packages import (
     LOCKFILE,
     MODULES_DIR,
     PROJECT,
+    SIGNATURE,
     PackageError,
     Registry,
     best_match,
@@ -478,3 +479,83 @@ def test_testing_package_assertions_pass_when_correct(tmp_path):
     r = _cli(["run", "ok.al"], proj, reg_dir)
     assert r.returncode == 0, r.stderr
     assert "ok" in r.stdout
+
+
+# ------------------------------------------------------------------ signing
+def _project(tmp_path, deps):
+    proj = tmp_path / "proj"
+    proj.mkdir(exist_ok=True)
+    (proj / PROJECT).write_text(
+        json.dumps({"name": "app", "version": "0.1.0", "dependencies": deps}),
+        encoding="utf-8",
+    )
+    return proj
+
+
+def test_publish_signs_and_install_verifies(tmp_path):
+    reg = Registry(tmp_path / "reg", key="k1")
+    reg.publish(_pkg(tmp_path, "stats", "1.0.0"), publisher="ada")
+    assert (tmp_path / "reg" / "stats" / "1.0.0" / SIGNATURE).is_file()
+    proj = _project(tmp_path, {"stats": "^1.0.0"})
+    resolved = install(proj, reg)
+    assert resolved["stats"]["signature"] == "ok"
+    lock = json.loads((proj / LOCKFILE).read_text(encoding="utf-8"))
+    assert lock["packages"]["stats"].get("signature") == "ok"
+    assert verify(proj, key="k1") == []
+
+
+def test_install_with_wrong_key_is_refused(tmp_path):
+    reg = Registry(tmp_path / "reg", key="right")
+    reg.publish(_pkg(tmp_path, "stats", "1.0.0"))
+    proj = _project(tmp_path, {"stats": "^1.0.0"})
+    try:
+        install(proj, Registry(tmp_path / "reg", key="wrong"))
+        raise AssertionError("wrong key must be refused")
+    except PackageError as e:
+        assert "signature" in str(e).lower()
+
+
+def test_tampered_registry_package_is_refused(tmp_path):
+    reg = Registry(tmp_path / "reg", key="k1")
+    reg.publish(_pkg(tmp_path, "stats", "1.0.0"))
+    (tmp_path / "reg" / "stats" / "1.0.0" / "main.al").write_text(
+        "fn f() -> Int:\n    give 999.\ndone.\n", encoding="utf-8"
+    )
+    proj = _project(tmp_path, {"stats": "^1.0.0"})
+    try:
+        install(proj, reg)
+        raise AssertionError("tampered package must be refused")
+    except PackageError as e:
+        assert "signature" in str(e).lower()
+
+
+def test_unsigned_packages_install_without_a_key(tmp_path):
+    reg = Registry(tmp_path / "reg")
+    reg.publish(_pkg(tmp_path, "stats", "1.0.0"))
+    proj = _project(tmp_path, {"stats": "^1.0.0"})
+    resolved = install(proj, reg)
+    assert resolved["stats"].get("signature") == "unsigned"
+    lock = json.loads((proj / LOCKFILE).read_text(encoding="utf-8"))
+    assert "signature" not in lock["packages"]["stats"]
+
+
+def test_signed_without_key_installs_but_is_flagged(tmp_path):
+    reg = Registry(tmp_path / "reg", key="k1")
+    reg.publish(_pkg(tmp_path, "stats", "1.0.0"), publisher="ada")
+    proj = _project(tmp_path, {"stats": "^1.0.0"})
+    resolved = install(proj, Registry(tmp_path / "reg"))  # no key
+    assert resolved["stats"]["signature"] == "unverifiable"
+    lock = json.loads((proj / LOCKFILE).read_text(encoding="utf-8"))
+    assert lock["packages"]["stats"].get("signature") == "unverifiable"
+
+
+def test_verify_with_key_catches_installed_tamper(tmp_path):
+    reg = Registry(tmp_path / "reg", key="k1")
+    reg.publish(_pkg(tmp_path, "stats", "1.0.0"))
+    proj = _project(tmp_path, {"stats": "^1.0.0"})
+    install(proj, reg)
+    (proj / MODULES_DIR / "stats" / "main.al").write_text(
+        "fn f() -> Int:\n    give 0.\ndone.\n", encoding="utf-8"
+    )
+    problems = verify(proj, key="k1")
+    assert any("stats" in p for p in problems)
