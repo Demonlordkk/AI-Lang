@@ -202,15 +202,23 @@ def _shared_redeclares(body, params=()):
 class _Gen:
     """Emit host source for one AI-Lang function."""
 
-    def __init__(self, fn):
+    def __init__(self, fn, prebound=None):
         self.fn = fn
         self.lines = []
         self.depth = 1
         self.tmp = 0
+        # free names resolved to captured values at compile time: maps the
+        # AI-Lang name to the Python local that will carry the value
+        self.prebound = prebound or {}
         # every name bound in this function becomes a real local slot
         self.locals = set(p[0] if isinstance(p, tuple) else p for p in fn.params)
         # names resolved dynamically, i.e. not locals -- must all be globals
         self.free = set()
+        self.cvar = 0
+
+    def _cond_var(self):
+        self.cvar += 1
+        return f"_c{self.cvar}"
 
     def w(self, text, node=None):
         if getattr(self, "track", False):
@@ -237,7 +245,11 @@ class _Gen:
                 return "False"
             if e.value == "nothing":
                 return "None"
-            # a free name resolves through the global scope
+            # a free name either resolves to a captured value (baked in as
+            # a default argument) or falls back to a dynamic global lookup
+            pb = self.prebound.get(e.value)
+            if pb is not None:
+                return pb
             self.free.add(e.value)
             return f"_lk({e.value!r})"
 
@@ -335,11 +347,20 @@ class _Gen:
             # a loop compiled to host bytecode would otherwise run forever
             # without touching the interpreter's fuel meter; the per-iteration
             # check gives it exactly the same "execution limit exceeded" wall
-            # behaviour a bytecode loop has
-            self.w(f"while _tr({self.expr(s.cond)}):")
+            # behaviour a bytecode loop has.  The condition is evaluated once
+            # per pass into a local: no `_tr` call, and `next` (continue)
+            # re-runs it at the top exactly like the interpreter does.
+            cvar = self._cond_var()
+            self.w(f"{cvar} = {self.expr(s.cond)}")
+            self.w("while True:")
             self.depth += 1
+            self.w(f"if {cvar} is None or {cvar} is False:")
+            self.depth += 1
+            self.w("break")
+            self.depth -= 1
             self.w("_fc()")
             self.body(s.body)
+            self.w(f"{cvar} = {self.expr(s.cond)}")
             self.depth -= 1
 
         elif isinstance(s, A.Assign):
@@ -370,18 +391,24 @@ class _Gen:
             self.w(f"_raise({self.expr(s.expr)})")
 
         elif isinstance(s, A.When):
-            kw = "if"
+            # each condition is evaluated once into a local (no `_tr` call)
+            # and the branches nest through else: blocks
             for br in s.branches:
-                self.w(f"{kw} _tr({self.expr(br.cond)}):")
+                cvar = self._cond_var()
+                self.w(f"{cvar} = {self.expr(br.cond)}")
+                self.w(f"if not ({cvar} is None or {cvar} is False):")
                 self.depth += 1
                 self.body(br.body)
                 self.depth -= 1
-                kw = "elif"
-            if s.else_body:
                 self.w("else:")
                 self.depth += 1
+            if s.else_body:
                 self.body(s.else_body)
-                self.depth -= 1
+            else:
+                self.w("pass")
+            # each branch iteration ends one level deeper than it started
+            # (its trailing else:); pay them all back
+            self.depth -= len(s.branches)
 
         elif isinstance(s, A.Repeat):
             self.locals.add(s.name)
@@ -437,9 +464,15 @@ class _Gen:
         else:
             raise _Unsupported(type(s).__name__)
 
-    def generate(self):
+    def _signature(self):
         params = [p[0] if isinstance(p, tuple) else p for p in self.fn.params]
-        header = f"def _fn({', '.join(params)}):"
+        caps = sorted(set(self.prebound.values()))
+        if caps:
+            return ", ".join(list(params) + [f"{c}={c}" for c in caps])
+        return ", ".join(params)
+
+    def generate(self):
+        header = f"def _fn({self._signature()}):"
         self.body(self.fn.body)
         self.w("return None")
         return header + "\n" + "\n".join(self.lines)
@@ -450,7 +483,6 @@ class _Gen:
         Errors raised inside compiled code are reported at the AI-Lang
         statement that caused them, matching the interpreter exactly.
         """
-        params = [p[0] if isinstance(p, tuple) else p for p in self.fn.params]
         self.track = True
         self.lines = []
         self.linemap = {}
@@ -458,7 +490,7 @@ class _Gen:
         self.w("return None")
         # +1 because the header occupies host line 1
         return (
-            f"def _fn({', '.join(params)}):\n" + "\n".join(self.lines),
+            f"def _fn({self._signature()}):\n" + "\n".join(self.lines),
             {h + 1: a for h, a in self.linemap.items()},
         )
 
@@ -561,7 +593,8 @@ def enabled():
     return os.environ.get("AILANG_NATIVE", "1") != "0"
 
 
-def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None):
+def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None,
+                can_bake=None):
     """Compile one AI-Lang function to a host function, or return None.
 
     `lookup` resolves a free name against the global scope. `is_global` says
@@ -569,10 +602,13 @@ def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None):
     an enclosing scope, which a cached host function cannot model, so the
     function is left to the interpreter. `fuel_box` is the VM's shared fuel
     budget; the generated loops charge it so a runaway loop is bounded exactly
-    as it would be on the interpreter.
+    as it would be on the interpreter. When `can_bake(name)` holds, the name's
+    current global value is captured by value (a default argument) instead of
+    being looked up on every call.
     """
     if not enabled():
         return None
+    prebound, local = {}, {}
     try:
         _screen_body(fn_node.body)
         # A function that assigns to a name it never declares is mutating an
@@ -594,12 +630,22 @@ def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None):
             for free in gen.free:
                 if not is_global(free):
                     return None
+        # second pass: bake the free names whose global values are stable so
+        # the hot path makes no per-call lookup at all
+        if gen.free and can_bake is not None:
+            prebound = {n: lookup(n) for n in gen.free if can_bake(n)}
+            if prebound:
+                local = {n: f"_g{i}" for i, n in enumerate(sorted(prebound))}
+                gen = _Gen(fn_node, local)
+                src, linemap = gen.generate_located()
     except _Unsupported:
         return None
     except Exception:
         return None
 
     env = _make_runtime(lookup, fuel_box)
+    for n, v in prebound.items():
+        env[local[n]] = v
     try:
         code = compile(src, f"<ailang:{name}>", "exec")
         exec(code, env)

@@ -95,6 +95,21 @@ def main(argv):
     _install_pytest_stub()
     from _pytest_stub import _MonkeyPatch, Skipped  # noqa: F401
 
+    # Interactive tests (confirm, read_line) read the host stdin.  On a
+    # blocking stdin (terminal, long-lived pipe) they would hang until the
+    # per-test timeout, so point stdin at /dev/null for the whole run: the
+    # tests get an immediate EOF, which is the path they assert, and any test
+    # that needs real input monkeypatches sys.stdin with its own fake.
+    # dup2 covers the OS-level fd 0 as well, so subprocesses launched by the
+    # tests inherit the EOF instead of the blocking pipe.
+    try:
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        os.close(devnull)
+        sys.stdin = open(os.devnull, "r")
+    except OSError:
+        pass
+
     wanted = set(argv)
     files = sorted(TESTS.glob("test_*.py"))
     if wanted:

@@ -6,6 +6,7 @@ Run with:  python3 -m pytest tests/ -q      (or)   python3 tests/test_language.p
 from __future__ import annotations
 
 import io
+import os
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -1181,6 +1182,16 @@ def _run_all():
                         pass
 
     signal.signal(signal.SIGALRM, _on_alarm)
+    # same stdin handling as tools/run_tests.py: never let an interactive
+    # test block on a live terminal (OS-level dup2 so subprocesses inherit
+    # the EOF too)
+    try:
+        devnull = os.open("/dev/null", os.O_RDONLY)
+        os.dup2(devnull, 0)
+        os.close(devnull)
+        sys.stdin = open("/dev/null", "r")
+    except OSError:
+        pass
     passed = failed = 0
     failures = []
     for name in tests:

@@ -91,7 +91,7 @@ class Environment:
 class Closure:
     """A function value bound to its defining environment and program."""
 
-    __slots__ = ("code", "env", "vm", "ailang_name", "program")
+    __slots__ = ("code", "env", "vm", "ailang_name", "program", "_fast")
 
     def __init__(self, code, env, vm, program=None):
         self.code = code
@@ -99,13 +99,32 @@ class Closure:
         self.vm = vm
         self.program = program if program is not None else vm.program
         self.ailang_name = code.name
+        # (native_fn, nparams) once the function is host-compiled; lets
+        # calls skip the generic dispatch (and its list copy) entirely
+        self._fast = (code.native, len(code.params)) if code.native is not None else None
 
     @property
     def arity(self):
         return len(self.code.params)
 
     def __call__(self, *args, **kwargs):
-        return self.vm.invoke(self, list(args), kwargs)
+        if not kwargs:
+            f = self._fast
+            if f is not None and len(args) == f[1]:
+                vm = self.vm
+                try:
+                    result = f[0](*args)
+                except RecursionError:
+                    raise VMError(
+                        "recursion limit exceeded (possible infinite recursion)"
+                    ) from None
+                # the body only changes the shared fuel box if it iterated;
+                # adopt it in that case, mirroring invoke's return path
+                b = vm._fbox[0]
+                if b != vm.fuel:
+                    vm.fuel = b
+                return result
+        return self.vm.invoke(self, args, kwargs or None)
 
     def __repr__(self):
         return f"<function {self.code.name}>"
@@ -198,10 +217,21 @@ class VM:
                         e = e.parent
                     return False
 
+                def _can_bake(nm, _g=globals_env):
+                    # only immutable globals may be captured by value: a
+                    # reassignable var must keep resolving live on every call
+                    return nm in _g.immutable and nm in _g.vars
+
                 code.native = try_compile(
                     code, _lookup, code.name,
                     is_global=_resolves_to_global, fuel_box=self._fbox,
+                    can_bake=_can_bake,
                 )
+                if code.native is not None:
+                    closure._fast = (code.native, len(params))
+
+        if code.native is not None and closure._fast is None:
+            closure._fast = (code.native, nparams)
 
         if code.native is not None and not kwargs and len(args) == nparams:
             # The caller (_CALL / CALL_KW) just wrote the interpreter's fuel
