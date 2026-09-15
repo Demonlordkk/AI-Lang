@@ -7,7 +7,13 @@ import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # no pytest installed (air-gapped): use the bundled shim
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    import _pytest_stub as pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -290,6 +296,7 @@ def test_cli_classifier_end_to_end(tmp_path):
             [sys.executable, str(ROOT / "ailang.py"), "run", str(prog), "--", *args,
              "--model", str(model)],
             capture_output=True, text=True, env=env, cwd=tmp_path,
+            timeout=120,
         )
         return r.returncode, r.stdout.strip()
 

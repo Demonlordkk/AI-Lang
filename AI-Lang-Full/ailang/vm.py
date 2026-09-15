@@ -204,17 +204,21 @@ class VM:
                 )
 
         if code.native is not None and not kwargs and len(args) == nparams:
-            # The native code decrements the shared fuel box directly, while
-            # the interpreter decrements a local that is only synced here, so
-            # reconcile the two at every call boundary.
-            if self._fbox[0]:
-                self.fuel = min(self.fuel, self._fbox[0])
+            # The caller (_CALL / CALL_KW) just wrote the interpreter's fuel
+            # into the shared box, so the native code sees the true budget.
+            # The box only *changes* if the native body iterated, so the
+            # return path adopts it only when it did — no min(), no write
+            # on the common case of a non-iterating function call.
             self.depth += 1
             if self.depth > self.MAX_DEPTH:
                 self.depth -= 1
                 raise VMError("recursion limit exceeded (possible infinite recursion)")
             try:
-                return code.native(*args)
+                result = code.native(*args)
+                b = self._fbox[0]
+                if b != self.fuel:
+                    self.fuel = b
+                return result
             except AILangError as exc:
                 # relabel with the AI-Lang line, using the map the backend
                 # attached; done here so the hot path stays wrapper-free
@@ -234,9 +238,6 @@ class VM:
                 raise
             finally:
                 self.depth -= 1
-                # the box is the authoritative meter while native code ran
-                if self._fbox[0]:
-                    self.fuel = min(self.fuel, self._fbox[0])
 
         if not kwargs:
             if len(args) != nparams:
@@ -554,17 +555,18 @@ class VM:
                         args = []
                     callee = pop()
                     if callee.__class__ is Closure:
+                        # hand the true budget to the shared box; invoke
+                        # (native and interpreter paths alike) leaves the box
+                        # and self.fuel reconciled when it returns
                         _box[0] = fuel
                         self.fuel = fuel
                         push(self.invoke(callee, args))
                         fuel = _box[0]
-                        self.fuel = fuel
                     else:
                         _box[0] = fuel
                         self.fuel = fuel
                         push(self.call_value(callee, args))
                         fuel = _box[0]
-                        self.fuel = fuel
 
                 elif op == _SET:
                     name = ins[1]
@@ -815,7 +817,6 @@ class VM:
                     self.fuel = fuel
                     push(self.call_value(callee, positional, kwargs))
                     fuel = _box[0]
-                    self.fuel = fuel
 
                 elif op == CLOSURE:
                     fcode = program.functions[ins[1]]
@@ -944,18 +945,32 @@ class VM:
         raise VMError(f"value of type {type_name(callee)} is not callable")
 
 
+_NO_SIG = object()
+_NAMED_ARG_CACHE = {}  # id(fn) -> (fn, named-args-or-None)
+
+
 def _check_python_named_args(fn, kwargs, name):
     """Named arguments to a Python builtin must exist on its real signature;
     otherwise the call would leak a raw Python TypeError into the user.
-    (The checker already enforces this; this guards `check=False` runs.)"""
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
+    (The checker already enforces this; this guards `check=False` runs.)
+    Signatures resolve once per function and are cached by id —
+    inspect.signature is expensive and must never sit in a dispatch path."""
+    entry = _NAMED_ARG_CACHE.get(id(fn))
+    if entry is None or entry[0] is not fn:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            named = None
+        else:
+            named = [
+                p.name for p in sig.parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            ]
+        _NAMED_ARG_CACHE[id(fn)] = (fn, named)
+    else:
+        named = entry[1]
+    if named is None:
         raise VMError(f"{name}: does not accept named arguments")
-    named = [
-        p.name for p in sig.parameters.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-    ]
     for key in kwargs:
         if key not in named:
             if not named:

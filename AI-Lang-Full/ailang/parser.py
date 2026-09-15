@@ -450,15 +450,23 @@ class Parser:
 
     # ------------------------------------------------------------- expressions
     def expr(self):
-        return self.pipeline()
+        return self.coalesce()
 
     def pipeline(self):
-        """`x |> f |> g` desugars to `g(f(x))` — a core brevity feature."""
-        left = self.coalesce()
+        """`x |> f |> g` desugars to `g(f(x))` — a core brevity feature.
+
+        The pipe sits between comparison operators and additive terms:
+
+        * its left side is a term, so `1 - 6 |> abs()` is `abs(1 - 6)`;
+        * comparison/equality operators wrap the *whole* chain, so
+          `xs |> filter(f) |> sum() == 6` is `((xs |> filter(f)) |> sum()) == 6`,
+          never a call on a Bool. Parens still force either grouping.
+        """
+        left = self.term()
         while self.at("PIPE"):
             t = self.cur()
             self.i += 1
-            right = self.coalesce()
+            right = self.term()
             if isinstance(right, A.Call):
                 right.args.insert(0, (None, left))
                 left = right
@@ -500,21 +508,21 @@ class Parser:
         return left
 
     def comparison(self):
-        left = self.term()
+        left = self.pipeline()
         while True:
             k = self.cur().kind
             if k in _COMPARE:
                 t = self.cur()
                 op = _COMPARE[t.kind]
                 self.i += 1
-                left = A.Binary(left, op, self.term(), t.line, t.col)
+                left = A.Binary(left, op, self.pipeline(), t.line, t.col)
                 continue
             # membership reads as prose: `when name in names:` and
             # `when key not in seen:`. Lowered to the `contains` builtin.
             if k == "IN":
                 t = self.cur()
                 self.i += 1
-                right = self.term()
+                right = self.pipeline()
                 left = A.Call(
                     A.Name("contains", t.line, t.col),
                     [(None, right), (None, left)],
@@ -525,7 +533,7 @@ class Parser:
             if k == "NOT" and self.peek(1).kind == "IN":
                 t = self.cur()
                 self.i += 2
-                right = self.term()
+                right = self.pipeline()
                 inner = A.Call(
                     A.Name("contains", t.line, t.col),
                     [(None, right), (None, left)],

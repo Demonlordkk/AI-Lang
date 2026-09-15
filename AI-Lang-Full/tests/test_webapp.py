@@ -237,6 +237,7 @@ def test_use_packages_resolves_from_any_subdir(tmp_path):
         r = subprocess.run(
             [sys.executable, str(ROOT / "ailang.py"), "run", str(probe)],
             capture_output=True, text=True, cwd=str(probe_dir),
+            timeout=120,
         )
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == "imported"
@@ -250,5 +251,6 @@ def test_webapp_package_typechecks():
     r = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), "check", str(ROOT / "packages" / "webapp" / "main.al")],
         capture_output=True, text=True,
+        timeout=120,
     )
     assert r.returncode == 0, r.stderr

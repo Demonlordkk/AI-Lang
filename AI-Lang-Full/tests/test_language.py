@@ -348,6 +348,46 @@ emit 10 |> add3(4) |> double().
     assert out('emit "ab" + "cd" |> upper().') == "ABCD"
 
 
+def test_pipeline_comparisons_wrap_the_chain():
+    """Comparison operators apply to the *result* of the whole pipe chain:
+    `xs |> f() |> g() == 6` is `((xs |> f()) |> g()) == 6`, never a call on
+    a Bool. The old parser swallowed `== 6` as the last pipe's right side,
+    which type-checked as 'value of type Bool is not callable'."""
+    src = """
+let xs := [1, 2, 3, 4, 5].
+emit xs |> filter(\\x -> x > 1) |> sum() == 14.
+emit xs |> filter(\\x -> x > 1) |> sum() != 14.
+emit xs |> sum() < 15.
+emit xs |> sum() >= 15.
+emit 3 in xs |> filter(\\x -> x > 1).
+emit 9 not in xs |> filter(\\x -> x > 1).
+emit (xs |> sum()) == 15.
+emit xs |> map(\\x -> x * 2) |> max() > 9.
+"""
+    assert out(src) == "true\nfalse\nfalse\ntrue\ntrue\ntrue\ntrue\ntrue"
+
+
+def test_pipeline_precedence_is_the_same_on_both_backends():
+    import os
+
+    src = """
+let xs := [1, 2, 3, 4, 5].
+emit xs |> filter(\\x -> x > 1) |> sum() == 14.
+emit xs |> sum() <= 15.
+emit 1 - 6 |> abs().
+"""
+    old = os.environ.get("AILANG_NATIVE")
+    os.environ["AILANG_NATIVE"] = "0"
+    try:
+        assert out(src) == "true\ntrue\n5"
+    finally:
+        if old is None:
+            os.environ.pop("AILANG_NATIVE", None)
+        else:
+            os.environ["AILANG_NATIVE"] = old
+    assert out(src) == "true\ntrue\n5"
+
+
 def test_named_args_to_builtins():
     """Named arguments must work for builtins with the documented names, and
     the checker's parameter names must never drift from the implementations
@@ -821,6 +861,80 @@ def test_built_artifact_executes():
         assert buf.getvalue().strip() == "42"
 
 
+def test_build_twice_is_byte_identical(tmp_path):
+    """`ailang build` twice on the same source must produce byte-identical
+    artifact files (reproducible, cacheable builds)."""
+    from ailang.bytecode import write
+    from ailang.toolchain import compile_source
+
+    src = 'fn f(a: Int) -> Int:\n give a * 2.\ndone.\nemit f(21).'
+    program = compile_source(src)
+    p1 = tmp_path / "a.albc.json"
+    p2 = tmp_path / "b.albc.json"
+    write(program, p1, src)
+    write(program, p2, src)
+    assert p1.read_bytes() == p2.read_bytes()
+
+
+def test_bytecode_read_rejects_corrupt_and_foreign_artifacts():
+    """Strict AILBC-3 validation: truncated, malformed, foreign, and tampered
+    artifacts must be rejected with a clear ValueError - never a
+    KeyError/TypeError/JSONDecodeError leaking through."""
+    import json
+    import tempfile
+    from ailang.bytecode import artifact, read, write
+    from ailang.toolchain import compile_source
+
+    src = 'fn f(a: Int) -> Int:\n give a * 2.\ndone.\nemit f(21).'
+    program = compile_source(src)
+
+    def make(corrupt):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "a.albc.json"
+            obj = artifact(program, src)
+            corrupt(obj, path)
+            try:
+                read(path)
+            except ValueError as e:
+                return str(e)
+            raise AssertionError("corrupt artifact was accepted")
+
+    def truncated(obj, path):
+        full = json.dumps(obj, indent=2) + "\n"
+        path.write_text(full[: len(full) // 2], encoding="utf-8")
+
+    def non_object(obj, path):
+        path.write_text("[1, 2, 3]", encoding="utf-8")
+
+    def wrong_format(obj, path):
+        obj["format"] = "AILBC-9"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+    def wrong_language(obj, path):
+        obj["language"] = "SomeOtherLang"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+    def wrong_version(obj, path):
+        obj["version"] = "0.0.1"
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+    def missing_main(obj, path):
+        del obj["main"]
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+    def tampered(obj, path):
+        obj["main"]["name"] = "evil"  # artifact_sha256 still covers the old name
+        path.write_text(json.dumps(obj), encoding="utf-8")
+
+    assert "corrupt bytecode artifact" in make(truncated)
+    assert "top level is not an object" in make(non_object)
+    assert "unsupported bytecode format" in make(wrong_format)
+    assert "foreign bytecode artifact" in make(wrong_language)
+    assert "built by" in make(wrong_version)
+    assert "malformed 'main'" in make(missing_main)
+    assert "integrity check" in make(tampered)
+
+
 # -------------------------------------------------------------- formatter
 def test_formatter_is_idempotent():
     from ailang.format import format_source
@@ -1024,25 +1138,81 @@ def test_bare_use_binds_module_name():
 
 
 def _run_all():
+    """Standalone runner: python3 tests/test_language.py -- no pytest needed.
+
+    Injects the `tmp_path` and `monkeypatch` fixtures that pytest would
+    provide, skips parametrization placeholders, and enforces a per-test
+    timeout so a bad test can never hang the run.
+    """
+    import inspect
+    import shutil
+    import signal
+    import tempfile
+    import time
+
     mod = sys.modules[__name__]
     tests = sorted(n for n in dir(mod) if n.startswith("test_"))
+
+    class _Timeout(Exception):
+        pass
+
+    def _on_alarm(signum, frame):  # noqa: ARG001
+        raise _Timeout("exceeded 120s")
+
+    class _MonkeyPatch:
+        def __init__(self):
+            self._undo = []
+
+        def setattr(self, target, name, value):
+            old = getattr(target, name, object())
+            had = old is not object()
+            setattr(target, name, value)
+            self._undo.append((target, name, old, had))
+
+        def undo(self):
+            while self._undo:
+                target, name, old, had = self._undo.pop()
+                if had:
+                    setattr(target, name, old)
+                else:
+                    try:
+                        delattr(target, name)
+                    except AttributeError:
+                        pass
+
+    signal.signal(signal.SIGALRM, _on_alarm)
     passed = failed = 0
     failures = []
     for name in tests:
+        fn = getattr(mod, name)
+        if not callable(fn) or not getattr(fn, "__name__", "").startswith("test_"):
+            continue  # parametrization placeholder
+        params = inspect.signature(fn).parameters
+        tmp = tempfile.mkdtemp(prefix="ailang_test_") if "tmp_path" in params else None
+        monkey = _MonkeyPatch() if "monkeypatch" in params else None
+        fixtures = {}
+        if tmp:
+            from pathlib import Path as _P
+            fixtures["tmp_path"] = _P(tmp)
+        if monkey:
+            fixtures["monkeypatch"] = monkey
+        signal.alarm(120)
         try:
-            getattr(mod, name)()
+            fn(**fixtures)
             passed += 1
-        except Exception as e:  # noqa: BLE001
+        except BaseException as e:  # noqa: BLE001
             failed += 1
             failures.append((name, e))
+        finally:
+            signal.alarm(0)
+            if monkey:
+                monkey.undo()
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
     for name, e in failures:
         print(f"FAIL {name}: {e}")
-    print(f"\n{passed} passed, {failed} failed, {len(tests)} total")
+    print(f"\n{passed} passed, {failed} failed, {passed + failed} total")
     return 1 if failed else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_run_all())
 
 
 # --------------------------------------------------- record names as types
@@ -1103,3 +1273,6 @@ def test_builtin_type_names_still_work():
     assert out('fn f(xs: List, n: Int, s: Text) -> Bool:\n'
                '    give len(xs) > n and len(s) > 0.\n'
                'done.\nemit f([1, 2], 1, "a").\n') == "true"
+
+if __name__ == "__main__":
+    raise SystemExit(_run_all())

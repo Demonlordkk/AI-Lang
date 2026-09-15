@@ -19,7 +19,13 @@ import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # no pytest installed (air-gapped): use the bundled shim
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    import _pytest_stub as pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -39,6 +45,7 @@ def _run(src, tmp_path, cmd="run", native=True):
     r = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), cmd, str(p)],
         capture_output=True, text=True, env=env, cwd=tmp_path,
+        timeout=120,
     )
     return r.stdout + r.stderr
 
@@ -139,6 +146,7 @@ def _run_path(path, native="1"):
     r = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), "run", str(path)],
         capture_output=True, text=True, env=env, cwd=path.parent,
+        timeout=120,
     )
     return r.stdout + r.stderr
 

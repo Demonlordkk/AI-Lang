@@ -29,6 +29,7 @@ implicit fall-off-the-end, and `result` is bound to the value being returned.
 """
 from __future__ import annotations
 
+import copy
 import os
 
 from . import ast_nodes as A
@@ -59,6 +60,31 @@ def _describe(kind, fn_name, text):
     return f"{fn_name}: {label} failed: {text}"
 
 
+def _rename_name(node, old, new):
+    """Return a copy of `node` with every Name(`old`) renamed to `new`.
+    Used to point a postcondition's `result` reference at the site-local
+    binding."""
+    if isinstance(node, A.Name):
+        if node.value == old:
+            return A.Name(new, node.line, node.col)
+        return node
+    if isinstance(node, list):
+        return [_rename_name(x, old, new) for x in node]
+    if isinstance(node, tuple):
+        return tuple(_rename_name(x, old, new) for x in node)
+    if not isinstance(node, A.Node):
+        return node
+    for attr in vars(node):
+        if attr.startswith("_"):
+            continue
+        v = getattr(node, attr)
+        if isinstance(v, A.Node):
+            setattr(node, attr, _rename_name(v, old, new))
+        elif isinstance(v, list) and any(isinstance(x, (A.Node, tuple)) for x in v):
+            setattr(node, attr, [_rename_name(x, old, new) if isinstance(x, (A.Node, tuple)) else x for x in v])
+    return node
+
+
 def split(body):
     """Separate leading contracts from the rest of a function body."""
     pre, post, rest = [], [], []
@@ -78,10 +104,18 @@ def _has_contracts(body):
 
 
 class _PostRewriter:
-    """Rewrites every `give` so the postconditions run first."""
+    """Rewrites every `give` so the postconditions run first.
 
-    def __init__(self, checks):
+    Each give site gets its own binding name (`result$1`, `result$2`, ...)
+    and its copy of the postconditions is pointed at that name.  A plain
+    `let result` at every site would be a duplicate declaration whenever two
+    sites share a scope (attempt body + rescue, or two branches), which the
+    interpreter rightly rejects.
+    """
+
+    def __init__(self, checks, next_name):
         self.checks = checks
+        self.next_name = next_name
 
     def rewrite(self, stmts):
         out = []
@@ -91,10 +125,11 @@ class _PostRewriter:
 
     def stmt(self, st):
         if isinstance(st, A.Give):
-            # bind the value, check it, then return it
-            bind = A.Let(RESULT, st.expr, None, st.line, st.col)
-            checks = [c(st.line, st.col) for c in self.checks]
-            give = A.Give(A.Name(RESULT, st.line, st.col), st.line, st.col)
+            # bind the value under a site-local name, check it, then return it
+            name = self.next_name()
+            bind = A.Let(name, st.expr, None, st.line, st.col)
+            checks = [c(st.line, st.col, name) for c in self.checks]
+            give = A.Give(A.Name(name, st.line, st.col), st.line, st.col)
             return [bind, *checks, give]
         if isinstance(st, A.When):
             branches = [A.Branch(b.cond, self.rewrite(b.body)) for b in st.branches]
@@ -113,6 +148,32 @@ class _PostRewriter:
         return [st]
 
 
+def _definitely_returns(stmts):
+    """Conservative: does this statement list end without falling off the
+    end with a Nothing value? When in doubt, answer False (the fall-off
+    check is kept, which is the safe direction)."""
+    if not stmts:
+        return False
+    st = stmts[-1]
+    if isinstance(st, (A.Give, A.Raise, A.Stop)):
+        return True
+    if isinstance(st, A.When):
+        for b in st.branches:
+            if not _definitely_returns(b.body):
+                return False
+        if st.else_body is None:
+            return False  # no matching branch means fall-off
+        return _definitely_returns(st.else_body)
+    if isinstance(st, A.Attempt):
+        if not _definitely_returns(st.body):
+            return False
+        if getattr(st, "rescue_body", None) is None:
+            return True  # an unrescued error propagates, never falls off
+        return _definitely_returns(st.rescue_body)
+    # loops may never execute; anything else falls off
+    return False
+
+
 def desugar_body(fn_name, body, check=True):
     """Return `body` with contracts turned into ordinary checks."""
     if not _has_contracts(body):
@@ -127,19 +188,36 @@ def desugar_body(fn_name, body, check=True):
         out.append(_check(p.expr, _describe("needs", fn_name, p.text), p.line, p.col))
 
     if post:
+        counter = [0]
+
+        def next_name():
+            counter[0] += 1
+            return f"{RESULT}${counter[0]}"
+
         def make(p):
-            return lambda line, col: _check(
-                p.expr, _describe("ensures", fn_name, p.text), p.line, p.col
-            )
+            def check(line, col, name):
+                # deep-copy: _rename_name mutates, and each give site needs
+                # its own copy of the postcondition expression
+                expr = _rename_name(copy.deepcopy(p.expr), RESULT, name)
+                return _check(
+                    expr, _describe("ensures", fn_name, p.text), p.line, p.col
+                )
+
+            return check
 
         checks = [make(p) for p in post]
-        rest = _PostRewriter(checks).rewrite(rest)
-        # a function that falls off the end returns nothing; check that too
-        if not (rest and isinstance(rest[-1], A.Give)):
+        rest = _PostRewriter(checks, next_name).rewrite(rest)
+        # A function that falls off the end returns nothing; check that too.
+        # But only when fall-through is actually reachable: a final
+        # when/else or attempt where every path gives must not get a
+        # `result := None` check (it would be dead code and would break
+        # postconditions comparing `result` against a typed value).
+        if not _definitely_returns(rest):
             line = post[-1].line
+            name = next_name()
             rest = rest + [
-                A.Let(RESULT, A.Literal(None, line, 0), None, line, 0),
-                *[c(line, 0) for c in checks],
+                A.Let(name, A.Literal(None, line, 0), None, line, 0),
+                *[c(line, 0, name) for c in checks],
             ]
     out.extend(rest)
     return out

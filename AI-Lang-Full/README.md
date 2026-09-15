@@ -210,11 +210,12 @@ emit sqrt(p.x * p.x + p.y * p.y).
 ### The pipeline operator
 
 `x |> f(a)` is exactly `f(x, a)`. It keeps data flow left-to-right and removes
-nested-call soup. The pipe is the loosest binding operator in the language —
-lower than `+`, comparisons, and function arguments — so `1 - 6 |> abs()` is
-`abs(1 - 6)`, and `10 |> add(4) |> double()` applies left to right. Chained
-pipes compose, and they work inside call arguments, loop conditions, and
-lambdas exactly like any other expression.
+nested-call soup. Binding: the pipe sits below arithmetic (so `1 - 6 |> abs()`
+is `abs(1 - 6)`), but above comparisons and equality — those apply to the
+*result of the whole chain*: `xs |> filter(\x -> x > 1) |> sum() == 14` parses
+as `((xs |> filter(\x -> x > 1)) |> sum()) == 14`, never as a call on a Bool.
+`10 |> add(4) |> double()` applies left to right, and pipes work inside call
+arguments, loop conditions, and lambdas exactly like any other expression.
 
 ```text
 emit range(20)
@@ -1199,9 +1200,19 @@ byte-identical file and the same `artifact_sha256`.
 ## Running the test suite
 
 ```bash
-python3 tests/test_language.py     # standalone
-python3 -m pytest tests/ -q        # via pytest
+python3 tools/run_tests.py         # whole suite, zero dependencies (no pytest)
+python3 tests/test_language.py     # the conformance file, standalone
+python3 -m pytest tests/ -q        # via pytest, when it is installed
 ```
+
+`tools/run_tests.py` needs only the Python standard library: when `pytest`
+is missing it substitutes a small bundled shim (`tests/_pytest_stub.py`)
+covering the subset the suite uses (`raises`, `mark.parametrize`,
+`mark.skipif`, `tmp_path`/`monkeypatch` fixtures). Every test runs with a
+wall-clock timeout (120 s, `RUN_TESTS_TEST_TIMEOUT`), the whole run has a
+total cap (900 s, `RUN_TESTS_TOTAL_TIMEOUT`), and a file filter is accepted
+(`python3 tools/run_tests.py contracts ml`). With pytest installed the same
+suite runs through it unchanged.
 
 ## Status
 

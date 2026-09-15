@@ -13,7 +13,13 @@ import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # no pytest installed (air-gapped): use the bundled shim
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    import _pytest_stub as pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -192,6 +198,7 @@ def test_single_file_bundle_builds_and_runs(tmp_path):
         [sys.executable, str(ROOT / "tools" / "make_bundle.py")],
         capture_output=True,
         text=True,
+        timeout=300,
     )
     assert build.returncode == 0, build.stderr
     bundle = ROOT / "ailang-bundle.pyz"
@@ -203,6 +210,7 @@ def test_single_file_bundle_builds_and_runs(tmp_path):
         [sys.executable, str(bundle), "run", str(prog)],
         capture_output=True,
         text=True,
+        timeout=120,
     )
     assert run.returncode == 0, run.stderr
     assert "bundled 42" in run.stdout

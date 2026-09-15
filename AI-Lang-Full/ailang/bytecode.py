@@ -56,11 +56,46 @@ def write(program: ProgramCode, path, source: str = None) -> dict:
 
 
 def read(path) -> dict:
-    obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    """Load and strictly validate an artifact.
+
+    Rejects (with a clear ValueError, not a KeyError/TypeError/JSONDecodeError):
+    truncated JSON, non-object top levels, foreign/unsupported formats,
+    foreign languages, mismatching toolchain versions, malformed 'main'
+    entries, and tampered files (artifact_sha256 mismatch).
+    """
+    name = Path(path).name
+    try:
+        obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"corrupt bytecode artifact {name}: {e}") from None
+    if not isinstance(obj, dict):
+        raise ValueError(f"corrupt bytecode artifact {name}: top level is not an object")
     if obj.get("format") != BYTECODE_FORMAT:
         raise ValueError(
             f"unsupported bytecode format {obj.get('format')!r}; expected {BYTECODE_FORMAT}"
         )
+    if obj.get("language") != LANGUAGE:
+        raise ValueError(
+            f"foreign bytecode artifact {name}: language {obj.get('language')!r}, "
+            f"expected {LANGUAGE!r}"
+        )
+    if obj.get("version") != VERSION:
+        raise ValueError(
+            f"bytecode artifact {name} was built by {LANGUAGE} {obj.get('version')!r}; "
+            f"this toolchain is {VERSION}"
+        )
+    main = obj.get("main")
+    if not isinstance(main, dict) or not {"name", "params", "code", "constants"} <= main.keys():
+        raise ValueError(f"corrupt bytecode artifact {name}: missing or malformed 'main'")
+    if "artifact_sha256" in obj:
+        check = {k: v for k, v in obj.items() if k != "artifact_sha256"}
+        raw = json.dumps(check, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False).encode()
+        if hashlib.sha256(raw).hexdigest() != obj["artifact_sha256"]:
+            raise ValueError(
+                f"bytecode artifact {name} failed its integrity check "
+                "(artifact_sha256 mismatch - the file was modified or truncated)"
+            )
     return obj
 
 

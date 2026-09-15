@@ -16,7 +16,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # no pytest installed (air-gapped): use the bundled shim
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    import _pytest_stub as pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -35,6 +41,7 @@ def _run(src: str, native: bool, tmp_path: Path):
         text=True,
         env=env,
         cwd=tmp_path,
+        timeout=300,
     )
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
@@ -370,10 +377,12 @@ def test_examples_agree_under_both_backends(path):
     a = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), "run", str(path)],
         capture_output=True, text=True, env=env_native, cwd=cwd,
+        timeout=300,
     )
     b = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), "run", str(path)],
         capture_output=True, text=True, env=env_vm, cwd=cwd,
+        timeout=300,
     )
     assert a.stdout == b.stdout, f"{path.name} diverged between backends"
     assert a.returncode == b.returncode

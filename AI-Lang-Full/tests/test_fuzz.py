@@ -22,7 +22,13 @@ import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # no pytest installed (air-gapped): use the bundled shim
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    import _pytest_stub as pytest
 
 import io
 
@@ -194,6 +200,7 @@ def _run_subprocess(src: str, native: bool, tmp_path: Path):
         text=True,
         env=env,
         cwd=tmp_path,
+        timeout=120,
     )
     return r.stdout.strip(), r.returncode, r.stderr.strip()
 
@@ -310,6 +317,7 @@ def test_random_binary_is_always_clean(tmp_path):
             text=True,
             env=dict(os.environ),
             cwd=tmp_path,
+            timeout=120,
         )
         assert "Traceback" not in r.stderr, f"raw leak on binary input: {r.stderr}"
 
@@ -365,6 +373,7 @@ def test_parser_rejects_malformed_functions(tmp_path):
             text=True,
             env=dict(os.environ),
             cwd=tmp_path,
+            timeout=120,
         )
         assert r.returncode != 0, f"malformed program must fail: {src!r}"
         assert "Traceback" not in r.stderr, f"raw leak: {r.stderr}\n---\n{src}"

@@ -136,6 +136,69 @@ def _declared_and_assigned(body, declared, assigned):
             _declared_and_assigned(s.rescue_body, declared, assigned)
 
 
+def _declared_in(stmts):
+    """All names declared anywhere in a statement list (conservative: it
+    includes declarations after a give/raise, which is fine for a
+    compile-eligibility gate)."""
+    names = set()
+    for s in stmts:
+        k = s.__class__.__name__
+        if k in ("Let", "Var"):
+            names.add(s.name)
+        elif k == "When":
+            for br in s.branches:
+                names |= _declared_in(br.body)
+            if s.else_body:
+                names |= _declared_in(s.else_body)
+        elif k in ("While", "Repeat"):
+            names |= _declared_in(s.body)
+        elif k == "Attempt":
+            names |= _declared_in(s.body) | _declared_in(s.rescue_body)
+    return names
+
+
+def _shared_redeclares(body, params=()):
+    """Names a `let`/`var` redeclares in a scope the interpreter shares.
+
+    The interpreter treats when-branches, attempt bodies and rescue bodies as
+    the enclosing scope: redeclaring a visible name there is a runtime error.
+    Host code (plain Python assignment) would silently rebind, so a function
+    with such a redeclaration is left to the interpreter, which reports the
+    same error as the pure-VM path.  Loop bodies get a fresh environment each
+    iteration (only outer names can conflict), and sibling when-branches only
+    ever run one at a time, so declarations in different branches do not
+    conflict with each other.
+    """
+    bad = []
+
+    def walk(stmts, visible):
+        for s in stmts:
+            k = s.__class__.__name__
+            if k in ("Let", "Var"):
+                if s.name in visible:
+                    bad.append(s.name)
+                visible.add(s.name)
+            elif k == "When":
+                base = set(visible)
+                for br in s.branches:
+                    walk(br.body, set(base))
+                if s.else_body:
+                    walk(s.else_body, set(base))
+            elif k in ("While", "Repeat"):
+                walk(s.body, set(visible))
+            elif k == "Attempt":
+                # the body runs until it raises or gives, so everything it
+                # declares is visible to the rescue
+                body_vis = set(visible)
+                walk(s.body, body_vis)
+                walk(s.rescue_body, set(visible) | _declared_in(s.body))
+                visible |= _declared_in(s.body) | _declared_in(s.rescue_body)
+            # Fn / FnExpr: separate function scope, never descended into
+
+    walk(body, set(params))
+    return bad
+
+
 class _Gen:
     """Emit host source for one AI-Lang function."""
 
@@ -521,6 +584,8 @@ def try_compile(fn_node, lookup, name="<fn>", is_global=None, fuel_box=None):
             p[0] if isinstance(p, tuple) else p for p in fn_node.params
         )
         if assigned - declared - params:
+            return None
+        if _shared_redeclares(fn_node.body):
             return None
         gen = _Gen(fn_node)
         src, linemap = gen.generate_located()

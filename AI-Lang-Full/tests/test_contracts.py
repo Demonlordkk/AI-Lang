@@ -6,7 +6,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # no pytest installed (air-gapped): use the bundled shim
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    import _pytest_stub as pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -20,6 +26,7 @@ def run(src, tmp_path, native="1", contracts="1"):
     r = subprocess.run(
         [sys.executable, str(ROOT / "ailang.py"), "run", str(p)],
         capture_output=True, text=True, env=env, cwd=tmp_path,
+        timeout=120,
     )
     return r.stdout + r.stderr
 
@@ -108,6 +115,106 @@ done.
 emit bad(-3).
 """
     assert "postcondition failed" in run(src, tmp_path)
+
+
+def test_postcondition_is_enforced_on_an_early_give_in_every_branch(tmp_path):
+    src = """fn branchy(x: Int) -> Int:
+    ensures result >= 100.
+    when x > 0:
+        give x * 10.
+    else:
+        give x * 10.
+    done.
+done.
+emit branchy(9).
+"""
+    assert "postcondition failed" in run(src, tmp_path)
+
+
+def test_postcondition_is_enforced_on_a_give_inside_a_loop(tmp_path):
+    src = """fn looped(x: Int) -> Int:
+    ensures result >= 100.
+    var i := 0.
+    while i < x:
+        i <- i + 1.
+        give i.
+    done.
+    give 999.
+done.
+emit looped(3).
+"""
+    assert "postcondition failed" in run(src, tmp_path)
+
+
+def test_postcondition_is_enforced_on_a_give_inside_a_rescue(tmp_path):
+    src = """fn rescued(x: Int) -> Int:
+    ensures result >= 100.
+    attempt:
+        give 5.
+    rescue e:
+        give 5.
+    done.
+done.
+emit rescued(1).
+"""
+    assert "postcondition failed" in run(src, tmp_path)
+
+
+def test_postcondition_on_all_branches_returning_function_is_legal(tmp_path):
+    """A function whose final statement is a when/else (or attempt) where
+    every path gives must not get a dead `result := Nothing` check - that
+    used to turn a valid typed postcondition into a spurious type error."""
+    src = """fn branchy(x: Int) -> Int:
+    ensures result >= 0.
+    when x > 0:
+        give x.
+    else:
+        give 0.
+    done.
+done.
+emit branchy(7).
+emit branchy(-2).
+"""
+    assert run(src, tmp_path).strip() == "7\n0"
+
+
+def test_rescue_shares_the_attempt_scope(tmp_path):
+    """The rescue clause shares the enclosing scope: redeclaring a name the
+    attempt body already bound is a duplicate-declaration error - and both
+    backends report it identically (the native backend used to silently
+    rebind, which diverged from the interpreter)."""
+    src = """fn f(x: Int) -> Int:
+    attempt:
+        let r := 1.
+        raise "boom".
+        give r + 1.
+    rescue e:
+        let r := 2.
+        give r + 10.
+    done.
+done.
+emit f(1).
+"""
+    for native in ("1", "0"):
+        out = run(src, tmp_path, native=native)
+        assert "already defined in this scope" in out, (native, out)
+
+
+def test_rescue_may_use_names_from_the_attempt_body(tmp_path):
+    """...while simply using a name from the attempt body is legal (the
+    common pattern: `let args := c.parse(...)` in the body, used after)."""
+    src = """fn f(x: Int) -> Int:
+    attempt:
+        let r := 5.
+        give r * 2.
+    rescue e:
+        give 0.
+    done.
+done.
+emit f(1).
+"""
+    for native in ("1", "0"):
+        assert run(src, tmp_path, native=native).strip() == "10"
 
 
 def test_precondition_failure_points_at_the_contract_line(tmp_path):
