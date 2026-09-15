@@ -16,6 +16,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import queue as _queue
+import threading as _threading
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -615,6 +617,87 @@ def _await_all(tasks):
         else:
             out.append(t)
     return out
+
+
+def _await_task(task, timeout=120):
+    """Wait for one spawn task and return its result."""
+    if not hasattr(task, "result"):
+        raise VMError("await: argument must be a task returned by spawn")
+    try:
+        return task.result(timeout=timeout)
+    except Exception as e:  # noqa: BLE001 - report the task's fault
+        raise VMError(f"await: task failed: {e}") from e
+
+
+# ------------------------------------------------------------------ locking
+def _new_mutex():
+    return {"__mutex__": _threading.Lock()}
+
+
+def _as_mutex(m, name):
+    if not isinstance(m, dict) or "__mutex__" not in m:
+        raise VMError(f"{name}: argument must be a mutex from mutex()")
+    return m["__mutex__"]
+
+
+def _lock(m, timeout=30):
+    lk = _as_mutex(m, "lock")
+    if not lk.acquire(timeout=timeout):
+        raise VMError("lock: timed out waiting for the mutex")
+    return m
+
+
+def _unlock(m):
+    lk = _as_mutex(m, "unlock")
+    try:
+        lk.release()
+    except RuntimeError:
+        raise VMError("unlock: mutex is not locked") from None
+
+
+# ------------------------------------------------------------------ channels
+def _new_channel():
+    return {"__queue__": _queue.Queue(), "closed": [False]}
+
+
+def _as_channel(c, name):
+    if not isinstance(c, dict) or "__queue__" not in c:
+        raise VMError(f"{name}: argument must be a channel from channel()")
+    return c
+
+
+def _channel_send(c, value):
+    c = _as_channel(c, "channel_send")
+    if c["closed"][0]:
+        raise VMError("channel_send: channel is closed")
+    c["__queue__"].put(value)
+    return None
+
+
+def _channel_recv(c):
+    """Blocking receive; returns nothing once the channel is closed and drained."""
+    c = _as_channel(c, "channel_recv")
+    q = c["__queue__"]
+    while True:
+        try:
+            return q.get(timeout=0.05)
+        except _queue.Empty:
+            if c["closed"][0]:
+                return None
+
+
+def _channel_try_recv(c):
+    c = _as_channel(c, "channel_try_recv")
+    try:
+        return c["__queue__"].get_nowait()
+    except _queue.Empty:
+        return None
+
+
+def _channel_close(c):
+    c = _as_channel(c, "channel_close")
+    c["closed"][0] = True
+    return None
 
 
 
@@ -2022,6 +2105,15 @@ def build_globals(argv=None):
         # concurrency
         "spawn": _spawn,
         "await_all": _await_all,
+        "await": _await_task,
+        "mutex": _new_mutex,
+        "lock": _lock,
+        "unlock": _unlock,
+        "channel": _new_channel,
+        "channel_send": _channel_send,
+        "channel_recv": _channel_recv,
+        "channel_try_recv": _channel_try_recv,
+        "channel_close": _channel_close,
     }
     for name, fn in env.items():
         try:
