@@ -98,6 +98,36 @@ def run_file(path, argv=None, check=True, fuel=None):
         set_script_dir(prev)
 
 
+def run_artifact(path, argv=None, fuel=None):
+    """Execute a compiled .albc.json artifact directly.
+
+    The artifact is rehydrated into a ProgramCode and run through the same
+    VM/module setup as source, so a built file and its source behave
+    identically (including `use` resolution relative to the artifact's
+    directory and the enclosing project root).
+    """
+    from .bytecode import load
+    from .modules import ModuleLoader
+    from .stdlib import build_globals, script_dir, set_script_dir
+    from .vm import VM
+
+    p = Path(path)
+    program = load(p)
+    prev = script_dir()
+    set_script_dir(p.parent.resolve())
+    try:
+        paths = [p.parent.resolve(), Path.cwd()]
+        root = _project_root(p.parent.resolve())
+        if root is not None and root not in paths:
+            paths.append(root)
+        loader = ModuleLoader(paths, lambda: build_globals(argv), fuel)
+        vm = VM(build_globals(argv), fuel=fuel, module_loader=loader.load)
+        vm.run(program)
+        return vm
+    finally:
+        set_script_dir(prev)
+
+
 def eval_source(source: str, search_paths=None):
     """Compile and run, returning the VM for inspection (used by tests)."""
     return run_source(source, "<eval>", search_paths or [Path.cwd()])

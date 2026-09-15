@@ -30,6 +30,12 @@ def _fn(f: FunctionCode):
         "params": list(f.params),
         "code": [[_safe(part) for part in ins] for ins in f.code],
         "constants": _safe(f.constants),
+        # extra fidelity for rehydrated code: error line numbers and the
+        # fields the dispatch paths consult
+        "captures": list(f.captures),
+        "defaults": dict(f.defaults),
+        "line": f.line,
+        "lines": {str(k): v for k, v in sorted(f.lines.items())},
     }
 
 
@@ -43,6 +49,10 @@ def artifact(program: ProgramCode, source: str = None) -> dict:
         "functions": {name: _fn(f) for name, f in sorted(program.functions.items())},
         "records": {k: [list(x) for x in v] for k, v in sorted(program.records.items())},
         "imports": [list(i) for i in program.imports],
+        # lifted top-level loops (NATIVE_LOOP targets) travel with the code
+        "native_loops": [
+            [src, list(carried), list(free)] for src, carried, free in program.native_loops
+        ],
     }
     raw = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     obj["artifact_sha256"] = hashlib.sha256(raw).hexdigest()
@@ -105,7 +115,14 @@ def load(path) -> ProgramCode:
 
     def mk(d):
         return FunctionCode(
-            d["name"], list(d["params"]), [tuple(x) for x in d["code"]], list(d["constants"])
+            d["name"],
+            list(d["params"]),
+            [tuple(x) for x in d["code"]],
+            list(d["constants"]),
+            captures=list(d.get("captures", [])),
+            defaults=dict(d.get("defaults", {})),
+            line=d.get("line", 0),
+            lines={int(k): v for k, v in d.get("lines", {}).items()},
         )
 
     return ProgramCode(
@@ -113,4 +130,6 @@ def load(path) -> ProgramCode:
         {k: mk(v) for k, v in obj["functions"].items()},
         {k: [tuple(x) for x in v] for k, v in obj.get("records", {}).items()},
         [tuple(x) for x in obj.get("imports", [])],
+        [(src, tuple(carried), tuple(free))
+         for src, carried, free in obj.get("native_loops", [])],
     )

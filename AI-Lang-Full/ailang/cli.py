@@ -32,20 +32,69 @@ def _read_source(path: Path) -> str:
         raise AILangError(f"could not be read: {e.strerror or e}") from None
 
 
+def _profile_run(fn):
+    """Run fn under cProfile and print a compact top-functions table."""
+    import cProfile
+    import io
+    import pstats
+
+    pr = cProfile.Profile()
+    pr.enable()
+    try:
+        fn()
+    finally:
+        pr.disable()
+    buf = io.StringIO()
+    pstats.Stats(pr, stream=buf).sort_stats("tottime").print_stats(15)
+    lines = buf.getvalue().splitlines()
+    try:
+        head = lines.index("Function")
+    except ValueError:
+        head = 4
+    print("\n--- profile: top 15 functions by internal time ---")
+    print("\n".join(lines[head: head + 22]))
+
+
 def cmd_run(args):
-    from .toolchain import run_file
+    from .toolchain import run_artifact, run_file
 
     path = Path(args.file)
     if not path.is_file():
         print(f"ailang: no such file: {path}", file=sys.stderr)
         return 1
+    if args.fuel is not None and args.fuel <= 0:
+        print("ailang: --fuel must be a positive number of steps", file=sys.stderr)
+        return 2
+
+    if path.name.endswith(".albc.json"):
+        # a built artifact runs directly: rehydrate, no re-parse, no re-check
+        try:
+            if args.profile:
+                _profile_run(lambda: run_artifact(path, argv=args.args, fuel=args.fuel))
+            else:
+                run_artifact(path, argv=args.args, fuel=args.fuel)
+            return 0
+        except ProcessExit as e:
+            return e.code
+        except AILangError as e:
+            return _fail(e, None, str(path))
+        except ValueError as e:
+            print(f"ailang: {e}", file=sys.stderr)
+            return 1
+        except RecursionError:
+            print("ailang: recursion limit exceeded", file=sys.stderr)
+            return 1
+
     source = None
     try:
         source = _read_source(path)
-        if args.fuel is not None and args.fuel <= 0:
-            print("ailang: --fuel must be a positive number of steps", file=sys.stderr)
-            return 2
-        run_file(path, argv=args.args, check=not args.no_check, fuel=args.fuel)
+        if args.profile:
+            _profile_run(
+                lambda: run_file(path, argv=args.args, check=not args.no_check,
+                                 fuel=args.fuel)
+            )
+        else:
+            run_file(path, argv=args.args, check=not args.no_check, fuel=args.fuel)
         return 0
     except ProcessExit as e:
         return e.code
@@ -397,6 +446,11 @@ def build_parser():
         type=int,
         default=None,
         help="step budget for the run (default 50,000,000, or AILANG_FUEL)",
+    )
+    p.add_argument(
+        "--profile",
+        action="store_true",
+        help="print a top-functions time table after running",
     )
     p.set_defaults(fn=cmd_run)
 

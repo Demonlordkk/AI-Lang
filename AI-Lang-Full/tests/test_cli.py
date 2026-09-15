@@ -310,3 +310,67 @@ def test_cli_classifier_end_to_end(tmp_path):
     rb, rep_b = run(["report"], False)
     assert ra == 0 and rb == 0
     assert rep_a == rep_b and "probe" in rep_a
+
+
+# --- compiled artifact execution (.albc.json) ------------------------------
+
+
+def _cli(*args, env_native="1"):
+    import os
+    import subprocess
+
+    return subprocess.run(
+        [sys.executable, str(ROOT / "ailang.py"), *args],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, AILANG_NATIVE=env_native),
+        timeout=120,
+    )
+
+
+def test_cli_build_then_run_artifact_matches_source(tmp_path):
+    src = tmp_path / "t.al"
+    src.write_text("var x := 0.\nvar i := 0.\nwhile i < 5:\n    x <- x + i.\n    i <- i + 1.\ndone.\nemit x.\n", encoding="utf-8")
+    art = tmp_path / "t.albc.json"
+    r = _cli("build", str(src), "--output", str(art))
+    assert r.returncode == 0, r.stderr
+    assert art.is_file()
+    a = _cli("run", str(src))
+    b = _cli("run", str(art))
+    assert b.returncode == 0, b.stderr
+    assert a.stdout == b.stdout == "10\n"
+
+
+def test_cli_artifact_receives_program_args(tmp_path):
+    src = tmp_path / "a.al"
+    src.write_text("emit args()[0].\nemit args()[1].\n", encoding="utf-8")
+    art = tmp_path / "a.albc.json"
+    r = _cli("build", str(src), "--output", str(art))
+    assert r.returncode == 0, r.stderr
+    a = _cli("run", str(src), "--", "hello", "world")
+    b = _cli("run", str(art), "--", "hello", "world")
+    assert b.returncode == 0, b.stderr
+    assert a.stdout == b.stdout == "hello\nworld\n"
+
+
+def test_cli_artifact_corrupt_is_a_clean_error(tmp_path):
+    src = tmp_path / "t.al"
+    src.write_text("emit 1.\n", encoding="utf-8")
+    art = tmp_path / "t.albc.json"
+    r = _cli("build", str(src), "--output", str(art))
+    assert r.returncode == 0, r.stderr
+    data = art.read_text(encoding="utf-8")
+    (tmp_path / "bad.albc.json").write_text(data[: len(data) // 2], encoding="utf-8")
+    r2 = _cli("run", str(tmp_path / "bad.albc.json"))
+    assert r2.returncode == 1
+    assert "ailang:" in r2.stderr
+    assert "Traceback" not in r2.stderr
+
+
+def test_cli_profile_flag_prints_table(tmp_path):
+    src = tmp_path / "p.al"
+    src.write_text("var s := 0.\nvar i := 0.\nwhile i < 2000:\n    s <- s + i.\n    i <- i + 1.\ndone.\nemit s.\n", encoding="utf-8")
+    r = _cli("run", str(src), "--profile")
+    assert r.returncode == 0, r.stderr
+    assert "1999000" in r.stdout
+    assert "profile: top 15" in r.stdout
