@@ -49,7 +49,7 @@ let val_labels := map(get(split, "test"), \i -> labels[i]).
 emit "spiral: {n} points ({len(get(split, "train"))} train / {len(get(split, "test"))} validation)...".
 
 # ------------------------------------------------------------------ the net
-let net := nn.mlp([2, 24, 24, 3], 42, "he").
+let net := nn.mlp_init([2, 24, 24, 3], 42, "he").
 let ps := nn.params(net).
 let opt := adamw(ps, 0.003, 0.01).
 let es := early_stop(100).

@@ -1350,11 +1350,31 @@ def _accel():
 
 
 def _seed(n):
-    """Fix the global random stream (random, randn, shuffle, sample)."""
+    """Fix the global random stream (random, randn, shuffle, sample, and
+    numpy's global state when the numpy accelerator is active — dropout
+    and unseeded randn draw from it, so a seeded program must be
+    reproducible word for word with or without numpy)."""
     if n is None:
         return None
     _random.seed(int(n))
+    try:
+        from . import accel
+
+        m = accel.np()
+        if m is not None:
+            m.random.seed(int(n))
+    except Exception:
+        pass
     return None
+
+
+def _panic(msg):
+    """Fatal, unrecoverable abort. Unlike an error, attempt/rescue cannot
+    catch a panic — use it for states where continuing is never correct
+    (corrupt configuration, missing credentials, impossible invariants)."""
+    from .errors import Panic
+
+    raise Panic(str(msg))
 
 
 def _tensor(value, requires_grad=False):
@@ -2098,6 +2118,7 @@ def build_globals(argv=None):
         "adamw_step": _adamw_step,
         "clip_grad": _clip_grad,
         "seed": _seed,
+        "panic": _panic,
         "sum_t": lambda a: _ad().t_sum(a),
         "mean_t": lambda a: _ad().t_mean(a),
         "mse_t": lambda p, y: _ad().mse_loss(p, y),

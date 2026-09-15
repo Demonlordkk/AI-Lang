@@ -333,6 +333,7 @@ BUILTIN_SIGS = {
     "random": ([], REAL),
     "random_int": ([("low", INT), ("high", INT)], INT),
     "sleep": ([("seconds", ANY)], VOID),
+    "panic": ([("message", ANY)], VOID),
     "hash_text": ([("text", TEXT)], TEXT),
     "uuid": ([], TEXT),
     "spawn": ([("fn", FUNCTION), ("arg", ANY)], ANY, 1),

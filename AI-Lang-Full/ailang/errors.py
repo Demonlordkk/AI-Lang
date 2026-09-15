@@ -98,6 +98,22 @@ class AILangRaise(AILangError):
         self.value = value
 
 
+class Panic(BaseException):
+    """Raised by the `panic` builtin: a fatal, unrecoverable abort.
+
+    Deliberately not an AILangError (like ProcessExit): attempt/rescue
+    must not be able to catch a process panic.
+    """
+
+    stage = "panic"
+
+    def __init__(self, message, line: int = 0, col: int = 0):
+        super().__init__(str(message))
+        self.message = str(message)
+        self.line = line
+        self.col = col
+
+
 __all__ = [
     "AILangError",
     "LexError",
@@ -107,4 +123,5 @@ __all__ = [
     "VMError",
     "ImportError_",
     "AILangRaise",
+    "Panic",
 ]

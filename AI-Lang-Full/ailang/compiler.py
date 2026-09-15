@@ -69,9 +69,10 @@ class _FnScope:
 
 
 class Compiler:
-    def __init__(self):
+    def __init__(self, lift_loops=True):
         self.functions: Dict[str, FunctionCode] = {}
         self.native_loops: List[tuple] = []
+        self.lift_loops = lift_loops
         self.records: Dict[str, List[tuple]] = {}
         self.imports: List[tuple] = []
         self._anon = 0
@@ -356,11 +357,16 @@ class _Ctx:
     def _try_native_loop(self, s):
         """Emit NATIVE_LOOP when this loop can run as host bytecode.
 
+        Skipped when `lift_loops` is off (line tracing needs the
+        interpreter to see every instruction).
+
         Only top-level loops qualify: inside a function the whole function is
         already a native-backend candidate. The loop must not contain `stop`
         or `next` targeting an outer construct, and the VM re-checks
         eligibility before using the compiled form.
         """
+        if not self.owner.lift_loops:
+            return False
         if self.fn_depth > 0:
             return False
         from .native import try_compile_loop, enabled

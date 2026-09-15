@@ -25,7 +25,11 @@ done.
 #
 # `init` picks the weight scheme: "randn" (historical default), "xavier"
 # (Glorot, good for tanh) or "he" (Kaiming, good for relu).
-fn mlp(sizes: List, seed: Int, init: Text) -> Any:
+fn mlp(sizes: List, seed: Int) -> Any:
+    give mlp_init(sizes, seed, "randn").
+done.
+
+fn mlp_init(sizes: List, seed: Int, init: Text) -> Any:
     var layers := [].
     var i := 0.
     while i < len(sizes) - 1:

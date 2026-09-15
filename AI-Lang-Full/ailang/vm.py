@@ -154,7 +154,7 @@ class VM:
     MAX_DEPTH = 2500
 
     def __init__(self, globals_dict: Dict[str, Any] = None, fuel: int = None,
-                 module_loader=None):
+                 module_loader=None, trace: bool = False, trace_lines=None):
         if fuel is None:
             fuel = fuel_default()
         self.globals = Environment(None, globals_dict or {})
@@ -162,6 +162,10 @@ class VM:
         self.globals.vars.setdefault("false", False)
         self.globals.vars.setdefault("nothing", None)
         self.fuel = fuel
+        # line tracing (`ailang trace`): print each source line as it executes
+        self.trace = trace
+        self.trace_lines = trace_lines or []
+        self._traced = None
         # The authoritative remaining-fuel counter. `self.fuel` mirrors it for
         # API compatibility, and `execute()` caches it in a local for speed,
         # but the box is what the native backend decrements, so a loop compiled
@@ -374,6 +378,13 @@ class VM:
                     'execution limit exceeded (raise the step budget with --fuel N or AILANG_FUEL=N)',
                     line_table.get(ip, 0))
             ins = code[ip]
+            if self.trace:
+                tl = line_table.get(ip, 0)
+                if tl and (fn, tl) != self._traced:
+                    self._traced = (fn, tl)
+                    if tl <= len(self.trace_lines):
+                        src = self.trace_lines[tl - 1].rstrip()
+                        print(f"  {tl:>4} | {src}")
             op = ins[0]
             ip += 1
 

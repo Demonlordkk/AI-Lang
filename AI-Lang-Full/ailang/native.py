@@ -450,11 +450,9 @@ class _Gen:
             self.depth += 1
             self.body(s.body)
             self.depth -= 1
-            self.w("except (KeyboardInterrupt, SystemExit):")
-            self.depth += 1
-            self.w("raise")
-            self.depth -= 1
-            self.w("except BaseException as _exc:")
+            # The interpreter's rescue trap catches Exception only, so
+            # ProcessExit (exit()) and Panic slip through in both engines.
+            self.w("except Exception as _exc:")
             self.depth += 1
             self.locals.add(s.error_name)
             self.w(f"{s.error_name} = _errval(_exc)")

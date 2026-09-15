@@ -32,6 +32,7 @@ def compile_source(
     search_paths: Optional[List] = None,
     check: bool = True,
     opt: bool = True,
+    lift_loops: bool = True,
 ) -> ProgramCode:
     program = parse(source)
     # contracts become ordinary checks before anything else looks at the tree
@@ -41,7 +42,7 @@ def compile_source(
         TypeChecker(module_resolver=resolver).check(program)
     if opt:
         optimize(program)
-    return Compiler().compile(program, filename)
+    return Compiler(lift_loops=lift_loops).compile(program, filename)
 
 
 def run_source(
@@ -51,6 +52,7 @@ def run_source(
     argv: Optional[List[str]] = None,
     check: bool = True,
     fuel: Optional[int] = None,
+    trace: bool = False,
 ):
     from .modules import ModuleLoader
     from .vm import fuel_default
@@ -58,9 +60,11 @@ def run_source(
     if fuel is None:
         fuel = fuel_default()
     paths = search_paths or [Path(filename).parent if filename != "<source>" else Path.cwd()]
-    program = compile_source(source, filename, paths, check=check)
+    program = compile_source(source, filename, paths, check=check,
+                             lift_loops=not trace)
     loader = ModuleLoader(paths, lambda: build_globals(argv), fuel)
-    vm = VM(build_globals(argv), fuel=fuel, module_loader=loader.load)
+    vm = VM(build_globals(argv), fuel=fuel, module_loader=loader.load,
+            trace=trace, trace_lines=source.splitlines())
     vm.run(program)
     return vm
 
@@ -77,7 +81,7 @@ def _project_root(start: Path):
     return None
 
 
-def run_file(path, argv=None, check=True, fuel=None):
+def run_file(path, argv=None, check=True, fuel=None, trace=False):
     p = Path(path)
     source = p.read_text(encoding="utf-8")
     # relative paths inside the program resolve against the program's own
@@ -93,7 +97,7 @@ def run_file(path, argv=None, check=True, fuel=None):
         root = _project_root(p.parent.resolve())
         if root is not None and root not in paths:
             paths.append(root)
-        return run_source(source, str(p), paths, argv, check, fuel)
+        return run_source(source, str(p), paths, argv, check, fuel, trace=trace)
     finally:
         set_script_dir(prev)
 

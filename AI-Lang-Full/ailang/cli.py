@@ -8,7 +8,8 @@ import sys
 import time
 from pathlib import Path
 
-from .errors import AILangError, ProcessExit
+from .errors import AILangError, Panic, ProcessExit
+from .values import display
 from .version import LANGUAGE, VERSION
 
 BANNER = f"{LANGUAGE} {VERSION}"
@@ -30,6 +31,63 @@ def _read_source(path: Path) -> str:
         ) from None
     except OSError as e:
         raise AILangError(f"could not be read: {e.strerror or e}") from None
+
+
+def cmd_trace(args):
+    from .toolchain import run_file
+
+    path = Path(args.file)
+    if not path.is_file():
+        print(f"ailang: no such file: {path}", file=sys.stderr)
+        return 1
+    if args.fuel is not None and args.fuel <= 0:
+        print("ailang: --fuel must be a positive number of steps", file=sys.stderr)
+        return 2
+    source = None
+    try:
+        source = _read_source(path)
+        run_file(path, argv=args.args, check=not args.no_check, fuel=args.fuel, trace=True)
+        return 0
+    except ProcessExit as e:
+        return e.code
+    except Panic as e:
+        print(f"ailang: panic: {e.message}", file=sys.stderr)
+        return 1
+    except AILangError as e:
+        return _fail(e, source, str(path))
+    except RecursionError:
+        print("ailang: recursion limit exceeded", file=sys.stderr)
+        return 1
+
+
+def cmd_dis(args):
+    from .opcodes import NAMES
+    from .toolchain import compile_source
+
+    path = Path(args.file)
+    if not path.is_file():
+        print(f"ailang: no such file: {path}", file=sys.stderr)
+        return 1
+    source = _read_source(path)
+    try:
+        program = compile_source(source, str(path), [path.parent.resolve()],
+                                 check=not args.no_check)
+    except AILangError as e:
+        return _fail(e, source, str(path))
+
+    def dump(fn):
+        print(f"== {fn.name}({', '.join(fn.params)}) — {len(fn.code)} instructions ==")
+        if fn.constants:
+            consts = ", ".join(f"{i}: {display(c)}" for i, c in enumerate(fn.constants))
+            print(f"  constants: {consts}")
+        for ip, ins in enumerate(fn.code):
+            args_ = " ".join(display(a) for a in ins[1:])
+            print(f"  {ip:4d}: {NAMES[ins[0]]}{(' ' + args_) if args_ else ''}")
+
+    dump(program.main)
+    for name, fn in sorted(program.functions.items()):
+        dump(fn)
+    return 0
 
 
 def _profile_run(fn):
@@ -81,6 +139,9 @@ def cmd_run(args):
         except ValueError as e:
             print(f"ailang: {e}", file=sys.stderr)
             return 1
+        except Panic as e:
+            print(f"ailang: panic: {e.message}", file=sys.stderr)
+            return 1
         except RecursionError:
             print("ailang: recursion limit exceeded", file=sys.stderr)
             return 1
@@ -94,10 +155,14 @@ def cmd_run(args):
                                  fuel=args.fuel)
             )
         else:
-            run_file(path, argv=args.args, check=not args.no_check, fuel=args.fuel)
+            run_file(path, argv=args.args, check=not args.no_check,
+                     fuel=args.fuel, trace=args.trace)
         return 0
     except ProcessExit as e:
         return e.code
+    except Panic as e:
+        print(f"ailang: panic: {e.message}", file=sys.stderr)
+        return 1
     except AILangError as e:
         return _fail(e, source, str(path))
     except RecursionError:
@@ -460,6 +525,11 @@ def build_parser():
         action="store_true",
         help="print a top-functions time table after running",
     )
+    p.add_argument(
+        "--trace",
+        action="store_true",
+        help="print each source line as it executes",
+    )
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("check", help="type-check without running")
@@ -504,6 +574,18 @@ def build_parser():
     p.add_argument("--key", help="HMAC signing key (or AILANG_REGISTRY_KEY)")
     p.add_argument("--publisher", help="publisher name recorded in the signature")
     p.set_defaults(fn=cmd_publish)
+
+    p = sub.add_parser("trace", help="run a program, printing each line as it executes")
+    p.add_argument("file")
+    p.add_argument("args", nargs="*", help="arguments passed to the program")
+    p.add_argument("--fuel", type=int, default=None)
+    p.add_argument("--no-check", action="store_true")
+    p.set_defaults(fn=cmd_trace)
+
+    p = sub.add_parser("dis", help="disassemble a program to opcodes")
+    p.add_argument("file")
+    p.add_argument("--no-check", action="store_true")
+    p.set_defaults(fn=cmd_dis)
 
     p = sub.add_parser("repl", help="start an interactive session")
     p.set_defaults(fn=cmd_repl)
